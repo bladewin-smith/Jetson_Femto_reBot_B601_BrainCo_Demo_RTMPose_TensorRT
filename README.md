@@ -1,780 +1,167 @@
-# RTMDet + RTMPose + 专用手部模型机械臂控制
+# Jetson Femto + reBot Arm B601-DM + BrainCo + RTMPose TensorRT
 
-这是从原项目独立复制并优化的仓库。当前生产视觉链已经切换为原生
-TensorRT 10 Python 后端，不再要求 MMDeploy SDK：
+本仓库把原 `Jetson_Femto_Realman_Brainco_Demo_RTMPose_TensorRT` 的 RM65-B
+控制链替换为 Seeed Studio reBot Arm B601-DM，同时保留 Orbbec RGB-D、
+RTMDet/RTMPose TensorRT、最近操作者选择、双手关键点与 BrainCo Revo2 手指控制。
 
-    Orbbec RGB-D
-        │
-        ├─ RTMDet-nano 320×320（全图、限频）
-        │      └─ 人体框 + 躯干深度排序 + 最近操作者锁定
-        │
-        └─ 锁定操作者
-               ├─ RTMPose-S 256×192：COCO 17 点身体骨架
-               ├─ 左肘/腕 → 左手 ROI → RTMPose-M Hand5 21 点
-               └─ 右肘/腕 → 右手 ROI → RTMPose-M Hand5 21 点
-                        │
-                        ├─ 肩、肘角度
-                        ├─ 双手五指弯曲度
-                        ├─ 手掌 RGB-D 三维位移
-                        └─ RM65-B 六向运动 + 灵巧手
+> **安全警告：B601-DM 断电或控制链中断时不能依靠软件保持姿态。首次上电前，
+> 必须把机械臂平行、完整支撑在桌面上，并确保失能时不会坠落、夹伤或撞击。
+> 软件的回桌轨迹无法覆盖停电、USB 断连、进程崩溃或急停。真机操作必须有人在
+> 急停旁监护，并建议使用机械支撑和 UPS。**
 
-## 当前实现
+## 迁移后的控制链
 
-- 使用 TensorRT 10 名称式 I/O API：set_input_shape、set_tensor_address 和
-  execute_async_v3。
-- RTMDet engine 输出未做 NMS 的 boxes 和 scores；预处理、阈值过滤、分类 NMS
-  与原图坐标恢复由 Python 实现。
-- RTMPose 身体和手部 engine 输出 simcc_x 与 simcc_y；SimCC 解码、仿射 ROI
-  和坐标回映射由 Python 实现。
-- 人体检测与 Orbbec 躯干深度融合，按最近距离选操作者，并通过 IoU/中心距离
-  连续跟踪目标。
-- 只对锁定操作者运行身体模型；左右手 ROI 根据对应肘腕方向生成。
-- 手部关键点采用紧凑跟踪 ROI、自适应关键点平滑和低置信度连续跟踪；四指再经
-  自适应肤色掩膜与独立窄通道校验，降低相邻手指误联动。
-- 拇指弯曲轴和旋转轴使用独立自动归零、双阈值迟滞、连续帧确认和静止区，
-  抑制绷直状态下的非零偏差与往复抖动。
-- 保留既有 RGB-D 反投影、手指弯曲度、肩肘角度、ROS 话题、机械臂/灵巧手
-  通信和安全门控。
-- MMDeploy 与 PyTorch 后端仍作为兼容和参考路径保留，但默认 runtime 为
-  tensorrt。
+```text
+Orbbec RGB-D
+  -> RTMDet 最近操作者
+  -> RTMPose 身体 + 双手
+  -> 手掌三维位移
+  -> B601 DM URDF / Pinocchio 逆解
+  -> 关节限位、单步限幅、桌面运动包络
+  -> 500 Hz MIT 位置/阻尼 + Pinocchio g(q) 重力前馈
+  -> MotorBridge /dev/ttyACM0 / 达妙电机 0x01..0x06
+
+手指弯曲度
+  -> BrainCo Revo2
+  -> 独立 USB-RS485 或 CANFD（不再经过 RM 工具口）
+```
+
+与 RM65-B 版本的关键差异、机械参数来源和迁移决策见
+[`docs/MECHANICAL_AND_CONTROL_MIGRATION.md`](docs/MECHANICAL_AND_CONTROL_MIGRATION.md)。
+
+## 关键安全门
+
+- `robot_motion_enabled` 默认 `false`。
+- 真机启用还必须显式设置 `b601_tabletop_startup_confirmed:=true`。
+- 上电后先读取六轴反馈；任一轴无反馈、机械臂仍在移动或偏离已标定桌面姿态，
+  都会在使能力矩前失败退出。
+- 禁止启动自动回零；初始目标始终是刚读取到的真实姿态，不是零向量。
+- 桌面参考点的负 Z 位移默认是 0；抬升不足 20 mm 时禁止 XY 平移。
+- 每个笛卡尔目标都重新做 B601 URDF 逆解、关节限位检查和关节跳变量检查。
+- `H` 键和正常退出使用低速 minimum-jerk 轨迹回到桌面支撑姿态，验证到位后
+  才正常失能。真实断电仍不受此流程保护。
 
 ## 主要文件
 
 | 路径 | 作用 |
 |---|---|
-| scripts/camera_arm_rm65b_control_rtmpose.py | 推荐的完整控制入口 |
-| scripts/test_tensorrt_vision.py | 不连接 ROS、Orbbec 和机械臂的视觉独立测试 |
-| vision_backends/tensorrt_runtime.py | TensorRT 10 执行、预处理、NMS 与 SimCC 解码 |
-| vision_backends/rtmpose_backend.py | 人体/身体/双手编排及深度选人 |
-| vision_backends/finger_segmentation.py | 掌心自适应掩膜、逐指独立轮廓通道与伸直证据融合 |
-| hand_control/calibration.py | 五指开合标定与拇指对掌几何 |
-| hand_control/stabilization.py | 五指迟滞防抖及拇指自动归零状态机 |
-| deploy/export_onnx_models.py | 从 OpenMMLab 模型导出三个普通 ONNX |
-| deploy/build_tensorrt_engines.sh | 在目标 Jetson 上生成三个 FP16 engine |
-| deploy/requirements-jetson-runtime.txt | Jetson 额外 Python 运行时依赖 |
-| tests/test_rtmpose_backend.py | 视觉几何与解码单元测试 |
-| tests/test_finger_segmentation.py | 相邻手指独立分割和误弯曲否决测试 |
-| tests/test_hand_calibration.py | 五指标定、迟滞和拇指自动归零测试 |
-| jetson_autostart/ | systemd/桌面自启动配置 |
+| `scripts/camera_arm_b601_control_pose_hands.py` | 完整 ROS/Orbbec/RTMPose/B601/BrainCo 入口 |
+| `arm_control/rebot_b601.py` | B601 启动门、Pinocchio IK、MIT + `g(q)`、桌面回位 |
+| `config/rebotarm_dm_brainco.yaml` | 仅六轴 DM 电机；刻意不注册 Seeed 夹爪 0x07 |
+| `scripts/read_b601_table_pose.py` | 不使能电机，只读取并输出桌面姿态参数 |
+| `vision_backends/` | TensorRT 10、RTMDet/RTMPose、深度选人和手部分割 |
+| `hand_control/` | BrainCo 手指标定、迟滞、防抖与拇指对掌 |
+| `third_party/reBotArm_control_py` | Seeed 官方 SDK Git submodule |
+| `jetson_autostart/` | 带双重真机确认的 Jetson 启动脚本和环境模板 |
 
-## 模型产物
+## 安装
 
-程序默认读取：
-
-    models/tensorrt/rtmdet_nano.engine
-    models/tensorrt/rtmpose_body.engine
-    models/tensorrt/rtmpose_hand.engine
-
-先在独立的 PyTorch/OpenMMLab 环境导出 ONNX。这个环境可以放在 x86 工作站，
-不需要 MMDeploy：
-
-    python3 deploy/export_onnx_models.py \
-      --mmpose-root /path/to/mmpose \
-      --output-dir models/onnx \
-      --device cuda:0
-
-把三个 ONNX 复制到 Jetson 后，必须在运行它们的 Jetson/JetPack/TensorRT 环境
-生成 engine：
-
-    cd /home/jetson/ws/Jetson_Femto_Realman_Brainco_Demo_RTMPose_TensorRT
-    bash deploy/build_tensorrt_engines.sh models/onnx models/tensorrt
-
-详细说明见 deploy/README.md。TensorRT engine 不应跨不同 JetPack、TensorRT 或
-GPU 环境直接复用。
-
-## Jetson 运行时
-
-TensorRT、CUDA 和 OpenCV 继续使用 JetPack/Ubuntu 自带版本。建议使用能够读取
-系统包的虚拟环境，只额外安装 CUDA Python 与 NumPy 1.x：
-
-    sudo apt update
-    sudo apt install -y python3-venv python3-pip python3-opencv libnvinfer-bin
-    python3 -m venv --system-site-packages .venv
-    source .venv/bin/activate
-    python -m pip install --upgrade pip wheel
-    python -m pip install -r deploy/requirements-jetson-runtime.txt
-
-验证当前解释器：
-
-    python -c "import cv2, numpy, tensorrt; from cuda import cudart; print(cv2.__version__, numpy.__version__, tensorrt.__version__)"
-
-不要使用 pip 覆盖 JetPack 的 tensorrt、CUDA 或 cuDNN 包。
-
-## Jetson 分阶段测试与运行
-
-以下流程使用当前 Jetson 上已经验证的 engine 布局。每次重新打开终端，都必须先
-重新执行变量定义；否则 `$DET_ENGINE` 等空变量会展开成错误的
-`/rtmdet_nano.engine`。
-
-### 0. 定义路径和运行环境
+Seeed SDK 当前声明 Python `>=3.10,<3.12`，Jetson 侧建议 Python 3.10：
 
 ```bash
-REPO="$HOME/ws/Jetson_Femto_Realman_Brainco_Demo_RTMPose_TensorRT"
-DET_ENGINE="$REPO/models/tensorrt_orin_nano_20261102_170600/rtmdet_nano.engine"
-BODY_ENGINE="$REPO/models/tensorrt_pose_fp32/rtmpose_body.engine"
-HAND_ENGINE="$REPO/models/tensorrt_pose_fp32/rtmpose_hand.engine"
-BRAINCO_SDK="$HOME/ws/brainco-hand-sdk-main/python"
+git clone --recurse-submodules <this-repository-url>
+cd Jetson_Femto_reBot_B601_BrainCo_Demo_RTMPose_TensorRT
+git submodule update --init --recursive
 
+python3 -m venv --system-site-packages .venv
+source .venv/bin/activate
+python -m pip install -e third_party/reBotArm_control_py
+python -m pip install -r deploy/requirements-jetson-runtime.txt
+```
+
+另外需要：ROS 2 Humble、`pyorbbecsdk`、目标 JetPack 自带 TensorRT/CUDA，及
+BrainCo 官方手部 SDK（启用灵巧手时）。不要用 pip 覆盖 JetPack 的 TensorRT。
+
+TensorRT engine 必须在目标 Jetson/JetPack/TensorRT 组合上构建；流程见
+[`deploy/README.md`](deploy/README.md)。
+
+## 分阶段验收
+
+先定义路径：
+
+```bash
+REPO="$HOME/ws/Jetson_Femto_reBot_B601_BrainCo_Demo_RTMPose_TensorRT"
+DET_ENGINE="$REPO/models/tensorrt/rtmdet_nano.engine"
+BODY_ENGINE="$REPO/models/tensorrt/rtmpose_body.engine"
+HAND_ENGINE="$REPO/models/tensorrt/rtmpose_hand.engine"
 cd "$REPO"
 source /opt/ros/humble/setup.bash
-export PYTHONPATH="$HOME/ws/pyorbbecsdk-2-main:$HOME/ws/RM_API2-main/Demo/RMDemo_Python:$REPO:$REPO/scripts:${PYTHONPATH:-}"
+export PYTHONPATH="$HOME/ws/pyorbbecsdk-2-main:$HOME/ws/brainco-hand-sdk-main/python:$REPO:$REPO/scripts:${PYTHONPATH:-}"
 ```
 
-可以先确认路径没有展开为空：
+### 1. 纯视觉，所有执行器关闭
 
 ```bash
-printf 'DET=%s\nBODY=%s\nHAND=%s\nBRAINCO=%s\n' \
-  "$DET_ENGINE" "$BODY_ENGINE" "$HAND_ENGINE" "$BRAINCO_SDK"
-```
-
-### 1. 纯 TensorRT 视觉测试
-
-该入口只验证 RTMDet、身体姿态、左右手 ROI 和 Hand5 关键点，不加载 Orbbec
-深度、ROS、机械臂或灵巧手：
-
-```bash
-cd "$REPO"
-
-python scripts/test_tensorrt_vision.py \
-  --input 0 \
-  --detector-engine "$DET_ENGINE" \
-  --body-engine "$BODY_ENGINE" \
-  --hand-engine "$HAND_ENGINE" \
-  --body-threshold 0.25 \
-  --hand-threshold 0.25
-```
-
-图片或视频也可以作为输入：
-
-```bash
-python scripts/test_tensorrt_vision.py \
-  --input /path/to/person.jpg \
-  --detector-engine "$DET_ENGINE" \
-  --body-engine "$BODY_ENGINE" \
-  --hand-engine "$HAND_ENGINE" \
-  --body-threshold 0.25 \
-  --hand-threshold 0.25 \
-  --output /tmp/rtmpose_result.jpg \
-  --no-display
-
-python scripts/test_tensorrt_vision.py \
-  --input /path/to/test.mp4 \
-  --detector-engine "$DET_ENGINE" \
-  --body-engine "$BODY_ENGINE" \
-  --hand-engine "$HAND_ENGINE" \
-  --body-threshold 0.25 \
-  --hand-threshold 0.25
-```
-
-### 2. 完整 RGB-D 视觉链，关闭所有动作
-
-该阶段加载 Orbbec 深度和完整 ROS 节点，但明确关闭机械臂和灵巧手输出：
-
-```bash
-cd "$REPO"
-
-python scripts/camera_arm_rm65b_control_rtmpose.py \
-  --ros-args \
+python scripts/camera_arm_b601_control_pose_hands.py --ros-args \
   -p vision_backend:=rtmpose \
   -p rtmpose_runtime:=tensorrt \
   -p rtmdet_engine_path:="$DET_ENGINE" \
   -p rtmpose_body_engine_path:="$BODY_ENGINE" \
   -p rtmpose_hand_engine_path:="$HAND_ENGINE" \
-  -p rtmpose_body_keypoint_threshold:=0.25 \
-  -p rtmpose_hand_keypoint_threshold:=0.25 \
-  -p rtmpose_hand_roi_max_size_px:=700 \
-  -p rtmpose_hand_inference_interval:=1 \
-  -p control_hand_side:=right \
   -p robot_motion_enabled:=false \
   -p hand_control_enabled:=false \
-  -p auto_start_on_ready:=false \
-  -p show_window:=true
+  -p auto_start_on_ready:=false
 ```
 
-最近操作者稳定后按 `s`。另开一个终端查看五指弯曲度：
+### 2. 标定“平行且由桌面支撑”的启动姿态
+
+断电摆好并支撑机械臂，清空周围空间。接通 24 V 和 MotorBridge 后只读取反馈：
 
 ```bash
-source /opt/ros/humble/setup.bash
-ros2 topic echo /hand_finger_bends
+python scripts/read_b601_table_pose.py
 ```
 
-`hand_finger_bends` 数据顺序固定为：
+把输出的六个弧度值保存为 `b601_tabletop_joints_rad`。不要把悬空姿态或仍在运动
+时的读数作为桌面姿态。
+
+### 3. 灵巧手独立验收
+
+保持 `robot_motion_enabled:=false`，将 `hand_control_enabled:=true`，并选择：
 
 ```text
-thumb, index, middle, ring, pinky
+hand_transport:=brainco-rs485   # 独立 USB-RS485
+hand_transport:=brainco-canfd   # 独立 SocketCAN CANFD
 ```
 
-### 3. 只连接 BrainCo 灵巧手，不发送运动
+`realman-hand` 与 `raw-modbus` 已被主动拒绝，因为 B601 没有 RM 控制器工具口。
 
-该阶段用于验证 Revo2 独立 USB-RS485、SDK 路径、串口和从站地址。不要按 `s`：
+### 4. B601 小范围真机验收
+
+确认机械臂仍完整支撑在桌面、六轴读数与标定一致、急停可用，再运行：
 
 ```bash
-cd "$REPO"
+TABLE_Q='[q1,q2,q3,q4,q5,q6]'  # 替换为第 2 步实测弧度值
 
-python scripts/camera_arm_rm65b_control_rtmpose.py \
-  --ros-args \
+python scripts/camera_arm_b601_control_pose_hands.py --ros-args \
   -p vision_backend:=rtmpose \
   -p rtmpose_runtime:=tensorrt \
   -p rtmdet_engine_path:="$DET_ENGINE" \
   -p rtmpose_body_engine_path:="$BODY_ENGINE" \
   -p rtmpose_hand_engine_path:="$HAND_ENGINE" \
-  -p rtmpose_body_keypoint_threshold:=0.25 \
-  -p rtmpose_hand_keypoint_threshold:=0.25 \
-  -p rtmpose_hand_roi_max_size_px:=700 \
-  -p rtmpose_hand_inference_interval:=1 \
-  -p control_hand_side:=right \
-  -p robot_motion_enabled:=false \
-  -p hand_control_enabled:=true \
-  -p hand_transport:=brainco-rs485 \
-  -p hand_rs485_sdk_path:="$BRAINCO_SDK" \
-  -p hand_rs485_port:=auto \
-  -p hand_rs485_slave_id:=0 \
-  -p hand_rs485_baudrate:=460800 \
-  -p hand_configure_tool_voltage:=false \
-  -p hand_open_on_start:=false \
-  -p hand_open_on_home:=false \
-  -p hand_open_on_lost:=false \
-  -p hand_open_on_exit:=false \
-  -p auto_start_on_ready:=false \
-  -p show_window:=true
-```
-
-通信正常时应看到类似日志：
-
-```text
-BrainCo Revo2 RS485 device OK
-BrainCo Revo2 RS485 finger unit mode set to Normalized
-Dexterous hand follower started
-```
-
-### 4. 当前完整灵巧手随动命令
-
-下面是当前代码对应的完整调优命令。机械臂运动仍保持关闭，只驱动 BrainCo 灵巧
-手。该命令使用 `hand_position_min:=0`、`hand_position_max:=1000`，属于完整行程；
-首次硬件验收如需限幅，可临时把 `hand_position_max` 改成 `350`。
-
-```bash
-cd "$REPO"
-
-python scripts/camera_arm_rm65b_control_rtmpose.py \
-  --ros-args \
-  -p vision_backend:=rtmpose \
-  -p rtmpose_runtime:=tensorrt \
-  -p rtmdet_engine_path:="$DET_ENGINE" \
-  -p rtmpose_body_engine_path:="$BODY_ENGINE" \
-  -p rtmpose_hand_engine_path:="$HAND_ENGINE" \
-  -p rtmpose_body_keypoint_threshold:=0.25 \
-  -p rtmpose_hand_keypoint_threshold:=0.28 \
-  -p rtmpose_hand_keypoint_tracking_threshold:=0.08 \
-  -p rtmpose_hand_keypoint_hold_frames:=0 \
-  -p rtmpose_hand_keypoint_smoothing:=0.25 \
-  -p rtmpose_hand_keypoint_fast_motion_px:=14.0 \
-  -p rtmpose_hand_roi_scale:=2.25 \
-  -p rtmpose_hand_roi_wrist_extension:=0.35 \
-  -p rtmpose_hand_tracking_roi_scale:=1.55 \
-  -p rtmpose_hand_roi_min_size_px:=96 \
-  -p rtmpose_hand_roi_max_size_px:=700 \
-  -p rtmpose_hand_inference_interval:=1 \
-  -p finger_segmentation_enabled:=true \
-  -p finger_segmentation_corridor_width_ratio:=0.08 \
-  -p finger_segmentation_color_mad_scale:=4.0 \
-  -p finger_segmentation_minimum_chroma_tolerance:=9.0 \
-  -p finger_segmentation_debug_overlay:=true \
-  -p finger_segmentation_fusion_enabled:=true \
-  -p finger_segmentation_min_confidence:=0.45 \
-  -p finger_segmentation_straight_threshold:=0.78 \
-  -p finger_segmentation_full_straight_threshold:=0.92 \
-  -p finger_segmentation_bend_cap:=0.12 \
-  -p control_hand_side:=right \
-  -p control_hand_fallback_enabled:=false \
-  -p robot_motion_enabled:=false \
-  -p hand_control_enabled:=true \
-  -p hand_transport:=brainco-rs485 \
-  -p hand_rs485_sdk_path:="$BRAINCO_SDK" \
-  -p hand_rs485_port:=auto \
-  -p hand_rs485_slave_id:=0 \
-  -p hand_rs485_baudrate:=460800 \
-  -p hand_rs485_duration_ms:=200 \
-  -p hand_rs485_speed:=300 \
-  -p hand_position_min:=0 \
-  -p hand_position_max:=1000 \
-  -p hand_bend_calibration_enabled:=true \
-  -p 'hand_bend_open_calibration:=[0.18,0.08,0.13,0.09,0.13]' \
-  -p 'hand_bend_closed_calibration:=[0.56,0.92,0.91,0.86,0.87]' \
-  -p 'hand_bend_gamma:=[1.0,1.0,1.0,1.0,1.0]' \
-  -p hand_bend_deadzone:=0.12 \
-  -p hand_bend_release_threshold:=0.05 \
-  -p hand_bend_jitter_deadband:=0.025 \
-  -p hand_send_hz:=10.0 \
-  -p hand_smoothing:=0.50 \
-  -p hand_bend_smoothing:=0.60 \
-  -p hand_bend_max_delta:=0.30 \
-  -p hand_deadband:=10 \
-  -p hand_require_3d_bends_for_control:=true \
-  -p hand_thumb_rotate_mode:=opposition \
-  -p hand_thumb_opposition_open_ratio:=1.05 \
-  -p hand_thumb_opposition_closed_ratio:=0.35 \
-  -p hand_thumb_opposition_gamma:=1.0 \
-  -p hand_thumb_rotate_scale:=0.35 \
-  -p hand_thumb_straight_lock_enabled:=true \
-  -p hand_thumb_auto_zero_enabled:=true \
-  -p hand_thumb_auto_zero_samples:=5 \
-  -p hand_thumb_auto_zero_margin:=0.05 \
-  -p hand_thumb_bend_engage_threshold:=0.25 \
-  -p hand_thumb_bend_release_threshold:=0.08 \
-  -p hand_thumb_rotate_engage_threshold:=0.32 \
-  -p hand_thumb_rotate_release_threshold:=0.12 \
-  -p hand_thumb_state_confirm_frames:=3 \
-  -p hand_thumb_jitter_deadband:=0.05 \
-  -p hand_reject_single_finger_spikes:=true \
-  -p hand_single_finger_spike_delta:=0.22 \
-  -p hand_single_finger_spike_peer_max:=0.22 \
-  -p hand_spike_confirm_frames:=2 \
-  -p hand_reject_multi_finger_spikes:=true \
-  -p hand_multi_finger_spike_delta:=0.30 \
-  -p hand_multi_finger_spike_min_count:=2 \
-  -p hand_multi_finger_spike_confirm_frames:=2 \
-  -p hand_closure_confirm_frames:=2 \
-  -p hand_closure_confirm_delta:=0.25 \
-  -p hand_closure_confirm_value:=0.45 \
-  -p hand_closure_confirm_min_fingers:=2 \
-  -p hand_open_on_start:=true \
-  -p hand_open_on_home:=true \
-  -p hand_open_on_lost:=true \
-  -p hand_lost_open_delay_s:=1.0 \
-  -p hand_open_on_exit:=true \
-  -p hand_configure_tool_voltage:=false \
-  -p auto_start_on_ready:=false \
-  -p show_window:=true
-```
-
-开始跟踪前将拇指完全绷直并保持静止，按 `s` 后继续保持至少 5 个有效识别帧，
-直到终端出现：
-
-```text
-Thumb auto-zero ready: bend_baseline=..., rotate_baseline=...
-```
-
-之后再测试拇指弯曲和对掌。GUI 中按 `h` 返回安全状态，按 `q` 或 `Esc` 退出。
-只有确认最近操作者、左右手标签、深度、手指分割线和坐标方向都稳定后，才应考虑
-开启机械臂运动。
-
-### 5. 视觉单独控制 RM65-B（当前实机最优参数组）
-
-下面记录当前实机调试得到的机械臂最优参数组。该命令启用机械臂、关闭灵巧手，使用
-低跟随 CANFD、启动/按 `s` 时六方向 IK 扫描，以及较小的单次目标变化量。启动后先
-检查 `effective_negative` 和 `effective_positive`，确认合理后再按 `s`：
-
-```bash
-cd "$REPO"
-
-python scripts/camera_arm_rm65b_control_rtmpose.py \
-  --ros-args \
-  -p vision_backend:=rtmpose \
-  -p rtmpose_runtime:=tensorrt \
-  -p rtmdet_engine_path:="$DET_ENGINE" \
-  -p rtmpose_body_engine_path:="$BODY_ENGINE" \
-  -p rtmpose_hand_engine_path:="$HAND_ENGINE" \
-  -p rtmpose_body_keypoint_threshold:=0.25 \
-  -p rtmpose_hand_keypoint_threshold:=0.25 \
-  -p rtmpose_hand_keypoint_tracking_threshold:=0.06 \
-  -p rtmpose_hand_keypoint_hold_frames:=3 \
-  -p rtmpose_hand_keypoint_smoothing:=0.18 \
-  -p rtmpose_hand_keypoint_fast_motion_px:=20.0 \
-  -p rtmpose_hand_roi_scale:=2.25 \
-  -p rtmpose_hand_roi_wrist_extension:=0.35 \
-  -p rtmpose_hand_tracking_roi_scale:=1.70 \
-  -p rtmpose_hand_roi_min_size_px:=96 \
-  -p rtmpose_hand_roi_max_size_px:=700 \
-  -p rtmpose_hand_inference_interval:=1 \
-  -p finger_segmentation_enabled:=false \
-  -p finger_segmentation_debug_overlay:=false \
-  -p finger_segmentation_fusion_enabled:=false \
-  -p control_hand_side:=right \
-  -p control_hand_fallback_enabled:=false \
-  -p operator_require_torso_pose:=true \
-  -p operator_ready_confirm_frames:=12 \
-  -p person_lost_timeout_s:=0.80 \
-  -p depth_enhancement_enabled:=false \
-  -p nn_skip_arm_angle_log:=true \
   -p robot_motion_enabled:=true \
-  -p robot_ip:=192.168.1.18 \
-  -p robot_port:=8080 \
-  -p robot_level:=3 \
-  -p robot_thread_mode:=2 \
-  -p arm_control_protocol:=canfd \
-  -p canfd_follow:=false \
-  -p canfd_trajectory_mode:=2 \
-  -p canfd_radio:=50 \
-  -p arm_speed:=5 \
-  -p arm_block:=0 \
-  -p arm_recover_motion_state_on_start:=false \
-  -p arm_recover_motion_state_on_tracking_start:=false \
-  -p arm_slow_stop_on_pause:=true \
-  -p arm_log_command_start:=true \
+  -p b601_tabletop_startup_confirmed:=true \
+  -p b601_tabletop_joints_rad:="$TABLE_Q" \
+  -p b601_tabletop_joint_tolerance_rad:='[0.12,0.12,0.12,0.12,0.12,0.12]' \
   -p auto_home_on_start:=false \
-  -p home_key_enabled:=true \
-  -p 'safe_home_joints:=[-1.341,-91.165,101.410,-13.002,23.072,-0.046]' \
-  -p joint_safety_enabled:=true \
-  -p target_ik_safety_enabled:=true \
-  -p singularity_safety_enabled:=true \
-  -p wrist_singularity_joint5_min_abs_deg:=15.0 \
-  -p joint_limit_margin_deg:=3.0 \
-  -p target_safety_check_interval_s:=0.20 \
-  -p target_safety_allow_cached_on_read_error:=false \
-  -p arm_workspace_scan_enabled:=true \
-  -p 'arm_workspace_scan_max_distance_m:=[0.600,0.600,0.600]' \
-  -p arm_workspace_scan_step_m:=0.010 \
-  -p arm_workspace_scan_refine_iterations:=6 \
-  -p arm_workspace_scan_safety_ratio:=0.80 \
-  -p arm_workspace_scan_min_effective_m:=0.005 \
-  -p arm_state_read_retries:=5 \
-  -p arm_state_read_retry_interval_s:=0.20 \
-  -p 'camera_to_arm_matrix:=[0.0,0.0,1.0,-1.0,0.0,0.0,0.0,-1.0,0.0]' \
-  -p palm_to_arm_scale:=0.20 \
-  -p 'arm_axis_scale:=[1.2,1.6,1.2]' \
-  -p 'arm_axis_deadband_m:=[0.004,0.005,0.004]' \
-  -p hand_deadband_m:=0.006 \
-  -p palm_filter_enabled:=true \
-  -p palm_filter_alpha:=0.25 \
-  -p palm_filter_still_alpha:=0.05 \
-  -p palm_filter_hold_deadband_m:=0.008 \
-  -p palm_filter_release_deadband_m:=0.014 \
-  -p palm_filter_velocity_deadband_m_s:=0.025 \
-  -p arm_motion_unit_m:=0.001 \
-  -p 'max_arm_axis_offset_m:=[0.180,0.200,0.180]' \
-  -p 'arm_axis_max_velocity_m_s:=[0.150,0.180,0.150]' \
-  -p 'arm_axis_max_accel_m_s2:=[0.180,0.220,0.180]' \
-  -p 'max_arm_target_delta_axis_m:=[0.004,0.005,0.004]' \
-  -p min_command_delta_m:=0.0015 \
-  -p arm_command_interval_s:=0.12 \
-  -p arm_mit_control_enabled:=true \
-  -p arm_mit_kp:=35.0 \
-  -p arm_mit_kd:=16.0 \
+  -p max_arm_axis_offset_m:='[0.025,0.025,0.060]' \
+  -p b601_workspace_negative_axis_offset_m:='[0.025,0.025,0.0]' \
+  -p b601_workspace_positive_axis_offset_m:='[0.025,0.025,0.060]' \
+  -p b601_min_lift_before_xy_m:=0.020 \
   -p hand_control_enabled:=false \
-  -p auto_start_on_ready:=false \
-  -p show_window:=true
+  -p auto_start_on_ready:=false
 ```
 
-`max_arm_axis_offset_m` 是用户硬上限，不代表当前姿态一定可以达到该距离；实际正负
-XYZ 范围仍由启动扫描结果与该参数逐轴取较小值。保持 `canfd_follow:=false`，不要在
-当前约 120 ms 的发送周期下直接切换官方高跟随模式。
-
-### 6. 视觉同时控制 RM65-B 与 BrainCo 灵巧手
-
-该命令将上一节的机械臂实机最优组，与第 4 节的逐指分割、五指标定、拇指锁定和
-BrainCo 独立 USB-RS485 参数合并。按 `s` 前保持操作者右手稳定、拇指完全绷直；按
-`s` 后继续保持至少 5 个有效识别帧，等待拇指自动归零完成：
-
-```bash
-cd "$REPO"
-
-python scripts/camera_arm_rm65b_control_rtmpose.py \
-  --ros-args \
-  -p vision_backend:=rtmpose \
-  -p rtmpose_runtime:=tensorrt \
-  -p rtmdet_engine_path:="$DET_ENGINE" \
-  -p rtmpose_body_engine_path:="$BODY_ENGINE" \
-  -p rtmpose_hand_engine_path:="$HAND_ENGINE" \
-  -p rtmpose_body_keypoint_threshold:=0.25 \
-  -p rtmpose_hand_keypoint_threshold:=0.25 \
-  -p rtmpose_hand_keypoint_tracking_threshold:=0.06 \
-  -p rtmpose_hand_keypoint_hold_frames:=3 \
-  -p rtmpose_hand_keypoint_smoothing:=0.18 \
-  -p rtmpose_hand_keypoint_fast_motion_px:=20.0 \
-  -p rtmpose_hand_roi_scale:=2.25 \
-  -p rtmpose_hand_roi_wrist_extension:=0.35 \
-  -p rtmpose_hand_tracking_roi_scale:=1.70 \
-  -p rtmpose_hand_roi_min_size_px:=96 \
-  -p rtmpose_hand_roi_max_size_px:=700 \
-  -p rtmpose_hand_inference_interval:=1 \
-  -p finger_segmentation_enabled:=true \
-  -p finger_segmentation_corridor_width_ratio:=0.08 \
-  -p finger_segmentation_color_mad_scale:=4.0 \
-  -p finger_segmentation_minimum_chroma_tolerance:=9.0 \
-  -p finger_segmentation_debug_overlay:=true \
-  -p finger_segmentation_fusion_enabled:=true \
-  -p finger_segmentation_min_confidence:=0.45 \
-  -p finger_segmentation_straight_threshold:=0.78 \
-  -p finger_segmentation_full_straight_threshold:=0.92 \
-  -p finger_segmentation_bend_cap:=0.12 \
-  -p control_hand_side:=right \
-  -p control_hand_fallback_enabled:=false \
-  -p operator_require_torso_pose:=true \
-  -p operator_ready_confirm_frames:=12 \
-  -p person_lost_timeout_s:=0.80 \
-  -p depth_enhancement_enabled:=false \
-  -p nn_skip_arm_angle_log:=true \
-  -p robot_motion_enabled:=true \
-  -p robot_ip:=192.168.1.18 \
-  -p robot_port:=8080 \
-  -p robot_level:=3 \
-  -p robot_thread_mode:=2 \
-  -p arm_control_protocol:=canfd \
-  -p canfd_follow:=false \
-  -p canfd_trajectory_mode:=2 \
-  -p canfd_radio:=50 \
-  -p arm_speed:=5 \
-  -p arm_block:=0 \
-  -p arm_recover_motion_state_on_start:=false \
-  -p arm_recover_motion_state_on_tracking_start:=false \
-  -p arm_slow_stop_on_pause:=true \
-  -p arm_log_command_start:=true \
-  -p auto_home_on_start:=false \
-  -p home_key_enabled:=true \
-  -p 'safe_home_joints:=[-1.341,-91.165,101.410,-13.002,23.072,-0.046]' \
-  -p joint_safety_enabled:=true \
-  -p target_ik_safety_enabled:=true \
-  -p singularity_safety_enabled:=true \
-  -p wrist_singularity_joint5_min_abs_deg:=15.0 \
-  -p joint_limit_margin_deg:=3.0 \
-  -p target_safety_check_interval_s:=0.20 \
-  -p target_safety_allow_cached_on_read_error:=false \
-  -p arm_workspace_scan_enabled:=true \
-  -p 'arm_workspace_scan_max_distance_m:=[0.600,0.600,0.600]' \
-  -p arm_workspace_scan_step_m:=0.010 \
-  -p arm_workspace_scan_refine_iterations:=6 \
-  -p arm_workspace_scan_safety_ratio:=0.80 \
-  -p arm_workspace_scan_min_effective_m:=0.005 \
-  -p arm_state_read_retries:=5 \
-  -p arm_state_read_retry_interval_s:=0.20 \
-  -p 'camera_to_arm_matrix:=[0.0,0.0,1.0,-1.0,0.0,0.0,0.0,-1.0,0.0]' \
-  -p palm_to_arm_scale:=0.20 \
-  -p 'arm_axis_scale:=[1.2,1.6,1.2]' \
-  -p 'arm_axis_deadband_m:=[0.004,0.005,0.004]' \
-  -p hand_deadband_m:=0.006 \
-  -p palm_filter_enabled:=true \
-  -p palm_filter_alpha:=0.25 \
-  -p palm_filter_still_alpha:=0.05 \
-  -p palm_filter_hold_deadband_m:=0.008 \
-  -p palm_filter_release_deadband_m:=0.014 \
-  -p palm_filter_velocity_deadband_m_s:=0.025 \
-  -p arm_motion_unit_m:=0.001 \
-  -p 'max_arm_axis_offset_m:=[0.180,0.200,0.180]' \
-  -p 'arm_axis_max_velocity_m_s:=[0.150,0.180,0.150]' \
-  -p 'arm_axis_max_accel_m_s2:=[0.180,0.220,0.180]' \
-  -p 'max_arm_target_delta_axis_m:=[0.004,0.005,0.004]' \
-  -p min_command_delta_m:=0.0015 \
-  -p arm_command_interval_s:=0.12 \
-  -p arm_mit_control_enabled:=true \
-  -p arm_mit_kp:=35.0 \
-  -p arm_mit_kd:=16.0 \
-  -p hand_control_enabled:=true \
-  -p hand_transport:=brainco-rs485 \
-  -p hand_rs485_sdk_path:="$BRAINCO_SDK" \
-  -p hand_rs485_port:=auto \
-  -p hand_rs485_slave_id:=0 \
-  -p hand_rs485_baudrate:=460800 \
-  -p hand_rs485_duration_ms:=200 \
-  -p hand_rs485_speed:=300 \
-  -p hand_position_min:=0 \
-  -p hand_position_max:=1000 \
-  -p hand_bend_calibration_enabled:=true \
-  -p 'hand_bend_open_calibration:=[0.18,0.08,0.13,0.09,0.13]' \
-  -p 'hand_bend_closed_calibration:=[0.56,0.92,0.91,0.86,0.87]' \
-  -p 'hand_bend_gamma:=[1.0,1.0,1.0,1.0,1.0]' \
-  -p hand_bend_deadzone:=0.12 \
-  -p hand_bend_release_threshold:=0.05 \
-  -p hand_bend_jitter_deadband:=0.025 \
-  -p hand_send_hz:=10.0 \
-  -p hand_smoothing:=0.50 \
-  -p hand_bend_smoothing:=0.60 \
-  -p hand_bend_max_delta:=0.30 \
-  -p hand_deadband:=10 \
-  -p hand_require_3d_bends_for_control:=true \
-  -p hand_thumb_rotate_mode:=opposition \
-  -p hand_thumb_opposition_open_ratio:=1.05 \
-  -p hand_thumb_opposition_closed_ratio:=0.35 \
-  -p hand_thumb_opposition_gamma:=1.0 \
-  -p hand_thumb_rotate_scale:=0.35 \
-  -p hand_thumb_straight_lock_enabled:=true \
-  -p hand_thumb_auto_zero_enabled:=true \
-  -p hand_thumb_auto_zero_samples:=5 \
-  -p hand_thumb_auto_zero_margin:=0.05 \
-  -p hand_thumb_bend_engage_threshold:=0.25 \
-  -p hand_thumb_bend_release_threshold:=0.08 \
-  -p hand_thumb_rotate_engage_threshold:=0.32 \
-  -p hand_thumb_rotate_release_threshold:=0.12 \
-  -p hand_thumb_state_confirm_frames:=3 \
-  -p hand_thumb_jitter_deadband:=0.05 \
-  -p hand_reject_single_finger_spikes:=true \
-  -p hand_single_finger_spike_delta:=0.22 \
-  -p hand_single_finger_spike_peer_max:=0.22 \
-  -p hand_spike_confirm_frames:=2 \
-  -p hand_reject_multi_finger_spikes:=true \
-  -p hand_multi_finger_spike_delta:=0.30 \
-  -p hand_multi_finger_spike_min_count:=2 \
-  -p hand_multi_finger_spike_confirm_frames:=2 \
-  -p hand_closure_confirm_frames:=2 \
-  -p hand_closure_confirm_delta:=0.25 \
-  -p hand_closure_confirm_value:=0.45 \
-  -p hand_closure_confirm_min_fingers:=2 \
-  -p hand_open_on_start:=true \
-  -p hand_open_on_home:=true \
-  -p hand_open_on_lost:=true \
-  -p hand_lost_open_delay_s:=1.0 \
-  -p hand_open_on_exit:=true \
-  -p hand_configure_tool_voltage:=false \
-  -p auto_start_on_ready:=false \
-  -p show_window:=true
-```
-
-联合运行时，机械臂和 BrainCo 手分别使用 RealMan TCP/CANFD 与独立 USB-RS485，
-但共享视觉推理和控制手关键点。首次联合测试保持 `canfd_follow:=false`，并确保灵巧手
-串口不是 RM 工具端 RS485；按 `h` 时机械臂回到
-`[-1.341,-91.165,101.410,-13.002,23.072,-0.046]`，同时灵巧手执行张开动作。程序随后
-保持暂停，即使 `auto_start_on_ready:=true` 也不会自动恢复，必须再次按 `s` 才重新建立
-控制参考并开始跟随。
-
-### 7. 安装桌面一键启动（替换旧快速启动器）
-
-新启动器使用上面第 6 节完整的机械臂与灵巧手联合参数，并覆盖旧的
-`/usr/local/bin/rm_brainco_orbbec_demo`。安装程序会先备份已有 env，停止旧 systemd
-服务，并把旧登录自启动快捷方式改名禁用，避免两个进程同时控制硬件：
-
-```bash
-cd "$HOME/ws/Jetson_Femto_Realman_Brainco_Demo_RTMPose_TensorRT"
-chmod +x jetson_autostart/run_rm_brainco_orbbec_demo.sh \
-  jetson_autostart/install_click_launcher.sh
-sudo ./jetson_autostart/install_click_launcher.sh
-```
-
-安装后双击桌面的 **RM65 Vision Control** 即可启动。启动器会先检查三个 TensorRT
-engine 和机械臂网络，再打开终端与视觉窗口；在窗口内按 `s` 启动，按 `h` 回到新的
-Home 并暂停，之后必须再次按 `s` 才能恢复。仍可在终端直接运行同一个入口：
-
-```bash
-/usr/local/bin/rm_brainco_orbbec_demo
-```
-
-## 关键参数
-
-| 参数 | 默认值 | 说明 |
-|---|---:|---|
-| vision_backend | rtmpose | rtmpose 或 mediapipe 回退 |
-| rtmpose_runtime | tensorrt | 原生 TensorRT；也保留 mmdeploy、pytorch |
-| rtmdet_engine_path | models/tensorrt/rtmdet_nano.engine | 人体检测 engine |
-| rtmpose_body_engine_path | models/tensorrt/rtmpose_body.engine | 身体 engine |
-| rtmpose_hand_engine_path | models/tensorrt/rtmpose_hand.engine | 手部 engine |
-| rtmdet_inference_hz | 8.0 | 全图人体检测频率 |
-| rtmdet_nms_iou_threshold | 0.60 | RTMDet NMS IoU 阈值 |
-| rtmdet_max_detections | 100 | NMS 后最大框数 |
-| rtmpose_bbox_padding | 1.25 | 身体/手部姿态 ROI 外扩比例 |
-| rtmpose_person_score_threshold | 0.45 | 人体框阈值 |
-| rtmpose_body_keypoint_threshold | 0.35 | 身体关键点阈值 |
-| rtmpose_hand_keypoint_threshold | 0.25 | 手部关键点阈值 |
-| rtmpose_hand_roi_scale | 2.25 | 手 ROI 边长与前臂长度比例 |
-| rtmpose_hand_roi_wrist_extension | 0.35 | ROI 沿肘到腕向外延伸比例 |
-| rtmpose_hand_tracking_roi_scale | 1.55 | 首次识别后按上一帧手点生成紧凑 ROI，提高单指弯曲的输入分辨率 |
-| rtmpose_hand_inference_interval | 1 | 双手推理间隔；逐帧推理可避免快速屈指被跳过 |
-| rtmpose_hand_keypoint_hold_frames | 0 | 低置信度点复用帧数；手指控制默认禁用旧姿态滞留 |
-| rtmpose_hand_keypoint_tracking_threshold | 0.08 | 已检测手点的低置信度连续跟踪阈值，低于主阈值时仍使用当前坐标而不是旧直指坐标 |
-| rtmpose_hand_keypoint_smoothing | 0.25 | 小幅关键点抖动的自适应平滑系数 |
-| rtmpose_hand_keypoint_fast_motion_px | 14 | 超过该位移时快速释放平滑，保证真实屈指及时响应 |
-| finger_segmentation_enabled | true | 启用掌心自适应颜色掩膜与逐指独立窄通道测量 |
-| finger_segmentation_corridor_width_ratio | 0.11 | 单指分割通道半宽相对掌宽；减小可降低相邻手指串扰 |
-| finger_segmentation_color_mad_scale | 4.0 | 掌心颜色鲁棒偏差倍数，光照变化较大时可适当增大 |
-| finger_segmentation_minimum_chroma_tolerance | 9.0 | YCrCb 色度最小容差 |
-| finger_segmentation_debug_overlay | true | 在画面中显示 I/M/R/P 独立延伸线与比例 |
-| finger_segmentation_fusion_enabled | true | 使用独立轮廓的伸直证据否决对应手指的误弯曲 |
-| finger_segmentation_min_confidence | 0.45 | 分割证据参与关键点结果融合的最低可信度 |
-| finger_segmentation_straight_threshold | 0.78 | 从该延伸比例开始逐步抑制该手指的误弯曲 |
-| finger_segmentation_full_straight_threshold | 0.92 | 达到该比例时把该手指弯曲量限制到 bend cap |
-| finger_segmentation_bend_cap | 0.12 | 明确伸直手指允许保留的最大原始弯曲量 |
-| person_min_depth_m / person_max_depth_m | 0.35 / 4.0 | 操作者深度范围 |
-| person_track_min_iou | 0.08 | 目标锁定最小 IoU |
-| control_hand_side | right | left、right 或 auto |
-| robot_motion_enabled | false | 必须显式开启机械臂动作 |
-| hand_control_enabled | false | 必须显式开启灵巧手动作 |
-| safe_home_joints | `[-1.341,-91.165,101.410,-13.002,23.072,-0.046]` | Web 端确认的新安全 Home；按 H 到位后保持暂停，必须按 S 恢复 |
-| max_arm_axis_offset_m | `[0.020,0.045,0.020]` | 相对启动 TCP 的 XYZ 分轴最大位移；当前映射中第二项 Y 是左右方向 |
-| arm_axis_max_velocity_m_s | `[0.035,0.050,0.035]` | MIT 外环 XYZ 分轴最大速度，单位 m/s |
-| arm_axis_max_accel_m_s2 | `[0.160,0.240,0.160]` | MIT 外环 XYZ 分轴最大加速度，单位 m/s² |
-| max_arm_target_delta_axis_m | `[0.004,0.006,0.004]` | 每条机械臂命令允许的 XYZ 分轴最大目标变化，单位 m |
-| arm_workspace_scan_enabled | true | 每次建立 TCP 控制参考时执行不运动的 XYZ 正负六方向 IK 扫描 |
-| arm_workspace_scan_max_distance_m | `[0.600,0.600,0.600]` | XYZ 每个正负方向的最大探测距离，单位 m |
-| arm_workspace_scan_step_m | 0.010 | 首轮粗扫描步长，单位 m；边界随后二分细化 |
-| arm_workspace_scan_refine_iterations | 6 | 首个不可用边界的二分细化次数 |
-| arm_workspace_scan_safety_ratio | 0.80 | 只保留每个方向 IK 可达距离的比例 |
-| arm_workspace_scan_min_effective_m | 0.005 | 任一方向最终范围低于该值时拒绝开始跟踪 |
-| arm_state_read_retries | 5 | 启动和重置参考点时读取当前机械臂状态的最大次数 |
-| arm_state_read_retry_interval_s | 0.20 | 状态读取重试间隔，单位 s |
-| hand_bend_calibration_enabled | true | 在发送硬件命令前启用逐指开合标定；ROS 话题仍保留原始弯曲度 |
-| hand_bend_open_calibration | `[0.18,0.08,0.13,0.09,0.13]` | 完全张开标定，顺序为 thumb/index/middle/ring/pinky |
-| hand_bend_closed_calibration | `[0.56,0.92,0.91,0.86,0.87]` | 完全握拳标定，顺序同上 |
-| hand_bend_gamma | `[1,1,1,1,1]` | 逐指响应曲线；大于 1 会减弱中段，小于 1 会增强中段 |
-| hand_bend_deadzone | 0.10 | 标定后弯曲量进入弯曲状态的阈值 |
-| hand_bend_release_threshold | 0.04 | 已弯曲手指返回伸直状态的较低阈值，和进入阈值形成迟滞区 |
-| hand_bend_jitter_deadband | 0.025 | 已激活手指的微小弯曲量变化保持不动，抑制电机抖动 |
-| hand_spike_confirm_frames | 2 | 单指大幅弯曲连续两帧即确认，避免把真实食指/中指动作长期当成尖峰 |
-| hand_thumb_rotate_mode | opposition | `opposition` 根据拇指尖相对掌宽独立计算旋转；`scaled-bend` 保留旧映射 |
-| hand_thumb_rotate_scale | 0.35 | 拇指旋转轴最大比例，首次标定建议保持 0.35 |
-| hand_thumb_straight_lock_enabled | true | 仅对拇指启用自动归零、迟滞和连续帧确认，不影响其余四指 |
-| hand_thumb_auto_zero_enabled | true | 每次开始跟踪时学习操作者拇指绷直状态的非零视觉偏差 |
-| hand_thumb_auto_zero_samples | 5 | 开始跟踪后用于自动归零的有效帧数；这几帧必须保持拇指绷直 |
-| hand_thumb_auto_zero_margin | 0.04 | 在学习基线之上额外忽略的拇指噪声范围 |
-| hand_thumb_bend_engage_threshold / release_threshold | 0.22 / 0.08 | 拇指弯曲轴进入/退出动作状态的双阈值 |
-| hand_thumb_rotate_engage_threshold / release_threshold | 0.30 / 0.12 | 拇指旋转轴进入/退出动作状态的双阈值 |
-| hand_thumb_state_confirm_frames | 3 | 拇指动作必须连续超过进入阈值的帧数 |
-| hand_thumb_jitter_deadband | 0.04 | 拇指已动作状态下保持不变的微小波动范围 |
-
-分轴参数和 IK 扫描参数均可通过 ROS 2 终端参数覆盖，数组顺序固定为机械臂
-`[X（前后）, Y（左右）, Z（上下）]`：
-
-```bash
--p 'max_arm_axis_offset_m:=[0.020,0.045,0.020]' \
--p 'arm_axis_max_velocity_m_s:=[0.035,0.050,0.035]' \
--p 'arm_axis_max_accel_m_s2:=[0.160,0.240,0.160]' \
--p 'max_arm_target_delta_axis_m:=[0.004,0.006,0.004]' \
--p arm_workspace_scan_enabled:=true \
--p 'arm_workspace_scan_max_distance_m:=[0.600,0.600,0.600]' \
--p arm_workspace_scan_step_m:=0.010 \
--p arm_workspace_scan_refine_iterations:=6 \
--p arm_workspace_scan_safety_ratio:=0.80 \
--p arm_workspace_scan_min_effective_m:=0.005 \
--p arm_state_read_retries:=5 \
--p arm_state_read_retry_interval_s:=0.20
-```
-
-这些参数采用逐轴裁剪，不再使用单个球形范数限制；因此某一方向达到上限时，
-不会再按比例压缩另外两个方向的有效范围。
-
-启用扫描后，程序在连接成功、按 `s` 重置控制参考，以及回到安全 Home 后，固定
-当前 TCP 姿态，只调用逆解和关节限位检查，依次探测 `-X/+X/-Y/+Y/-Z/+Z`；扫描
-不会发送 `movej`、`movel` 或 CANFD 透传运动命令。每个方向先按
-`arm_workspace_scan_step_m` 粗扫到第一个不可用点，再二分逼近边界，并检查官方
-关节范围与 `joint_limit_margin_deg`、J5 腕部奇异区以及 SDK 关节位置限位。最终每个
-方向的运行限幅为：
-
-```text
-min(max_arm_axis_offset_m, 扫描可达距离 * arm_workspace_scan_safety_ratio)
-```
-
-因此 XYZ 正负方向可以得到六个不同的实际限幅。终端日志中的
-`effective_negative` 和 `effective_positive` 即本次控制参考实际使用的范围；如果任一
-方向低于 `arm_workspace_scan_min_effective_m`，程序会保持零范围并拒绝跟踪。
-
-该扫描只验证当前姿态下的运动学、关节限位和腕部奇异点，不识别外部障碍物、线缆、
-桌面或人体，也不等价于完整碰撞检测。分轴扫描构成的是局部轴向安全盒，组合方向的
-每一个实际目标仍由运行时 IK 安全检查再次验证。
+程序启动后不会立刻跟随。人员识别稳定后按 `S` 才开始；按 `H` 返回桌面姿态并
+进入必须再次按 `S` 的暂停状态；`Q`/`Esc` 正常退出。
 
 ## 测试
 
-不连接 GPU、相机和机械臂即可执行纯 NumPy/OpenCV 几何测试：
+```bash
+python -m pip install -r requirements-dev.txt
+python -m py_compile arm_control/rebot_b601.py scripts/camera_arm_b601_control_pose_hands.py
+python -m pytest tests -q
+```
 
-    python3 -m unittest discover -s tests -v
-
-这些测试覆盖阈值与关键点映射、手 ROI、推理降频、NMS、SimCC 解码和原始
-RTMDet 输出解码，以及相邻手指的独立轮廓分割。真实 engine 兼容性、FPS、
-Orbbec 深度质量和机械臂动作仍需在
-目标 Jetson 上分阶段验收。
-
-## ROS 输出
-
-- operator_torso_depth：锁定操作者的躯干深度。
-- operator_skeleton_3d：COCO 17 点，每点为 x、y、z、score。
-- operator_arm_joint_angles：左右肩、肘角度。
-- operator_dual_hand_bends：左右手各五指弯曲度。
-- operator_dual_palm_xyz：左右掌心三维位置。
-- hand_finger_bends：当前控制手五指弯曲度。
-- hand_palm_direction_distances：当前控制手六方向位移。
+单元测试覆盖启动姿态拒绝、运动中拒绝、桌面 Z/XY 包络和 minimum-jerk 端点。
+真机通信、重力模型符号、桌面姿态、相机外参和负载变化必须在目标 B601 上按上述
+阶段重新验收，不能由无硬件测试替代。

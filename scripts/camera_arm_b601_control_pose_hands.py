@@ -1,5 +1,9 @@
 '''
-# RM65-B Pose Lite + Dual-Hand RGB-D Control
+# reBot Arm B601-DM + BrainCo Dual-Hand RGB-D Control
+
+> This file was migrated from the RM65-B demo. The active arm backend is now
+> `B601PalmFollower`; the retained RealMan classes below are compatibility-only
+> reference code and are never instantiated by this entry point.
 
 This demo combines the uploaded Orbbec RGB-D + MediaPipe hand tracking code with
 the RealMan Python SDK. It uses the detected palm 3D displacement to move the
@@ -435,6 +439,7 @@ from hand_control import (
     FingerBendHysteresis,
     thumb_opposition,
 )
+from arm_control import B601PalmFollower
 
 for _DEPTH_PACKAGE_ROOT in (_SCRIPT_DIR, _SCRIPT_DIR.parent):
     if (_DEPTH_PACKAGE_ROOT / "lingbot_depth_feature_pack").exists():
@@ -492,7 +497,7 @@ GUI_TUNING_KEYS = (
     "hand_deadband",
 )
 PERSISTENT_DEFAULTS_PATH = Path(__file__).with_name(
-    "camera_arm_rm65b_pose_hands.defaults.json"
+    "camera_arm_b601_pose_hands.defaults.json"
 )
 
 
@@ -575,14 +580,28 @@ def install_local_mediapipe_pose_model(
 
 # _add_rm_sdk_to_path()
 
-from Robotic_Arm import rm_robot_interface as rm_api
-from Robotic_Arm.rm_robot_interface import (
-    RoboticArm,
-    rm_api_version,
-    rm_inverse_kinematics_params_t,
-    rm_pos_teach_type_e,
-    rm_thread_mode_e,
-)
+try:
+    from Robotic_Arm import rm_robot_interface as rm_api
+    from Robotic_Arm.rm_robot_interface import (
+        RoboticArm,
+        rm_api_version,
+        rm_inverse_kinematics_params_t,
+        rm_pos_teach_type_e,
+        rm_thread_mode_e,
+    )
+    RM_API_AVAILABLE = True
+except Exception as rm_import_error:
+    # The B601 entry point deliberately has no runtime dependency on RM_API2.
+    # These names are retained only so the legacy reference classes can remain
+    # importable; attempting to instantiate them still fails explicitly.
+    rm_api = None
+    RoboticArm = None
+    rm_api_version = None
+    rm_inverse_kinematics_params_t = None
+    rm_pos_teach_type_e = None
+    rm_thread_mode_e = None
+    RM_API_AVAILABLE = False
+    RM_API_IMPORT_ERROR = rm_import_error
 
 
 class LatestFrameBuffer:
@@ -2315,7 +2334,7 @@ class CvDisplay:
         )
 
 
-class RM65PalmFollower:
+class LegacyRM65PalmFollower:
     def __init__(self, node):
         self.node = node
         self.logger = node.get_logger()
@@ -5097,7 +5116,7 @@ class BrainCoRs485HandClient:
             self.logger.warn(message)
 
 
-class RMHandFingerFollower:
+class BrainCoHandFingerFollower:
     RM_HAND_LABELS = (
         "pinky",
         "ring",
@@ -5286,22 +5305,23 @@ class RMHandFingerFollower:
             node.declare_parameter("hand_use_follow_pos", True).value
         )
         self.transport = str(
-            node.declare_parameter("hand_transport", "realman-hand").value
+            node.declare_parameter("hand_transport", "brainco-rs485").value
         ).strip().lower()
         if self.transport in ("brainco-socketcanfd", "socketcanfd", "canfd"):
             self.transport = "brainco-canfd"
         if self.transport in ("brainco-modbus", "brainco-rs-485", "stark-rs485"):
             self.transport = "brainco-rs485"
-        if self.transport not in (
-            "realman-hand",
-            "raw-modbus",
-            "brainco-canfd",
-            "brainco-rs485",
-        ):
+        if self.transport not in ("brainco-canfd", "brainco-rs485"):
             raise ValueError(
-                "hand_transport must be 'realman-hand', 'raw-modbus', "
-                "'brainco-canfd', or 'brainco-rs485'"
+                "The B601 integration requires an independent BrainCo hand link. "
+                "hand_transport must be 'brainco-canfd' or 'brainco-rs485'; "
+                "the RM controller tool-port transports are unavailable."
             )
+        # Never treat the B601 actuator object as an RM controller connection.
+        # The dexterous hand has its own CANFD or USB-RS485 adapter.
+        self.use_dedicated_connection = False
+        self.robot = None
+        self.owns_robot_connection = False
         if (
             self.enabled
             and self.transport in ("brainco-canfd", "brainco-rs485")
@@ -5310,7 +5330,7 @@ class RMHandFingerFollower:
             self.pause_while_arm_sdk_busy = False
             self.logger.info(
                 "Disabling hand_pause_while_arm_sdk_busy for BrainCo direct hand "
-                "transport because it does not share the RM_API tool-RS485 channel"
+                "transport because it does not share the B601 MotorBridge link"
             )
         self.force_shared_connection_for_raw_modbus = bool(
             node.declare_parameter(
@@ -5431,7 +5451,7 @@ class RMHandFingerFollower:
         self.speed = int(node.declare_parameter("hand_speed", 500).value)
         self.force = int(node.declare_parameter("hand_force", 500).value)
         self.configure_tool_voltage = bool(
-            node.declare_parameter("hand_configure_tool_voltage", True).value
+            node.declare_parameter("hand_configure_tool_voltage", False).value
         )
         self.tool_voltage_type = int(
             node.declare_parameter("hand_tool_voltage_type", 3).value
@@ -5565,9 +5585,8 @@ class RMHandFingerFollower:
         if self.robot is None and self.transport not in ("brainco-canfd", "brainco-rs485"):
             self.enabled = False
             self.logger.warn(
-                "Dexterous hand control needs the RM65-B SDK connection. "
-                "Set robot_motion_enabled:=true or hand_use_dedicated_connection:=true "
-                "before enabling hand_control_enabled."
+                "Dexterous hand control needs an independent BrainCo CANFD or "
+                "USB-RS485 connection."
             )
             return
 
@@ -5682,7 +5701,7 @@ class RMHandFingerFollower:
             if not wait_timed_out or palm_follower.has_pending_or_active_motion():
                 self._log_arm_gate(
                     now,
-                    "Holding hand command until the first RM65-B tracking command "
+                    "Holding hand command until the first B601 tracking command "
                     "succeeds or the arm stays idle past the startup hand gate timeout",
                 )
                 return False
@@ -5695,7 +5714,7 @@ class RMHandFingerFollower:
             stage = getattr(palm_follower, "motion_stage", None)
             self._log_arm_gate(
                 now,
-                f"Holding hand command while RM65-B motion is pending/active "
+                f"Holding hand command while B601 motion is pending/active "
                 f"(stage={stage})",
             )
             return False
@@ -5704,7 +5723,7 @@ class RMHandFingerFollower:
             stage = getattr(palm_follower, "motion_stage", None)
             self._log_arm_gate(
                 now,
-                f"Holding hand command while RM65-B SDK is busy (stage={stage})",
+                f"Holding hand command while the B601 backend is busy (stage={stage})",
             )
             return False
 
@@ -6355,13 +6374,13 @@ class RMHandFingerFollower:
         return max(0.0, min(1.0, float(bends.get(name, 0.0))))
 
 
-class HandPalmRm65ControlNode(Node):
+class HandPalmB601ControlNode(Node):
     STATE_WAITING = "waiting_for_person"
     STATE_READY = "ready_to_start"
     STATE_TRACKING = "tracking"
 
     def __init__(self):
-        super().__init__("hand_palm_rm65_control_node")
+        super().__init__("hand_palm_b601_control_node")
         self.persistent_defaults = load_persistent_defaults(self.get_logger())
         if self.persistent_defaults:
             self.get_logger().info(
@@ -6837,17 +6856,13 @@ class HandPalmRm65ControlNode(Node):
             raise ValueError("vision_backend must be 'rtmpose' or 'mediapipe'")
         self.kinematics = NeuralHandKinematics(self)
         self.display = CvDisplay(
-            "Hand Palm RM65-B Control",
+            "Hand Palm reBot B601-DM Control",
             display_max_width,
             display_max_height,
             show_window=show_window,
         )
-        self.palm_follower = RM65PalmFollower(self)
-        self.hand_follower = RMHandFingerFollower(self, self.palm_follower)
-        self.display.configure_tuning(
-            self.gui_tuning_values(),
-            enabled=True,
-        )
+        self.palm_follower = None
+        self.hand_follower = None
 
         self.prev_points_3d = {}
         self.prev_time = None
@@ -6912,7 +6927,26 @@ class HandPalmRm65ControlNode(Node):
         self.last_person_log_time = 0.0
         self.auto_start_ready_since = None
 
+        # Start fallible vision resources before enabling the unbraked arm.
+        # Timers cannot run until rclpy.spin(), so it is also safe to create
+        # them before the hardware objects exist.
+        self.timer = self.create_timer(1.0 / 30.0, self.timer_callback)
+        self.health_timer = self.create_timer(1.0, self.health_callback)
         self.camera.start()
+        try:
+            self.palm_follower = B601PalmFollower(self)
+            self.hand_follower = BrainCoHandFingerFollower(self, self.palm_follower)
+            self.display.configure_tuning(
+                self.gui_tuning_values(),
+                enabled=True,
+            )
+        except Exception:
+            if self.hand_follower is not None:
+                self.hand_follower.close()
+            if self.palm_follower is not None:
+                self.palm_follower.close()
+            self.camera.stop()
+            raise
         self.get_logger().info(
             "Hardware/software initialization complete. Waiting for the nearest "
             "person; press 's' in the display window to start recognition/control."
@@ -6926,8 +6960,6 @@ class HandPalmRm65ControlNode(Node):
             f"depth_enhancement="
             f"{self.depth_enhancer.backend if self.depth_enhancer else 'off'}"
         )
-        self.timer = self.create_timer(1.0 / 30.0, self.timer_callback)
-        self.health_timer = self.create_timer(1.0, self.health_callback)
 
     def health_callback(self):
         if self.is_shutting_down or self.restart_in_progress:
@@ -7754,22 +7786,40 @@ class HandPalmRm65ControlNode(Node):
         self.is_shutting_down = True
         try:
             self.detector.close()
-        except Exception:
-            pass
-        self.camera.stop()
+        except Exception as exc:
+            self.get_logger().warn(f"Detector shutdown failed: {exc}")
+        try:
+            self.camera.stop()
+        except Exception as exc:
+            self.get_logger().warn(f"Camera shutdown failed: {exc}")
         if self.depth_enhancer is not None:
-            self.depth_enhancer.close()
-        self.hand_follower.close()
-        self.palm_follower.close()
-        self.display.close()
-        super().destroy_node()
+            try:
+                self.depth_enhancer.close()
+            except Exception as exc:
+                self.get_logger().warn(f"Depth enhancer shutdown failed: {exc}")
+        if self.hand_follower is not None:
+            try:
+                self.hand_follower.close()
+            except Exception as exc:
+                self.get_logger().error(f"BrainCo hand shutdown failed: {exc}")
+        # Always attempt the B601 table-home path even when another resource
+        # failed to close. This ordering is safety-critical for an unbraked arm.
+        if self.palm_follower is not None:
+            try:
+                self.palm_follower.close()
+            except Exception as exc:
+                self.get_logger().fatal(f"B601 safe shutdown failed: {exc}")
+        try:
+            self.display.close()
+        finally:
+            super().destroy_node()
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = None
     try:
-        node = HandPalmRm65ControlNode()
+        node = HandPalmB601ControlNode()
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass

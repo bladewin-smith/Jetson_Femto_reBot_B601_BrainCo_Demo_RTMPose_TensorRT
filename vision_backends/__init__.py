@@ -1,4 +1,4 @@
-"""Vision backends used by the RM65-B RGB-D controller."""
+"""Vision backends used by the B601-DM RGB-D controller."""
 
 from .rtmpose_backend import (
     RTMDetDepthPersonSelector,

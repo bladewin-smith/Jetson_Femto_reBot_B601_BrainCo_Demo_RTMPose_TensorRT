@@ -12,3 +12,7 @@ models/mmdeploy/*/
 *.onnx
 *.pth
 *.pt
+
+# Site-specific hardware confirmation and calibration values.
+jetson_autostart/b601_brainco_orbbec_demo.env
+scripts/camera_arm_b601_pose_hands.defaults.json
