@@ -23,8 +23,14 @@ for file in "$DET_ENGINE" "$BODY_ENGINE" "$HAND_ENGINE"; do
 done
 
 if [[ -f /opt/ros/humble/setup.bash ]]; then
+  # ROS Humble's generated setup scripts read several optional variables
+  # before checking whether they are defined, which is incompatible with
+  # `set -u`. Keep strict mode for this launcher, but suspend nounset only
+  # while the trusted ROS environment script is being sourced.
+  set +u
   # shellcheck disable=SC1091
   source /opt/ros/humble/setup.bash
+  set -u
 fi
 export PYTHONPATH="$HOME/ws/pyorbbecsdk-2-main:$HOME/ws/brainco-hand-sdk-main/python:$REPO:$REPO/scripts:$REPO/third_party/reBotArm_control_py:${PYTHONPATH:-}"
 
