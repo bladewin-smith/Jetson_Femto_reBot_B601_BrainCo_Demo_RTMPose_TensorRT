@@ -6,6 +6,7 @@ from arm_control.rebot_b601 import (
     StartupGuardError,
     acceleration_limited_scalar_target,
     apply_tabletop_motion_envelope,
+    confirm_directional_wrist_twist,
     filtered_wrapped_angle_delta,
     horizontal_radial_axis,
     joint_tracking_bounds,
@@ -247,6 +248,61 @@ def test_wrist_twist_filter_wraps_boundary_and_rejects_one_frame_spike():
 
     assert np.rad2deg(boundary_delta) == pytest.approx(2.0)
     assert np.rad2deg(spike_delta) == pytest.approx(6.0)
+
+
+def test_wrist_twist_direction_requires_confirmation_and_holds_through_spike():
+    state = (0, 0.0, 0, 0)
+
+    for _ in range(3):
+        state = confirm_directional_wrist_twist(
+            np.deg2rad(20.0),
+            *state,
+            activate_rad=np.deg2rad(12.0),
+            release_rad=np.deg2rad(6.0),
+            confirm_samples=4,
+        )
+        assert state[0] == 0
+    state = confirm_directional_wrist_twist(
+        np.deg2rad(20.0),
+        *state,
+        activate_rad=np.deg2rad(12.0),
+        release_rad=np.deg2rad(6.0),
+        confirm_samples=4,
+    )
+    assert state[0] == 1
+    assert np.rad2deg(state[1]) == pytest.approx(20.0)
+
+    state = confirm_directional_wrist_twist(
+        np.deg2rad(-25.0),
+        *state,
+        activate_rad=np.deg2rad(12.0),
+        release_rad=np.deg2rad(6.0),
+        confirm_samples=4,
+    )
+    assert state[0] == 1
+    assert np.rad2deg(state[1]) == pytest.approx(20.0)
+    assert state[2:] == (-1, 1)
+
+    for _ in range(3):
+        state = confirm_directional_wrist_twist(
+            np.deg2rad(-25.0),
+            *state,
+            activate_rad=np.deg2rad(12.0),
+            release_rad=np.deg2rad(6.0),
+            confirm_samples=4,
+        )
+    assert state[0] == -1
+    assert np.rad2deg(state[1]) == pytest.approx(-25.0)
+
+    for _ in range(4):
+        state = confirm_directional_wrist_twist(
+            0.0,
+            *state,
+            activate_rad=np.deg2rad(12.0),
+            release_rad=np.deg2rad(6.0),
+            confirm_samples=4,
+        )
+    assert state == (0, 0.0, 0, 0)
 
 
 def test_weighted_planar_dls_biases_motion_toward_more_mobile_joint():

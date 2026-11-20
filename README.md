@@ -165,7 +165,7 @@ python scripts/camera_arm_b601_control_pose_hands.py --ros-args \
 | 掌心整体前后位移 | J2 + J3 + J4 | 沿当前底座到 TCP 的水平径向做加权阻尼雅可比解算 |
 | 掌心上下位移 | J2 + J3 + J4 | 与前后位移组成同一个二维任务，同时保持中间连杆净空 |
 | 肘关节屈伸、腕关节俯仰 | 不直接控制关节 | 仍可用于视觉诊断，但不再分别映射到 J3/J4 |
-| 掌面旋转 | J6 | 食指/小指掌指关节连线在图像平面的滚转角映射到 J6 |
+| 前臂旋前/旋后 | J6 | 三维掌面法向量绕肘—腕轴的确认角映射到 J6 |
 
 J5 在该模式下保持本次跟踪开始时的参考角。二维解算器把掌心深度和高度作为一个
 连续目标，通过 `b601_semantic_planar_joint_mobility` 调整 J2/J3/J4 的相对参与度，
@@ -177,9 +177,10 @@ J5 在该模式下保持本次跟踪开始时的参考角。二维解算器把�
 
 六个 `b601_semantic_channel_enable` 值依次表示：
 `[J1左右, J2/J3/J4前后, 保留, 保留, J6滚转, J2/J3/J4上下]`。第 3、4 项仅为兼容
-旧命令保留，设成 0 或 1 都不会再把肘/腕角送给电机。为了避免贴桌拖动，前后、J1、
-J6 会根据 TCP 实际抬升和连杆实际净空从 0 到 1 连续淡入，不再在阈值处突然开关；
-上下通道始终可用于离桌。高度任务分别给 link3、link4、TCP 分配 50%、82%、100%
+旧命令保留，设成 0 或 1 都不会再把肘/腕角送给电机。为了避免贴桌拖动，前后与 J1
+会根据 TCP 实际抬升和连杆实际净空从 0 到 1 连续淡入；J6 在净空达到 95% 后才解锁，
+并在解锁瞬间重新采集腕部零位，避免把抬手动作误判成旋腕。上下通道始终可用于离桌。
+高度任务分别给 link3、link4、TCP 分配 50%、82%、100%
 的目标抬升量，避免只抬末端而让中间连杆继续贴桌。每次控制手左右切换也会重新采集
 当前人体掌心和关节参考，避免瞬时跳变。
 
@@ -252,16 +253,20 @@ run_b601_semantic_test() {
     -p b601_tabletop_joint_tolerance_rad:='[0.12,0.12,0.12,0.12,0.12,0.12]' \
     -p b601_control_mode:=semantic_joint \
     -p b601_semantic_channel_enable:="$CHANNELS" \
-    -p b601_semantic_joint_gains:='[0.65,-0.60,0.18,0.15,0.30]' \
+    -p b601_semantic_joint_gains:='[0.65,-0.60,0.18,0.15,0.45]' \
     -p b601_semantic_angle_deadband_deg:='[5.0,5.0,3.0]' \
-    -p b601_wrist_twist_filter_alpha:=0.30 \
-    -p b601_wrist_twist_max_innovation_deg:=20.0 \
-    -p b601_semantic_max_joint_offset_rad:='[0.035,0.080,0.100,0.070,0.008,0.160]' \
-    -p b601_semantic_max_step_rad:='[0.0025,0.0025,0.0030,0.0020,0.0010,0.0040]' \
+    -p b601_wrist_twist_filter_alpha:=0.15 \
+    -p b601_wrist_twist_max_innovation_deg:=12.0 \
+    -p b601_wrist_twist_activate_deg:=12.0 \
+    -p b601_wrist_twist_release_deg:=6.0 \
+    -p b601_wrist_twist_confirm_samples:=4 \
+    -p b601_wrist_twist_min_joint_offset_rad:=0.140 \
+    -p b601_semantic_max_joint_offset_rad:='[0.035,0.080,0.100,0.070,0.008,0.300]' \
+    -p b601_semantic_max_step_rad:='[0.0025,0.0025,0.0030,0.0020,0.0010,0.0060]' \
     -p b601_joint_kp:='[120.0,120.0,180.0,30.0,35.0,30.0]' \
     -p b601_joint_kd:='[8.0,8.0,8.0,4.0,2.0,2.0]' \
     -p b601_joint_effort_limit_nm:='[8.0,10.0,16.0,6.0,4.0,4.0]' \
-    -p b601_semantic_max_tracking_error_rad:='[0.012,0.020,0.055,0.018,0.008,0.025]' \
+    -p b601_semantic_max_tracking_error_rad:='[0.012,0.020,0.055,0.018,0.008,0.040]' \
     -p b601_semantic_stall_error_rad:='[0.010,0.015,0.030,0.015,0.010,0.012]' \
     -p b601_semantic_stall_min_progress_rad:=0.0015 \
     -p b601_semantic_stall_timeout_s:=4.0 \
@@ -279,8 +284,8 @@ run_b601_semantic_test() {
     -p b601_semantic_j4_target_max_velocity_rad_s:=0.025 \
     -p b601_semantic_j4_target_max_acceleration_rad_s2:=0.10 \
     -p b601_semantic_j4_target_deadband_rad:=0.0015 \
-    -p b601_semantic_j6_target_max_velocity_rad_s:=0.08 \
-    -p b601_semantic_j6_target_max_acceleration_rad_s2:=0.40 \
+    -p b601_semantic_j6_target_max_velocity_rad_s:=0.10 \
+    -p b601_semantic_j6_target_max_acceleration_rad_s2:=0.50 \
     -p b601_semantic_j6_target_deadband_rad:=0.0015 \
     -p b601_semantic_vertical_solver_step_rad:=0.015 \
     -p b601_semantic_vertical_solver_iterations:=12 \
@@ -298,8 +303,9 @@ run_b601_semantic_test() {
 日志中的 `tcp_lift` 应比按 `S` 时增加至少约 `0.015m`，最终目标约 `0.025m`；
 `chain_clearance` 应达到约 `0.001m`，并出现 `articulation=ready`；
 `actual_error` 中的 `height` 应逐步降到约 `0.005m` 以下。机械臂抬升过程中
-`forward_gate` 会从 0 平滑增加到 1；只有它接近 1 后，掌心前后、J1 和 J6
-才达到完整幅度。
+`forward_gate` 会从 0 平滑增加到 1；掌心前后和 J1 逐步达到完整幅度。J6 则等待
+`J6_clearance=armed`，此时会自动在抬升后的姿态重新置零；看到该字段后保持掌心位置，
+再开始旋腕。
 `q_target` 会从上一次目标连续爬坡，并由 `target_lead` 显示它相对实测关节角积累的
 有限位置误差。`q_sent` 是经过总力矩限制后真正发送的目标；`tau_g` 是重力前馈，
 `tau_measured` 是电机反馈力矩，`effort_cmd` 是包含位置、阻尼与重力项的指令估算，
@@ -335,11 +341,14 @@ J6 不再使用食指 MCP 5 到小指 MCP 17 的二维连线角度。新算法�
 [MediaPipe Hands](https://github.com/google-ai-edge/mediapipe/blob/master/docs/solutions/hands.md)
 公开的 21 点三维手部表示一致，但继续复用现有
 [MMPose RTMPose 手部模型](https://github.com/open-mmlab/mmpose/blob/main/demo/docs/en/2d_hand_demo.md)
-和 TensorRT 引擎，不增加第二套推理运行时。单帧角度创新限制、圆周低通滤波以及
-J6 独立速度/加速度限制会抑制深度尖峰；任一必需点没有可靠深度，或手臂几乎完全
+和 TensorRT 引擎，不增加第二套推理运行时。单帧角度创新限制、圆周低通滤波、
+四帧同方向确认以及 J6 独立速度/加速度限制会抑制深度尖峰。确认后的 J6 至少产生
+`0.140rad`（约 8°）的可见目标，最大限制为 `0.300rad`（约 17°）；孤立反向帧会
+保持原方向，不会立即反转。任一必需点没有可靠深度，或手臂几乎完全
 伸直导致肩—肘—腕平面退化时，日志显示 `wrist_twist=invalid`，控制器保持上一 J6
 目标而不是猜测。测试时肘部保持约 60–120° 弯曲，张开手掌，肩、肘、腕和掌心均
-留在画面与深度量程内。`J6_delta` 是滤波后相对按 `S` 时参考姿态的角度。
+留在画面与深度量程内。`J6_delta` 是滤波后的腕部角度，`J6_confirmed` 是消抖确认值，
+`J6_offset` 是关节目标偏移，`J6_measured_offset` 是电机反馈的真实偏移。
 
 如果 J1 或 J6 方向与现场期望相反，只翻转 `b601_semantic_joint_gains` 中第 1 或第 5 项；
 前后方向由末端径向几何定义，不应通过翻转某个 J2/J3/J4 增益来修改。若出现持续振荡、

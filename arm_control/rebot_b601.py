@@ -545,6 +545,75 @@ def filtered_wrapped_angle_delta(
     )
 
 
+def confirm_directional_wrist_twist(
+    filtered_delta_rad: float,
+    active_direction: int,
+    held_delta_rad: float,
+    candidate_direction: int,
+    candidate_count: int,
+    activate_rad: float,
+    release_rad: float,
+    confirm_samples: int,
+) -> tuple[int, float, int, int]:
+    """Debounce wrist-twist direction before changing the J6 command.
+
+    Depth-derived palm normals can briefly flip direction.  A confirmed
+    direction is therefore held through isolated contradictory samples and is
+    changed (or released to neutral) only after several consecutive samples.
+    The downstream J6 velocity/acceleration limiter still shapes all motion.
+    """
+
+    values = np.asarray(
+        [filtered_delta_rad, held_delta_rad, activate_rad, release_rad],
+        dtype=np.float64,
+    )
+    if not np.all(np.isfinite(values)):
+        raise ValueError("wrist-twist confirmation inputs must be finite")
+    if active_direction not in (-1, 0, 1) or candidate_direction not in (-1, 0, 1):
+        raise ValueError("wrist-twist directions must be -1, 0, or 1")
+    if confirm_samples < 1 or candidate_count < 0:
+        raise ValueError("wrist-twist confirmation counts must be positive")
+    if release_rad < 0.0 or activate_rad <= release_rad:
+        raise ValueError("wrist-twist activation must exceed its release threshold")
+
+    magnitude = abs(float(filtered_delta_rad))
+    observed_direction = int(np.sign(filtered_delta_rad))
+    if active_direction == 0:
+        requested_direction = observed_direction if magnitude >= activate_rad else 0
+    elif magnitude <= release_rad:
+        requested_direction = 0
+    elif observed_direction == active_direction:
+        # A valid sample in the active direction refreshes the proportional
+        # magnitude immediately and cancels any pending release/reversal.
+        return active_direction, float(filtered_delta_rad), 0, 0
+    elif magnitude >= activate_rad:
+        requested_direction = observed_direction
+    else:
+        # Inside the Schmitt band, keep the last confirmed direction and value.
+        return active_direction, float(held_delta_rad), 0, 0
+
+    if requested_direction == active_direction:
+        return active_direction, float(held_delta_rad), 0, 0
+    if requested_direction != candidate_direction:
+        candidate_direction = requested_direction
+        candidate_count = 1
+    else:
+        candidate_count += 1
+    if candidate_count < confirm_samples:
+        return (
+            active_direction,
+            float(held_delta_rad),
+            candidate_direction,
+            candidate_count,
+        )
+
+    active_direction = candidate_direction
+    held_delta_rad = (
+        float(filtered_delta_rad) if active_direction != 0 else 0.0
+    )
+    return active_direction, held_delta_rad, 0, 0
+
+
 def synchronize_vertical_follower_progress(
     reference_rad: Sequence[float],
     desired_rad: Sequence[float],
@@ -898,7 +967,7 @@ class B601PalmFollower:
         self.semantic_joint_gains = _vector(
             node.declare_parameter(
                 "b601_semantic_joint_gains",
-                [0.60, -0.60, 0.20, 0.15, 0.30],
+                [0.60, -0.60, 0.20, 0.15, 0.45],
             ).value,
             5,
             "b601_semantic_joint_gains",
@@ -935,38 +1004,78 @@ class B601PalmFollower:
         )
         self.wrist_twist_filter_alpha = float(
             node.declare_parameter(
-                "b601_wrist_twist_filter_alpha", 0.30
+                "b601_wrist_twist_filter_alpha", 0.15
             ).value
         )
         self.wrist_twist_max_innovation_rad = np.deg2rad(
             float(
                 node.declare_parameter(
-                    "b601_wrist_twist_max_innovation_deg", 20.0
+                    "b601_wrist_twist_max_innovation_deg", 12.0
                 ).value
             )
+        )
+        self.wrist_twist_activate_rad = np.deg2rad(
+            float(
+                node.declare_parameter(
+                    "b601_wrist_twist_activate_deg", 12.0
+                ).value
+            )
+        )
+        self.wrist_twist_release_rad = np.deg2rad(
+            float(
+                node.declare_parameter(
+                    "b601_wrist_twist_release_deg", 6.0
+                ).value
+            )
+        )
+        self.wrist_twist_confirm_samples = int(
+            node.declare_parameter(
+                "b601_wrist_twist_confirm_samples", 4
+            ).value
         )
         if (
             not np.isfinite(self.wrist_twist_filter_alpha)
             or not 0.0 < self.wrist_twist_filter_alpha <= 1.0
             or not np.isfinite(self.wrist_twist_max_innovation_rad)
             or not 0.0 < self.wrist_twist_max_innovation_rad <= np.pi
+            or not np.isfinite(self.wrist_twist_activate_rad)
+            or not np.isfinite(self.wrist_twist_release_rad)
+            or self.wrist_twist_release_rad < 0.0
+            or self.wrist_twist_activate_rad <= self.wrist_twist_release_rad
+            or self.wrist_twist_confirm_samples < 1
         ):
             raise ValueError(
                 "B601 wrist-twist filter alpha must be in (0, 1] and "
-                "maximum innovation must be in (0, 180] degrees"
+                "maximum innovation in (0, 180] degrees; activation must "
+                "exceed release and confirmation samples must be positive"
             )
         self.semantic_max_joint_offset = _positive_vector(
             node.declare_parameter(
                 "b601_semantic_max_joint_offset_rad",
-                [0.035, 0.040, 0.040, 0.030, 0.010, 0.160],
+                [0.035, 0.040, 0.040, 0.030, 0.010, 0.300],
             ).value,
             6,
             "b601_semantic_max_joint_offset_rad",
         )
+        self.wrist_twist_min_joint_offset_rad = float(
+            node.declare_parameter(
+                "b601_wrist_twist_min_joint_offset_rad", 0.140
+            ).value
+        )
+        if (
+            not np.isfinite(self.wrist_twist_min_joint_offset_rad)
+            or self.wrist_twist_min_joint_offset_rad <= 0.0
+            or self.wrist_twist_min_joint_offset_rad
+            > self.semantic_max_joint_offset[5]
+        ):
+            raise ValueError(
+                "B601 wrist-twist minimum J6 offset must be positive and no "
+                "greater than the J6 maximum joint offset"
+            )
         self.semantic_max_step = _positive_vector(
             node.declare_parameter(
                 "b601_semantic_max_step_rad",
-                [0.004, 0.004, 0.004, 0.003, 0.002, 0.004],
+                [0.004, 0.004, 0.004, 0.003, 0.002, 0.006],
             ).value,
             6,
             "b601_semantic_max_step_rad",
@@ -974,7 +1083,7 @@ class B601PalmFollower:
         self.semantic_max_tracking_error = _positive_vector(
             node.declare_parameter(
                 "b601_semantic_max_tracking_error_rad",
-                [0.012, 0.024, 0.040, 0.025, 0.008, 0.025],
+                [0.012, 0.024, 0.040, 0.025, 0.008, 0.040],
             ).value,
             6,
             "b601_semantic_max_tracking_error_rad",
@@ -1208,12 +1317,12 @@ class B601PalmFollower:
             )
         self.semantic_j6_target_max_velocity = float(
             node.declare_parameter(
-                "b601_semantic_j6_target_max_velocity_rad_s", 0.08
+                "b601_semantic_j6_target_max_velocity_rad_s", 0.10
             ).value
         )
         self.semantic_j6_target_max_acceleration = float(
             node.declare_parameter(
-                "b601_semantic_j6_target_max_acceleration_rad_s2", 0.40
+                "b601_semantic_j6_target_max_acceleration_rad_s2", 0.50
             ).value
         )
         self.semantic_j6_target_deadband = float(
@@ -1309,6 +1418,12 @@ class B601PalmFollower:
         self.semantic_signal_deltas = {
             "wrist_twist": 0.0,
         }
+        self.semantic_j6_clearance_enabled = False
+        self.semantic_j6_active_direction = 0
+        self.semantic_j6_held_delta_rad = 0.0
+        self.semantic_j6_candidate_direction = 0
+        self.semantic_j6_candidate_count = 0
+        self.semantic_j6_command_offset_rad = 0.0
         self.last_semantic_log_time = 0.0
         self.last_semantic_vertical_error_m = 0.0
         self.last_semantic_planar_error_m = np.zeros(2, dtype=np.float64)
@@ -1693,11 +1808,20 @@ class B601PalmFollower:
     # Tracking interface
     # ------------------------------------------------------------------
 
+    def _reset_wrist_twist_confirmation(self) -> None:
+        self.semantic_j6_clearance_enabled = False
+        self.semantic_j6_active_direction = 0
+        self.semantic_j6_held_delta_rad = 0.0
+        self.semantic_j6_candidate_direction = 0
+        self.semantic_j6_candidate_count = 0
+        self.semantic_j6_command_offset_rad = 0.0
+
     def _reset_semantic_smoothing(self, now_s: float = 0.0) -> None:
         self.semantic_planar_command_m.fill(0.0)
         self.last_semantic_planar_command_time = float(now_s)
         self.semantic_j4_target_velocity = 0.0
         self.semantic_j6_target_velocity = 0.0
+        self._reset_wrist_twist_confirmation()
 
     def begin_tracking_cycle(self, reason: str = "person_start") -> bool:
         if not self.enabled:
@@ -1877,6 +2001,7 @@ class B601PalmFollower:
             self.last_semantic_planar_command_time = now
             self.semantic_j4_target_velocity = 0.0
             self.semantic_j6_target_velocity = 0.0
+            self._reset_wrist_twist_confirmation()
             self._reset_filters()
             if now - self.last_semantic_log_time >= 1.0:
                 self.logger.warn(
@@ -1909,19 +2034,6 @@ class B601PalmFollower:
         lift *= self.semantic_planar_input_scale[1]
         lift = float(np.clip(lift, 0.0, self.semantic_vertical_max_lift_m))
 
-        roll_delta = self._semantic_angle_delta(
-            "wrist_twist",
-            observation.palm_roll_rad,
-            self.semantic_angle_deadband_rad[2],
-        )
-
-        direct_offsets = semantic_direct_joint_offsets(
-            lateral,
-            roll_delta,
-            self.semantic_joint_gains,
-            self.semantic_channel_enable,
-            self.semantic_max_joint_offset,
-        )
         tcp_lift, chain_clearance = self._semantic_clearance_from_table(q_seed)
         tcp_fraction = (
             1.0
@@ -1956,8 +2068,86 @@ class B601PalmFollower:
         articulation_ready = (
             clearance_fraction >= 1.0 - 1e-6
         )
+        # Arm J6 only after the links have reached near-full clearance, then
+        # capture a fresh twist zero.  Lifting the palm from the table changes
+        # the human arm plane considerably and must not be mistaken for a
+        # deliberate wrist rotation.  A lower disarm threshold prevents gate
+        # chatter when measured clearance sits close to the boundary.
+        if (
+            not self.semantic_j6_clearance_enabled
+            and clearance_fraction >= 0.95
+            and observation.palm_roll_rad is not None
+            and np.isfinite(observation.palm_roll_rad)
+        ):
+            self.semantic_j6_clearance_enabled = True
+            self.semantic_signal_references["wrist_twist"] = float(
+                observation.palm_roll_rad
+            )
+            self.semantic_signal_deltas["wrist_twist"] = 0.0
+            self.semantic_j6_active_direction = 0
+            self.semantic_j6_held_delta_rad = 0.0
+            self.semantic_j6_candidate_direction = 0
+            self.semantic_j6_candidate_count = 0
+        elif self.semantic_j6_clearance_enabled and clearance_fraction <= 0.50:
+            self._reset_wrist_twist_confirmation()
+
+        roll_delta = self._semantic_angle_delta(
+            "wrist_twist",
+            observation.palm_roll_rad,
+            self.semantic_angle_deadband_rad[2],
+        )
+        if self.semantic_j6_clearance_enabled:
+            (
+                self.semantic_j6_active_direction,
+                self.semantic_j6_held_delta_rad,
+                self.semantic_j6_candidate_direction,
+                self.semantic_j6_candidate_count,
+            ) = confirm_directional_wrist_twist(
+                roll_delta,
+                self.semantic_j6_active_direction,
+                self.semantic_j6_held_delta_rad,
+                self.semantic_j6_candidate_direction,
+                self.semantic_j6_candidate_count,
+                self.wrist_twist_activate_rad,
+                self.wrist_twist_release_rad,
+                self.wrist_twist_confirm_samples,
+            )
+        else:
+            roll_delta = 0.0
+
+        direct_offsets = semantic_direct_joint_offsets(
+            lateral,
+            self.semantic_j6_held_delta_rad,
+            self.semantic_joint_gains,
+            self.semantic_channel_enable,
+            self.semantic_max_joint_offset,
+        )
+        if (
+            self.semantic_channel_enable[4] > 0.5
+            and self.semantic_j6_active_direction != 0
+            and abs(float(direct_offsets[5])) > 1e-9
+        ):
+            direct_offsets[5] = float(
+                np.copysign(
+                    max(
+                        abs(float(direct_offsets[5])),
+                        self.wrist_twist_min_joint_offset_rad,
+                    ),
+                    float(direct_offsets[5]),
+                )
+            )
+            direct_offsets[5] = float(
+                np.clip(
+                    direct_offsets[5],
+                    -self.semantic_max_joint_offset[5],
+                    self.semantic_max_joint_offset[5],
+                )
+            )
+        else:
+            direct_offsets[5] = 0.0
+        self.semantic_j6_command_offset_rad = float(direct_offsets[5])
         direct_offsets[0] *= forward_gate
-        direct_offsets[5] *= forward_gate
+        direct_offsets[5] *= float(self.semantic_j6_clearance_enabled)
         q_reference = self.semantic_control_reference_q
         q_base = q_reference + direct_offsets
         requested_forward_target = (
@@ -2119,8 +2309,14 @@ class B601PalmFollower:
                 f"J4_target_velocity={self.semantic_j4_target_velocity:+.4f}rad/s, "
                 f"J6_target_velocity={self.semantic_j6_target_velocity:+.4f}rad/s, "
                 f"articulation={'ready' if articulation_ready else 'locked'}, "
+                f"J6_clearance={'armed' if self.semantic_j6_clearance_enabled else 'locked'}, "
                 f"wrist_twist={wrist_twist_text}, "
                 f"J6_delta={np.rad2deg(roll_delta):+.1f}deg, "
+                f"J6_confirmed={np.rad2deg(self.semantic_j6_held_delta_rad):+.1f}deg, "
+                f"J6_direction={self.semantic_j6_active_direction:+d}, "
+                f"J6_pending={self.semantic_j6_candidate_count}/{self.wrist_twist_confirm_samples}, "
+                f"J6_offset={np.rad2deg(self.semantic_j6_command_offset_rad):+.1f}deg, "
+                f"J6_measured_offset={np.rad2deg(q_seed[5] - q_reference[5]):+.1f}deg, "
                 f"q_measured={q_seed.round(4).tolist()}, "
                 f"q_desired={q_desired.round(4).tolist()}, "
                 f"q_target={q_target.round(4).tolist()}, "

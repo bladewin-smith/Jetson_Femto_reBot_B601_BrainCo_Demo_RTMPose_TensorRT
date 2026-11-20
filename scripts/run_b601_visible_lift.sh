@@ -40,7 +40,7 @@ export PYTHONPATH="$HOME/ws/pyorbbecsdk-2-main:$HOME/ws/brainco-hand-sdk-main/py
 echo "Visible B601 planar profile: J2/J3/J4 joint forward/height solve, 25 mm lift"
 echo "Forward mapping: 0.35x palm depth, bounded to +/-35 mm after tabletop clearance"
 echo "J4 anti-jitter: task slew limit + 25 mrad/s velocity + 0.10 rad/s^2 acceleration"
-echo "J6 wrist twist: 3-D palm normal around the bent elbow-to-wrist axis; 9.2 deg max"
+echo "J6 wrist twist: clearance re-zero + 4-sample confirmation; 8-17 deg visible target"
 echo "For J6 keep the shoulder, bent elbow, wrist and open palm visible to the depth camera"
 echo "Channels: $CHANNELS"
 echo "Detector engine: $DET_ENGINE"
