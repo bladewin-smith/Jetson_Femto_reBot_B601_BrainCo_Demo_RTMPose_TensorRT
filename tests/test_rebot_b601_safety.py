@@ -4,6 +4,7 @@ import pytest
 from arm_control.rebot_b601 import (
     B601PalmFollower,
     StartupGuardError,
+    acceleration_limited_scalar_target,
     apply_tabletop_motion_envelope,
     horizontal_radial_axis,
     joint_tracking_bounds,
@@ -14,6 +15,7 @@ from arm_control.rebot_b601 import (
     resolve_native_frame_ids,
     scale_vector_to_max_abs,
     send_mit_checked,
+    slew_limit_vector,
     synchronize_vertical_follower_progress,
     validate_tabletop_startup,
     weighted_damped_least_squares,
@@ -167,6 +169,61 @@ def test_coordinated_joint_step_scaling_preserves_direction():
 
     assert np.max(np.abs(scaled)) == pytest.approx(0.012)
     np.testing.assert_allclose(scaled / raw, np.full(3, 0.012 / 0.044))
+
+
+def test_planar_command_slew_limit_rejects_single_frame_jump():
+    limited = slew_limit_vector(
+        requested=[0.035, 0.025],
+        previous=[0.0, 0.0],
+        max_velocity=[0.040, 0.035],
+        dt_s=0.06,
+    )
+
+    np.testing.assert_allclose(limited, [0.0024, 0.0021])
+
+
+def test_j4_target_limiter_bounds_velocity_acceleration_and_deadband():
+    target = 0.0
+    velocity = 0.0
+    velocities = []
+    for _ in range(8):
+        target, velocity = acceleration_limited_scalar_target(
+            requested=0.08,
+            previous=target,
+            previous_velocity=velocity,
+            max_velocity=0.025,
+            max_acceleration=0.10,
+            deadband=0.0015,
+            dt_s=0.06,
+        )
+        velocities.append(velocity)
+
+    assert 0.0 < target < 0.08
+    assert max(abs(value) for value in velocities) <= 0.025
+    assert max(abs(b - a) for a, b in zip(velocities, velocities[1:])) <= 0.006001
+
+    _, reversed_velocity = acceleration_limited_scalar_target(
+        requested=-0.08,
+        previous=target,
+        previous_velocity=velocity,
+        max_velocity=0.025,
+        max_acceleration=0.10,
+        deadband=0.0015,
+        dt_s=0.06,
+    )
+    assert reversed_velocity == pytest.approx(velocity - 0.006)
+
+    held, stopped = acceleration_limited_scalar_target(
+        requested=target + 0.001,
+        previous=target,
+        previous_velocity=velocity,
+        max_velocity=0.025,
+        max_acceleration=0.10,
+        deadband=0.0015,
+        dt_s=0.06,
+    )
+    assert held == pytest.approx(target)
+    assert stopped == pytest.approx(0.0)
 
 
 def test_weighted_planar_dls_biases_motion_toward_more_mobile_joint():

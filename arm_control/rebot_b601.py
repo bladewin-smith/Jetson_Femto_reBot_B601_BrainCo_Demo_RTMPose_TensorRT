@@ -420,6 +420,81 @@ def ramp_joint_target_with_tracking_window(
     )
 
 
+def slew_limit_vector(
+    requested: Sequence[float],
+    previous: Sequence[float],
+    max_velocity: Sequence[float],
+    dt_s: float,
+) -> np.ndarray:
+    """Rate-limit a task-space command without changing its absolute bounds."""
+
+    target = np.asarray(requested, dtype=np.float64).reshape(-1)
+    prior = np.asarray(previous, dtype=np.float64).reshape(-1)
+    velocity = np.asarray(max_velocity, dtype=np.float64).reshape(-1)
+    dt = float(dt_s)
+    if not target.shape == prior.shape == velocity.shape:
+        raise ValueError("slew-limit vectors must have matching shapes")
+    if not all(np.all(np.isfinite(value)) for value in (target, prior, velocity)):
+        raise ValueError("slew-limit vectors must contain finite values")
+    if np.any(velocity <= 0.0) or not np.isfinite(dt) or dt <= 0.0:
+        raise ValueError("slew-limit velocity and dt must be positive")
+    maximum_step = velocity * dt
+    return prior + np.clip(target - prior, -maximum_step, maximum_step)
+
+
+def acceleration_limited_scalar_target(
+    requested: float,
+    previous: float,
+    previous_velocity: float,
+    max_velocity: float,
+    max_acceleration: float,
+    deadband: float,
+    dt_s: float,
+) -> tuple[float, float]:
+    """Return a deadbanded velocity/acceleration-limited scalar target."""
+
+    values = np.asarray(
+        [
+            requested,
+            previous,
+            previous_velocity,
+            max_velocity,
+            max_acceleration,
+            deadband,
+            dt_s,
+        ],
+        dtype=np.float64,
+    )
+    if not np.all(np.isfinite(values)):
+        raise ValueError("acceleration-limited target inputs must be finite")
+    if max_velocity <= 0.0 or max_acceleration <= 0.0 or dt_s <= 0.0:
+        raise ValueError("target velocity, acceleration and dt must be positive")
+    if deadband < 0.0:
+        raise ValueError("target deadband cannot be negative")
+
+    error = float(requested - previous)
+    if abs(error) <= deadband:
+        return float(previous), 0.0
+    requested_velocity = float(
+        np.clip(error / dt_s, -max_velocity, max_velocity)
+    )
+    velocity_step = float(
+        np.clip(
+            requested_velocity - previous_velocity,
+            -max_acceleration * dt_s,
+            max_acceleration * dt_s,
+        )
+    )
+    velocity = float(
+        np.clip(previous_velocity + velocity_step, -max_velocity, max_velocity)
+    )
+    step = velocity * dt_s
+    # Never cross the requested target. On arrival, remove residual velocity.
+    if step * error > 0.0 and abs(step) >= abs(error):
+        return float(requested), 0.0
+    return float(previous + step), velocity
+
+
 def synchronize_vertical_follower_progress(
     reference_rad: Sequence[float],
     desired_rad: Sequence[float],
@@ -1025,6 +1100,40 @@ class B601PalmFollower:
             4,
             "b601_semantic_planar_task_weights",
         )
+        self.semantic_planar_command_max_velocity = _positive_vector(
+            node.declare_parameter(
+                "b601_semantic_planar_command_max_velocity_m_s", [0.040, 0.035]
+            ).value,
+            2,
+            "b601_semantic_planar_command_max_velocity_m_s",
+        )
+        self.semantic_j4_target_max_velocity = float(
+            node.declare_parameter(
+                "b601_semantic_j4_target_max_velocity_rad_s", 0.025
+            ).value
+        )
+        self.semantic_j4_target_max_acceleration = float(
+            node.declare_parameter(
+                "b601_semantic_j4_target_max_acceleration_rad_s2", 0.10
+            ).value
+        )
+        self.semantic_j4_target_deadband = float(
+            node.declare_parameter(
+                "b601_semantic_j4_target_deadband_rad", 0.0015
+            ).value
+        )
+        if (
+            not np.isfinite(self.semantic_j4_target_max_velocity)
+            or self.semantic_j4_target_max_velocity <= 0.0
+            or not np.isfinite(self.semantic_j4_target_max_acceleration)
+            or self.semantic_j4_target_max_acceleration <= 0.0
+            or not np.isfinite(self.semantic_j4_target_deadband)
+            or self.semantic_j4_target_deadband < 0.0
+        ):
+            raise ValueError(
+                "B601 J4 target velocity/acceleration must be positive and "
+                "deadband must be finite and non-negative"
+            )
         self.semantic_vertical_solver_step_rad = float(
             node.declare_parameter(
                 "b601_semantic_vertical_solver_step_rad", 0.012
@@ -1105,6 +1214,9 @@ class B601PalmFollower:
         self.last_semantic_vertical_error_m = 0.0
         self.last_semantic_planar_error_m = np.zeros(2, dtype=np.float64)
         self.last_semantic_forward_gate = 0.0
+        self.semantic_planar_command_m = np.zeros(2, dtype=np.float64)
+        self.last_semantic_planar_command_time = 0.0
+        self.semantic_j4_target_velocity = 0.0
         self.last_semantic_vertical_primary_progress = 0.0
         self.last_semantic_vertical_follower_limit = 0.0
         self.last_commanded_pose = None
@@ -1481,6 +1593,11 @@ class B601PalmFollower:
     # Tracking interface
     # ------------------------------------------------------------------
 
+    def _reset_semantic_smoothing(self, now_s: float = 0.0) -> None:
+        self.semantic_planar_command_m.fill(0.0)
+        self.last_semantic_planar_command_time = float(now_s)
+        self.semantic_j4_target_velocity = 0.0
+
     def begin_tracking_cycle(self, reason: str = "person_start") -> bool:
         if not self.enabled:
             return True
@@ -1507,6 +1624,7 @@ class B601PalmFollower:
         self.last_semantic_vertical_error_m = 0.0
         self.last_semantic_planar_error_m.fill(0.0)
         self.last_semantic_forward_gate = 0.0
+        self._reset_semantic_smoothing(time.monotonic())
         self.last_target_pose = list(self.initial_pose)
         self.last_commanded_pose = list(self.initial_pose)
         self.last_arm_offset = np.zeros(3, dtype=np.float64)
@@ -1538,6 +1656,7 @@ class B601PalmFollower:
         self.semantic_signal_deltas.update(roll=0.0)
         self.last_semantic_planar_error_m.fill(0.0)
         self.last_semantic_forward_gate = 0.0
+        self._reset_semantic_smoothing()
         self.semantic_stall_started_s.fill(np.nan)
         self.semantic_stall_reference_q.fill(np.nan)
         self.semantic_stall_direction.fill(0.0)
@@ -1579,6 +1698,7 @@ class B601PalmFollower:
             "roll": observation.palm_roll_rad,
         }
         self.semantic_signal_deltas.update(roll=0.0)
+        self._reset_semantic_smoothing(time.monotonic())
         self._reset_filters()
         self.logger.info(
             "B601 semantic observation reference captured: "
@@ -1644,6 +1764,8 @@ class B601PalmFollower:
         ):
             with self.target_lock:
                 self.target_q = q_seed.copy()
+            self.last_semantic_planar_command_time = now
+            self.semantic_j4_target_velocity = 0.0
             self._reset_filters()
             if now - self.last_semantic_log_time >= 1.0:
                 self.logger.warn(
@@ -1724,12 +1846,33 @@ class B601PalmFollower:
         direct_offsets *= forward_gate
         q_reference = self.semantic_control_reference_q
         q_base = q_reference + direct_offsets
-        forward_target = (
+        requested_forward_target = (
             forward * forward_gate
             if self.semantic_channel_enable[1] > 0.5
             else 0.0
         )
-        lift_target = lift if self.semantic_channel_enable[5] > 0.5 else 0.0
+        requested_lift_target = (
+            lift if self.semantic_channel_enable[5] > 0.5 else 0.0
+        )
+        planar_dt = (
+            self.command_interval_s
+            if self.last_semantic_planar_command_time <= 0.0
+            else float(
+                np.clip(
+                    now - self.last_semantic_planar_command_time,
+                    0.001,
+                    0.2,
+                )
+            )
+        )
+        planar_command = slew_limit_vector(
+            [requested_forward_target, requested_lift_target],
+            self.semantic_planar_command_m,
+            self.semantic_planar_command_max_velocity,
+            planar_dt,
+        )
+        forward_target = float(planar_command[0])
+        lift_target = float(planar_command[1])
         if abs(forward_target) > 0.0 or lift_target > 0.0:
             q_desired = self._apply_semantic_planar(
                 q_base,
@@ -1783,7 +1926,24 @@ class B601PalmFollower:
         else:
             self.last_semantic_vertical_primary_progress = 1.0
             self.last_semantic_vertical_follower_limit = 1.0
+        target_dt = (
+            self.command_interval_s
+            if self.last_submit_time <= 0.0
+            else float(np.clip(now - self.last_submit_time, 0.001, 0.2))
+        )
+        j4_target, j4_velocity = acceleration_limited_scalar_target(
+            float(q_target[3]),
+            float(previous_target[3]),
+            self.semantic_j4_target_velocity,
+            self.semantic_j4_target_max_velocity,
+            self.semantic_j4_target_max_acceleration,
+            self.semantic_j4_target_deadband,
+            target_dt,
+        )
+        q_target[3] = j4_target
         if not self._semantic_table_clearance_ok(q_seed, q_target):
+            self.last_semantic_planar_command_time = now
+            self.semantic_j4_target_velocity = 0.0
             if now - self.last_semantic_log_time >= 1.0:
                 self.logger.warn(
                     "Refusing B601 semantic target: a modeled frame would move "
@@ -1792,10 +1952,15 @@ class B601PalmFollower:
                 self.last_semantic_log_time = now
             return self.last_arm_offset
         if not self._joint_target_is_safe(q_target, q_seed):
+            self.last_semantic_planar_command_time = now
+            self.semantic_j4_target_velocity = 0.0
             return self.last_arm_offset
 
         with self.target_lock:
             self.target_q = q_target
+        self.semantic_planar_command_m = planar_command
+        self.last_semantic_planar_command_time = now
+        self.semantic_j4_target_velocity = j4_velocity
         self.last_submit_time = now
         self.last_arm_offset = np.array([lateral, forward, lift], dtype=np.float64)
         self.first_tracking_motion_ok = True
@@ -1819,6 +1984,7 @@ class B601PalmFollower:
                 f"height={actual_planar_error[1]:+.4f}]m, "
                 f"J3_progress={self.last_semantic_vertical_primary_progress:.2f}, "
                 f"follower_limit={self.last_semantic_vertical_follower_limit:.2f}, "
+                f"J4_target_velocity={self.semantic_j4_target_velocity:+.4f}rad/s, "
                 f"articulation={'ready' if articulation_ready else 'locked'}, "
                 f"roll={np.rad2deg(roll_delta):+.1f}deg, "
                 f"q_measured={q_seed.round(4).tolist()}, "
@@ -2285,6 +2451,7 @@ class B601PalmFollower:
         self.last_arm_offset = np.zeros(3, dtype=np.float64)
         self.last_target_pose = list(self.initial_pose)
         self.last_commanded_pose = list(self.initial_pose)
+        self._reset_semantic_smoothing()
         self._reset_filters()
         self.logger.info("B601 reached and verified the configured table-supported pose")
 

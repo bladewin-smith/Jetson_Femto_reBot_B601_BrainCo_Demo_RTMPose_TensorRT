@@ -39,6 +39,7 @@ export PYTHONPATH="$HOME/ws/pyorbbecsdk-2-main:$HOME/ws/brainco-hand-sdk-main/py
 
 echo "Visible B601 planar profile: J2/J3/J4 joint forward/height solve, 25 mm lift"
 echo "Forward mapping: 0.35x palm depth, bounded to +/-35 mm after tabletop clearance"
+echo "J4 anti-jitter: task slew limit + 25 mrad/s velocity + 0.10 rad/s^2 acceleration"
 echo "Channels: $CHANNELS"
 echo "Detector engine: $DET_ENGINE"
 echo "Body-pose engine: $BODY_ENGINE"

@@ -183,6 +183,11 @@ J6 会根据 TCP 实际抬升和连杆实际净空从 0 到 1 连续淡入，不
 的目标抬升量，避免只抬末端而让中间连杆继续贴桌。每次控制手左右切换也会重新采集
 当前人体掌心和关节参考，避免瞬时跳变。
 
+J4 另外使用两级抑振：任务空间的前后/上下目标先按最大速度连续爬坡，随后 J4
+关节目标再经过小死区、最大速度和最大加速度限制。明显运动配置把 J4 的 MIT 参数从
+高刚度改为 `kp=30、kd=4`，并降低 J4 在冗余解算中的 mobility，避免视觉深度跳变
+或雅可比分配变化直接变成 J4 的快速正反转。
+
 ### 安全的明显运动分通道验证
 
 必须先完成上面的桌面姿态标定。下面的第一阶段已经提高到肉眼可见但仍受约束的
@@ -250,10 +255,10 @@ run_b601_semantic_test() {
     -p b601_semantic_joint_gains:='[0.65,-0.60,0.18,0.15,0.25]' \
     -p b601_semantic_max_joint_offset_rad:='[0.035,0.080,0.100,0.070,0.008,0.035]' \
     -p b601_semantic_max_step_rad:='[0.0025,0.0025,0.0030,0.0020,0.0010,0.0020]' \
-    -p b601_joint_kp:='[120.0,120.0,180.0,45.0,35.0,30.0]' \
-    -p b601_joint_kd:='[8.0,8.0,8.0,2.0,2.0,2.0]' \
+    -p b601_joint_kp:='[120.0,120.0,180.0,30.0,35.0,30.0]' \
+    -p b601_joint_kd:='[8.0,8.0,8.0,4.0,2.0,2.0]' \
     -p b601_joint_effort_limit_nm:='[8.0,10.0,16.0,6.0,4.0,4.0]' \
-    -p b601_semantic_max_tracking_error_rad:='[0.012,0.020,0.055,0.025,0.008,0.015]' \
+    -p b601_semantic_max_tracking_error_rad:='[0.012,0.020,0.055,0.018,0.008,0.015]' \
     -p b601_semantic_stall_error_rad:='[0.010,0.015,0.030,0.015,0.010,0.012]' \
     -p b601_semantic_stall_min_progress_rad:=0.0015 \
     -p b601_semantic_stall_timeout_s:=4.0 \
@@ -265,8 +270,12 @@ run_b601_semantic_test() {
     -p b601_semantic_vertical_height_profile:='[0.50,0.82,1.0]' \
     -p b601_semantic_planar_input_scale:='[0.35,1.0]' \
     -p b601_semantic_planar_max_forward_m:=0.035 \
-    -p b601_semantic_planar_joint_mobility:='[0.80,1.00,0.70]' \
+    -p b601_semantic_planar_joint_mobility:='[0.85,1.00,0.50]' \
     -p b601_semantic_planar_task_weights:='[1.00,0.65,0.85,1.00]' \
+    -p b601_semantic_planar_command_max_velocity_m_s:='[0.040,0.035]' \
+    -p b601_semantic_j4_target_max_velocity_rad_s:=0.025 \
+    -p b601_semantic_j4_target_max_acceleration_rad_s2:=0.10 \
+    -p b601_semantic_j4_target_deadband_rad:=0.0015 \
     -p b601_semantic_vertical_solver_step_rad:=0.015 \
     -p b601_semantic_vertical_solver_iterations:=12 \
     -p b601_semantic_vertical_orientation_weight_m_per_rad:=0.02 \
