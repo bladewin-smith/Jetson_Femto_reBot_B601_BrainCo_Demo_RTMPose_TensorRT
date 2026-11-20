@@ -311,6 +311,70 @@ def ramp_joint_target_with_tracking_window(
     )
 
 
+def synchronize_vertical_follower_progress(
+    reference_rad: Sequence[float],
+    desired_rad: Sequence[float],
+    measured_rad: Sequence[float],
+    target_rad: Sequence[float],
+    primary_index: int,
+    follower_indices: Sequence[int],
+    max_follower_progress_lead: float,
+) -> tuple[np.ndarray, float, float]:
+    """Keep fast lift joints from outrunning the load-bearing primary joint.
+
+    Near the B601 table pose, J2 and J4 can track their MIT targets much faster
+    than the heavily loaded J3.  Independent target windows then destroy the
+    J2/J3/J4 ratio produced by the vertical solver and can lower the TCP.  This
+    guard uses measured J3 trajectory progress as the clock and limits only the
+    faster follower targets.  J3 retains its larger position-error allowance so
+    it can generate enough torque to move.
+    """
+
+    reference = np.asarray(reference_rad, dtype=np.float64).reshape(-1)
+    desired = np.asarray(desired_rad, dtype=np.float64).reshape(-1)
+    measured = np.asarray(measured_rad, dtype=np.float64).reshape(-1)
+    target = np.asarray(target_rad, dtype=np.float64).reshape(-1).copy()
+    if not reference.shape == desired.shape == measured.shape == target.shape:
+        raise ValueError("vertical synchronization vectors must have matching shapes")
+    if not all(
+        np.all(np.isfinite(values))
+        for values in (reference, desired, measured, target)
+    ):
+        raise ValueError("vertical synchronization vectors must contain finite values")
+    primary = int(primary_index)
+    if primary < 0 or primary >= reference.size:
+        raise ValueError("vertical primary joint index is out of range")
+    lead = float(max_follower_progress_lead)
+    if not np.isfinite(lead) or lead < 0.0:
+        raise ValueError("max_follower_progress_lead must be finite and non-negative")
+
+    desired_delta = desired - reference
+    primary_delta = float(desired_delta[primary])
+    if abs(primary_delta) < 1e-8:
+        return target, 1.0, 1.0
+    primary_progress = float(
+        np.clip(
+            (measured[primary] - reference[primary]) / primary_delta,
+            0.0,
+            1.0,
+        )
+    )
+    follower_progress_limit = float(np.clip(primary_progress + lead, 0.0, 1.0))
+    for raw_index in follower_indices:
+        index = int(raw_index)
+        if index < 0 or index >= reference.size or index == primary:
+            continue
+        delta = float(desired_delta[index])
+        if abs(delta) < 1e-8:
+            continue
+        progress_bound = reference[index] + follower_progress_limit * delta
+        if delta > 0.0:
+            target[index] = min(target[index], progress_bound)
+        else:
+            target[index] = max(target[index], progress_bound)
+    return target, primary_progress, follower_progress_limit
+
+
 def resolve_native_frame_ids(model: Any, frame_names: Sequence[str]) -> list[int]:
     """Resolve Pinocchio frame IDs as native Python integers."""
 
@@ -736,6 +800,35 @@ class B601PalmFollower:
             raise ValueError("b601_semantic_vertical_joint_mask values must be 0 or 1")
         if not np.any(self.semantic_vertical_joint_mask):
             raise ValueError("b601_semantic_vertical_joint_mask cannot disable every joint")
+        self.semantic_vertical_primary_joint = int(
+            node.declare_parameter("b601_semantic_vertical_primary_joint", 3).value
+        ) - 1
+        vertical_indices = np.flatnonzero(self.semantic_vertical_joint_mask > 0.5)
+        if self.semantic_vertical_primary_joint not in vertical_indices:
+            raise ValueError(
+                "b601_semantic_vertical_primary_joint must select an enabled vertical joint"
+            )
+        self.semantic_vertical_follower_indices = np.asarray(
+            [
+                index
+                for index in vertical_indices
+                if index != self.semantic_vertical_primary_joint
+            ],
+            dtype=np.int64,
+        )
+        self.semantic_vertical_follower_progress_lead = float(
+            node.declare_parameter(
+                "b601_semantic_vertical_follower_progress_lead", 0.15
+            ).value
+        )
+        if (
+            not np.isfinite(self.semantic_vertical_follower_progress_lead)
+            or self.semantic_vertical_follower_progress_lead < 0.0
+            or self.semantic_vertical_follower_progress_lead > 1.0
+        ):
+            raise ValueError(
+                "b601_semantic_vertical_follower_progress_lead must be in [0, 1]"
+            )
         self.semantic_vertical_damping = float(
             node.declare_parameter("b601_semantic_vertical_damping", 0.02).value
         )
@@ -835,6 +928,8 @@ class B601PalmFollower:
         }
         self.last_semantic_log_time = 0.0
         self.last_semantic_vertical_error_m = 0.0
+        self.last_semantic_vertical_primary_progress = 0.0
+        self.last_semantic_vertical_follower_limit = 0.0
         self.last_commanded_pose = None
         self.last_target_pose = None
         self.last_arm_offset = np.zeros(3, dtype=np.float64)
@@ -1422,6 +1517,23 @@ class B601PalmFollower:
             self.semantic_max_step,
             self.semantic_max_tracking_error,
         )
+        if not articulation_ready and lift > 0.0:
+            (
+                q_target,
+                self.last_semantic_vertical_primary_progress,
+                self.last_semantic_vertical_follower_limit,
+            ) = synchronize_vertical_follower_progress(
+                q_reference,
+                q_desired,
+                q_seed,
+                q_target,
+                self.semantic_vertical_primary_joint,
+                self.semantic_vertical_follower_indices,
+                self.semantic_vertical_follower_progress_lead,
+            )
+        else:
+            self.last_semantic_vertical_primary_progress = 1.0
+            self.last_semantic_vertical_follower_limit = 1.0
         if not self._semantic_table_clearance_ok(q_seed, q_target):
             if now - self.last_semantic_log_time >= 1.0:
                 self.logger.warn(
@@ -1454,6 +1566,8 @@ class B601PalmFollower:
                 f"chain_clearance={chain_clearance:+.4f}m, "
                 f"solver_error={self.last_semantic_vertical_error_m:+.4f}m, "
                 f"actual_vertical_error={actual_vertical_error:+.4f}m, "
+                f"J3_progress={self.last_semantic_vertical_primary_progress:.2f}, "
+                f"follower_limit={self.last_semantic_vertical_follower_limit:.2f}, "
                 f"articulation={'ready' if articulation_ready else 'locked'}, "
                 f"elbow={np.rad2deg(elbow_delta):+.1f}deg, "
                 f"wrist={np.rad2deg(wrist_delta):+.1f}deg, "
@@ -1594,14 +1708,23 @@ class B601PalmFollower:
             return True
         current = np.asarray(current_q, dtype=np.float64)
         target = np.asarray(target_q, dtype=np.float64)
+        current_heights = self._frame_heights(current)
+        if current_heights.shape != reference.shape:
+            return False
+        # If tracking mismatch has already put a modeled frame just below the
+        # table tolerance, permit only a monotonic-height recovery.  Requiring
+        # every recovery sample to be above the original floor would otherwise
+        # trap the arm at the low pose and repeatedly reject the corrective
+        # J2/J3/J4 command.
+        recovery_floor = np.minimum(
+            reference - self.semantic_table_clearance_tolerance_m,
+            current_heights,
+        )
         for ratio in (0.5, 1.0):
             heights = self._frame_heights(current + ratio * (target - current))
             if heights.shape != reference.shape:
                 return False
-            if np.any(
-                heights
-                < reference - self.semantic_table_clearance_tolerance_m
-            ):
+            if np.any(heights < recovery_floor - 1e-6):
                 return False
         return True
 

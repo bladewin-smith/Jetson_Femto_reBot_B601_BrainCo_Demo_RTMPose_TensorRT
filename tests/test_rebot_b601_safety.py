@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from arm_control.rebot_b601 import (
+    B601PalmFollower,
     StartupGuardError,
     apply_tabletop_motion_envelope,
     joint_tracking_bounds,
@@ -11,6 +12,7 @@ from arm_control.rebot_b601 import (
     resolve_native_frame_ids,
     scale_vector_to_max_abs,
     send_mit_checked,
+    synchronize_vertical_follower_progress,
     validate_tabletop_startup,
 )
 
@@ -227,3 +229,46 @@ def test_checked_mit_send_reports_joint_name_and_keeps_other_holds_alive():
 
     assert all(len(motor.commands) == 1 for motor in motors.values())
     assert motors["joint3"].commands[0] == (0.3, 0.0, 120.0, 8.0, 3.0)
+
+
+def test_vertical_followers_cannot_outrun_measured_j3_progress():
+    reference = np.array([0.0, -0.0105, -0.0105, -0.0036, 0.0, 0.0])
+    desired = np.array([0.0, -0.0332, -0.0491, 0.0039, 0.0, 0.0])
+    measured = np.array([0.0, -0.0315, -0.0219, 0.0113, 0.0, 0.0])
+
+    target, primary_progress, follower_limit = synchronize_vertical_follower_progress(
+        reference,
+        desired,
+        measured,
+        desired,
+        primary_index=2,
+        follower_indices=[1, 3],
+        max_follower_progress_lead=0.15,
+    )
+
+    expected_primary_progress = (-0.0219 + 0.0105) / (-0.0491 + 0.0105)
+    assert primary_progress == pytest.approx(expected_primary_progress)
+    assert follower_limit == pytest.approx(expected_primary_progress + 0.15)
+    assert target[2] == pytest.approx(desired[2])
+    assert target[1] == pytest.approx(
+        reference[1] + follower_limit * (desired[1] - reference[1])
+    )
+    assert target[3] == pytest.approx(
+        reference[3] + follower_limit * (desired[3] - reference[3])
+    )
+
+
+def test_table_clearance_allows_monotonic_recovery_from_small_tracking_dip():
+    follower = object.__new__(B601PalmFollower)
+    follower.table_frame_heights = np.array([0.0, 0.0])
+    follower.semantic_table_clearance_tolerance_m = 0.001
+    follower._frame_heights = lambda q: np.asarray(q, dtype=np.float64)
+
+    assert follower._semantic_table_clearance_ok(
+        np.array([-0.0015, 0.0]),
+        np.array([0.0, 0.0]),
+    )
+    assert not follower._semantic_table_clearance_ok(
+        np.array([-0.0015, 0.0]),
+        np.array([-0.0020, 0.0]),
+    )

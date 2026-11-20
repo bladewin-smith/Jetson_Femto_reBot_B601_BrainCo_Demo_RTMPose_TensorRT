@@ -231,6 +231,8 @@ run_b601_semantic_test() {
     -p b601_semantic_max_tracking_error_rad:='[0.012,0.024,0.040,0.025,0.008,0.015]' \
     -p b601_semantic_stall_error_rad:='[0.010,0.015,0.025,0.015,0.010,0.012]' \
     -p b601_semantic_stall_timeout_s:=1.5 \
+    -p b601_semantic_vertical_primary_joint:=3 \
+    -p b601_semantic_vertical_follower_progress_lead:=0.15 \
     -p b601_semantic_vertical_max_lift_m:=0.012 \
     -p b601_semantic_min_lift_before_articulation_m:=0.008 \
     -p b601_semantic_min_chain_clearance_m:=0.001 \
@@ -251,6 +253,8 @@ run_b601_semantic_test() {
 `q_target` 会从上一次目标连续爬坡，并由 `target_lead` 显示它相对实测关节角积累的
 有限位置误差。`tau_g` 是重力前馈，`tau_measured` 是电机反馈力矩，`effort_est`
 是位置误差项与重力项的合计估算，正常使能时六个 `motor_status` 均应为 `0x1`。
+抬升阶段以负载最大的 J3 实测进度为主时钟，`J3_progress` 表示其已完成比例，
+`follower_limit` 是 J2/J4 当时允许达到的最大比例，避免两个快关节先运动反而压低末端。
 如果某关节在有足够目标误差时持续静止，看门狗会保持实测姿态并明确打印关节名；
 此时不要继续加大增益，应检查该电机、接头和 24 V 电源。然后再做对应的单一小动作。
 按 `H` 验证慢速回桌，确认完成后按 `Q` 退出，再进行下一组。
