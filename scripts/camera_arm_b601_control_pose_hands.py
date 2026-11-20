@@ -439,7 +439,7 @@ from hand_control import (
     FingerBendHysteresis,
     thumb_opposition,
 )
-from arm_control import B601PalmFollower
+from arm_control import B601PalmFollower, build_operator_arm_motion
 
 for _DEPTH_PACKAGE_ROOT in (_SCRIPT_DIR, _SCRIPT_DIR.parent):
     if (_DEPTH_PACKAGE_ROOT / "lingbot_depth_feature_pack").exists():
@@ -7049,9 +7049,21 @@ class HandPalmB601ControlNode(Node):
         if finger_bends is None:
             self.hand_follower.notify_hand_lost()
         palm_distances, palm_displacement = self._publish_palm_motion(points_3d, points_2d)
-        arm_offset = self.palm_follower.update_from_palm_displacement(
-            palm_displacement
+        preferred_side = self.kinematics.control_hand_side
+        if preferred_side == "auto":
+            preferred_side = None
+        control_side = self.kinematics.best_hand_prefix(
+            points_2d,
+            preferred_side=preferred_side,
+            allow_fallback=self.kinematics.control_hand_fallback_enabled,
         )
+        operator_motion = build_operator_arm_motion(
+            points_3d,
+            points_2d,
+            control_side,
+            palm_displacement,
+        )
+        arm_offset = self.palm_follower.update_from_operator_motion(operator_motion)
         hand_positions = self.hand_follower.update_from_bends(
             finger_bends,
             source=finger_source,

@@ -4,6 +4,7 @@ import pytest
 from arm_control.rebot_b601 import (
     StartupGuardError,
     apply_tabletop_motion_envelope,
+    joint_tracking_bounds,
     joint_target_safety_violations,
     minimum_jerk_blend,
     validate_tabletop_startup,
@@ -136,3 +137,15 @@ def test_joint_limit_margin_rejects_target_beyond_validated_tabletop_reference()
     )
 
     assert outside[1]
+
+
+def test_joint_tracking_bounds_keep_validated_table_pose_reachable():
+    lower, upper = joint_tracking_bounds(
+        [-2.8, -3.14, -3.14],
+        [2.8, 0.0, 0.0],
+        0.05,
+        [-1.5, -0.009, -0.011],
+    )
+
+    np.testing.assert_allclose(lower, [-2.75, -3.09, -3.09])
+    np.testing.assert_allclose(upper, [2.75, -0.009, -0.011])

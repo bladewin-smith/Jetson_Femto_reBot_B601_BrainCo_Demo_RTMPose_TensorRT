@@ -154,6 +154,116 @@ python scripts/camera_arm_b601_control_pose_hands.py --ros-args \
 程序启动后不会立刻跟随。人员识别稳定后按 `S` 才开始；按 `H` 返回桌面姿态并
 进入必须再次按 `S` 的暂停状态；`Q`/`Esc` 正常退出。
 
+## B601 人体语义关节控制
+
+`b601_control_mode:=semantic_joint` 使用人体动作的语义，而不是把掌心位移直接交给
+六轴笛卡尔 IK。当前映射为：
+
+| 人体信号 | B601 动作 | 实现 |
+|---|---|---|
+| 掌心左右位移 | J1 底座旋转 | 相机 X 位移直接映射到 J1 |
+| 掌心整体前后位移 | J2 | 相机深度 Z 位移映射到 J2 |
+| 肘关节屈伸 | J3 | 肩-肘-腕夹角相对启动参考值映射到 J3 |
+| 腕关节小幅前后俯仰 | J4 | 前臂和掌轴在相机垂直/深度平面的夹角映射到 J4 |
+| 掌面旋转 | J6 | 食指/小指掌指关节连线在图像平面的滚转角映射到 J6 |
+| 掌心上下位移 | J2 + J3 + J4 | 阻尼雅可比最小二乘，同时抑制末端姿态变化 |
+
+J5 在该模式下保持本次跟踪开始时的参考角。垂直通道只允许从经过验证的桌面姿态
+向上运动；手掌下移表示回落到桌面参考高度，不能命令末端进入桌面以下。控制器还会
+比较 URDF 中所有 frame 与启动桌面姿态的高度，并拒绝降低到容差以下的目标。
+
+六个 `b601_semantic_channel_enable` 值依次表示：
+`[J1左右, J2深度, J3肘, J4腕, J6滚转, J2/J3/J4上下]`。为了避免贴桌拖动，
+肘部、腕部和 TCP 三个模型 frame 相对桌面姿态的最小净空达到
+`b601_semantic_min_lift_before_articulation_m` 之前，前五个通道保持锁定。每次控制手
+左右切换也会重新采集人体角度和当前关节参考，避免瞬时跳变。
+
+### 安全的小幅度分通道验证
+
+必须先完成上面的桌面姿态标定。下面刻意把各轴总偏移限制在约 `0.3–1.7°`、每帧
+限制在约 `0.086°`，灵巧手保持关闭。引擎路径使用已经在同一台 Jetson 上验收过的
+RealMan 旧仓库引擎文件；不要跨 JetPack/TensorRT 版本复制 engine。
+
+```bash
+REPO="$HOME/ws/Jetson_Femto_reBot_B601_BrainCo_Demo_RTMPose_TensorRT"
+ENGINE_DIR="$HOME/ws/Jetson_Femto_Realman_Brainco_Demo_RTMPose_TensorRT/models/tensorrt"
+DET_ENGINE="$ENGINE_DIR/rtmdet_nano.engine"
+BODY_ENGINE="$ENGINE_DIR/rtmpose_body.engine"
+HAND_ENGINE="$ENGINE_DIR/rtmpose_hand.engine"
+TABLE_Q='[q1,q2,q3,q4,q5,q6]'  # 必须替换为本机刚标定的六轴弧度值
+
+cd "$REPO"
+source .venv/bin/activate
+source /opt/ros/humble/setup.bash
+export PYTHONPATH="$HOME/ws/pyorbbecsdk-2-main:$HOME/ws/brainco-hand-sdk-main/python:$REPO:$REPO/scripts:$REPO/third_party/reBotArm_control_py:${PYTHONPATH:-}"
+
+for file in "$DET_ENGINE" "$BODY_ENGINE" "$HAND_ENGINE"; do
+  if test -s "$file"; then
+    ls -lh "$file"
+  else
+    echo "缺失或为空（不要继续真机启动）: $file"
+  fi
+done
+
+run_b601_semantic_test() {
+  python scripts/camera_arm_b601_control_pose_hands.py --ros-args \
+    -p vision_backend:=rtmpose \
+    -p rtmpose_runtime:=tensorrt \
+    -p rtmdet_engine_path:="$DET_ENGINE" \
+    -p rtmpose_body_engine_path:="$BODY_ENGINE" \
+    -p rtmpose_hand_engine_path:="$HAND_ENGINE" \
+    -p robot_motion_enabled:=true \
+    -p b601_tabletop_startup_confirmed:=true \
+    -p b601_tabletop_joints_rad:="$TABLE_Q" \
+    -p b601_tabletop_joint_tolerance_rad:='[0.12,0.12,0.12,0.12,0.12,0.12]' \
+    -p b601_control_mode:=semantic_joint \
+    -p b601_semantic_channel_enable:="$CHANNELS" \
+    -p b601_semantic_joint_gains:='[0.40,-0.40,0.10,0.08,0.10]' \
+    -p b601_semantic_max_joint_offset_rad:='[0.018,0.030,0.030,0.018,0.005,0.015]' \
+    -p b601_semantic_max_step_rad:='[0.0015,0.0015,0.0015,0.0015,0.0010,0.0015]' \
+    -p b601_semantic_vertical_max_lift_m:=0.012 \
+    -p b601_semantic_min_lift_before_articulation_m:=0.008 \
+    -p b601_semantic_table_clearance_tolerance_m:=0.001 \
+    -p control_hand_side:=right \
+    -p control_hand_fallback_enabled:=false \
+    -p hand_control_enabled:=false \
+    -p auto_home_on_start:=false \
+    -p auto_start_on_ready:=false
+}
+```
+
+每次只执行下面一组。启动后保持人体静止，按 `S` 采集参考；先把掌心缓慢抬高，
+看到日志 `articulation=ready` 后，再做对应的单一小动作。按 `H` 验证慢速回桌，确认
+完成后按 `Q` 退出，再进行下一组。
+
+```bash
+# 0. 先验证纯上下协同；除 J2/J3/J4 外不应有动作
+CHANNELS='[0.0,0.0,0.0,0.0,0.0,1.0]'; run_b601_semantic_test
+
+# 1. 抬起后，验证掌心左右 -> J1
+CHANNELS='[1.0,0.0,0.0,0.0,0.0,1.0]'; run_b601_semantic_test
+
+# 2. 抬起后，验证掌心整体前后 -> J2
+CHANNELS='[0.0,1.0,0.0,0.0,0.0,1.0]'; run_b601_semantic_test
+
+# 3. 抬起后，验证肘屈伸 -> J3
+CHANNELS='[0.0,0.0,1.0,0.0,0.0,1.0]'; run_b601_semantic_test
+
+# 4. 抬起后，验证腕部小幅俯仰 -> J4
+CHANNELS='[0.0,0.0,0.0,1.0,0.0,1.0]'; run_b601_semantic_test
+
+# 5. 抬起后，验证掌面旋转 -> J6
+CHANNELS='[0.0,0.0,0.0,0.0,1.0,1.0]'; run_b601_semantic_test
+
+# 6. 前六组全部通过后才做组合验证
+CHANNELS='[1.0,1.0,1.0,1.0,1.0,1.0]'; run_b601_semantic_test
+```
+
+如果单个通道方向与现场期望相反，只翻转
+`b601_semantic_joint_gains` 中对应项的正负号，不要同时改多个通道。若出现持续振荡、
+frame 低于桌面的拒绝日志、反馈异常或实际连杆接近桌面，立即停止手势并按 `H`；若
+正常按键失效，则托住机械臂并使用硬件急停。
+
 ## 测试
 
 ```bash
