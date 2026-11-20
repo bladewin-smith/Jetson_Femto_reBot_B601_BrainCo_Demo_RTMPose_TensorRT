@@ -54,6 +54,51 @@ def _positive_vector(values: Sequence[float], size: int, name: str) -> np.ndarra
     return result
 
 
+def send_mit_checked(
+    motor_map: dict[str, Any],
+    joint_names: Sequence[str],
+    position_rad: Sequence[float],
+    velocity_rad_s: Sequence[float],
+    kp: Sequence[float],
+    kd: Sequence[float],
+    torque_nm: Sequence[float],
+) -> None:
+    """Send one MIT command per joint without hiding MotorBridge failures.
+
+    The vendored SDK's ``JointGroup.send_mit`` catches ``CallError`` for each
+    motor and silently continues. That behaviour is unsuitable for an
+    unbraked arm: the target can look healthy in the outer loop while one
+    member of a coordinated J2/J3/J4 motion receives no command. Keep sending
+    the remaining motors so they retain their hold command, then report every
+    failed joint to the caller.
+    """
+
+    names = [str(name) for name in joint_names]
+    size = len(names)
+    position = _vector(position_rad, size, "position_rad")
+    velocity = _vector(velocity_rad_s, size, "velocity_rad_s")
+    position_kp = _positive_vector(kp, size, "kp")
+    velocity_kd = _positive_vector(kd, size, "kd")
+    torque = _vector(torque_nm, size, "torque_nm")
+    failures: list[str] = []
+    for index, name in enumerate(names):
+        if name not in motor_map:
+            failures.append(f"{name}: missing MotorBridge handle")
+            continue
+        try:
+            motor_map[name].send_mit(
+                float(position[index]),
+                float(velocity[index]),
+                float(position_kp[index]),
+                float(velocity_kd[index]),
+                float(torque[index]),
+            )
+        except Exception as exc:
+            failures.append(f"{name}: {type(exc).__name__}: {exc}")
+    if failures:
+        raise RuntimeError("MIT send failed for " + "; ".join(failures))
+
+
 def validate_tabletop_startup(
     positions_rad: Sequence[float],
     velocities_rad_s: Sequence[float],
@@ -337,7 +382,7 @@ class B601PalmFollower:
 
         self.joint_kp = _positive_vector(
             node.declare_parameter(
-                "b601_joint_kp", [120.0, 120.0, 120.0, 18.0, 18.0, 18.0]
+                "b601_joint_kp", [120.0, 120.0, 120.0, 45.0, 35.0, 30.0]
             ).value,
             self.ARM_DOF,
             "b601_joint_kp",
@@ -601,11 +646,39 @@ class B601PalmFollower:
         self.semantic_max_tracking_error = _positive_vector(
             node.declare_parameter(
                 "b601_semantic_max_tracking_error_rad",
-                [0.012, 0.018, 0.018, 0.012, 0.008, 0.015],
+                [0.012, 0.024, 0.040, 0.025, 0.008, 0.015],
             ).value,
             6,
             "b601_semantic_max_tracking_error_rad",
         )
+        self.semantic_stall_error = _positive_vector(
+            node.declare_parameter(
+                "b601_semantic_stall_error_rad",
+                [0.010, 0.015, 0.025, 0.015, 0.010, 0.012],
+            ).value,
+            6,
+            "b601_semantic_stall_error_rad",
+        )
+        self.semantic_stall_max_velocity_rad_s = float(
+            node.declare_parameter(
+                "b601_semantic_stall_max_velocity_rad_s", 0.003
+            ).value
+        )
+        self.semantic_stall_timeout_s = float(
+            node.declare_parameter("b601_semantic_stall_timeout_s", 1.5).value
+        )
+        if (
+            not np.isfinite(self.semantic_stall_max_velocity_rad_s)
+            or self.semantic_stall_max_velocity_rad_s < 0.0
+        ):
+            raise ValueError(
+                "b601_semantic_stall_max_velocity_rad_s must be finite and non-negative"
+            )
+        if (
+            not np.isfinite(self.semantic_stall_timeout_s)
+            or self.semantic_stall_timeout_s <= 0.0
+        ):
+            raise ValueError("b601_semantic_stall_timeout_s must be positive and finite")
         self.semantic_vertical_max_lift_m = float(
             node.declare_parameter(
                 "b601_semantic_vertical_max_lift_m", 0.015
@@ -744,6 +817,11 @@ class B601PalmFollower:
         self.target_q = None
         self.last_measured_q = None
         self.last_measured_dq = None
+        self.last_measured_tau = np.zeros(self.ARM_DOF, dtype=np.float64)
+        self.last_gravity_tau = np.zeros(self.ARM_DOF, dtype=np.float64)
+        self.last_motor_status = np.zeros(self.ARM_DOF, dtype=np.int64)
+        self.semantic_stall_started_s = np.full(self.ARM_DOF, np.nan, dtype=np.float64)
+        self.semantic_actuation_fault = None
         self.startup_joint_reference = None
         self.table_frame_heights = None
         self.semantic_control_reference_q = None
@@ -951,18 +1029,52 @@ class B601PalmFollower:
                 )[: self.ARM_DOF]
                 if q.size != self.ARM_DOF or not np.all(np.isfinite(q)):
                     raise RuntimeError(f"invalid joint feedback: {q}")
+                states = [
+                    robot._motor_map[name].get_state()
+                    for name in robot.arm.joint_names
+                ]
+                missing = [
+                    robot.arm.joint_names[index]
+                    for index, state in enumerate(states)
+                    if state is None
+                ]
+                if missing:
+                    raise RuntimeError(f"missing MotorBridge feedback from {missing}")
+                status = np.asarray(
+                    [int(getattr(state, "status_code", -1)) for state in states],
+                    dtype=np.int64,
+                )
+                disabled_or_faulted = [
+                    f"{robot.arm.joint_names[index]}=0x{int(code):X}"
+                    for index, code in enumerate(status)
+                    if int(code) != 0x1
+                ]
+                if disabled_or_faulted:
+                    raise RuntimeError(
+                        "B601 motor is not ENABLED: " + ", ".join(disabled_or_faulted)
+                    )
+                measured_tau = np.asarray(
+                    [float(getattr(state, "torq", 0.0)) for state in states],
+                    dtype=np.float64,
+                )
                 with self.target_lock:
                     target_q = q.copy() if self.target_q is None else self.target_q.copy()
                 tau = self._gravity_torque(q)
-                robot.arm.send_mit(
+                send_mit_checked(
+                    robot._motor_map,
+                    robot.arm.joint_names,
                     target_q,
-                    vel=np.zeros(self.ARM_DOF),
-                    kp=self.joint_kp,
-                    kd=self.joint_kd,
-                    tau=tau,
+                    np.zeros(self.ARM_DOF),
+                    self.joint_kp,
+                    self.joint_kd,
+                    tau,
                 )
             self.last_measured_q = q
             self.last_measured_dq = dq
+            self.last_measured_tau = measured_tau
+            self.last_gravity_tau = tau
+            self.last_motor_status = status
+            self._update_semantic_stall_watchdog(q, dq, target_q)
             self.last_control_error = None
         except Exception as exc:
             self.last_control_error = exc
@@ -972,6 +1084,47 @@ class B601PalmFollower:
                     f"B601 control-loop error; the last target remains active: {exc}"
                 )
                 self.last_control_error_log_s = now
+
+    def _update_semantic_stall_watchdog(
+        self,
+        q: np.ndarray,
+        dq: np.ndarray,
+        target_q: np.ndarray,
+    ) -> None:
+        """Latch a tracking fault when a commanded joint remains stationary."""
+
+        if self.control_mode != "semantic_joint" or self.semantic_control_reference_q is None:
+            self.semantic_stall_started_s.fill(np.nan)
+            return
+        now = time.monotonic()
+        error = np.abs(np.asarray(target_q) - np.asarray(q))
+        slow = np.abs(np.asarray(dq)) <= self.semantic_stall_max_velocity_rad_s
+        stalled = np.logical_and(error >= self.semantic_stall_error, slow)
+        self.semantic_stall_started_s[~stalled] = np.nan
+        newly_stalled = np.logical_and(stalled, np.isnan(self.semantic_stall_started_s))
+        self.semantic_stall_started_s[newly_stalled] = now
+        timed_out = np.logical_and(
+            stalled,
+            now - self.semantic_stall_started_s >= self.semantic_stall_timeout_s,
+        )
+        if not np.any(timed_out) or self.semantic_actuation_fault is not None:
+            return
+        indices = np.flatnonzero(timed_out)
+        details = [
+            f"J{index + 1}(error={target_q[index] - q[index]:+.4f}rad, "
+            f"dq={dq[index]:+.4f}rad/s, status=0x{int(self.last_motor_status[index]):X})"
+            for index in indices
+        ]
+        self.semantic_actuation_fault = (
+            "semantic joint tracking stalled: " + ", ".join(details)
+        )
+        with self.target_lock:
+            self.target_q = np.asarray(q, dtype=np.float64).copy()
+        self.logger.error(
+            "B601 actuation watchdog stopped this tracking cycle; holding the "
+            f"measured pose. {self.semantic_actuation_fault}. Press 's' only after "
+            "checking the named motor, its connector and the 24 V supply."
+        )
 
     def _gravity_torque(self, q: np.ndarray) -> np.ndarray:
         q_for_model = q * self.joint_direction
@@ -1053,6 +1206,8 @@ class B601PalmFollower:
         self.last_submit_time = 0.0
         self.first_tracking_motion_ok = False
         self.tracking_cycle_started_at = time.monotonic()
+        self.semantic_stall_started_s.fill(np.nan)
+        self.semantic_actuation_fault = None
         self._reset_filters()
         self.logger.info(
             f"B601 {self.control_mode} control reference reset ({reason})"
@@ -1072,6 +1227,7 @@ class B601PalmFollower:
         self.semantic_reference_frame_heights = None
         self.semantic_signal_references.clear()
         self.semantic_signal_deltas.update(elbow=0.0, wrist=0.0, roll=0.0)
+        self.semantic_stall_started_s.fill(np.nan)
         self._reset_filters()
         self.logger.info(
             f"B601 tracking paused; holding measured pose with gravity feed-forward ({reason})"
@@ -1145,6 +1301,8 @@ class B601PalmFollower:
         if not self.enabled or self.initial_pose is None:
             return None
         if self.home_requested or self.home_motion_active:
+            return self.last_arm_offset
+        if self.semantic_actuation_fault is not None:
             return self.last_arm_offset
 
         q_seed = (
@@ -1285,6 +1443,9 @@ class B601PalmFollower:
                 q_seed,
                 lift,
             )
+            commanded_effort = (
+                self.joint_kp * (q_target - q_seed) + self.last_gravity_tau
+            )
             self.logger.info(
                 "B601 semantic: "
                 f"side={observation.side}, lateral={lateral:+.4f}m, "
@@ -1300,7 +1461,11 @@ class B601PalmFollower:
                 f"q_measured={q_seed.round(4).tolist()}, "
                 f"q_desired={q_desired.round(4).tolist()}, "
                 f"q_target={q_target.round(4).tolist()}, "
-                f"target_lead={(q_target - q_seed).round(4).tolist()}"
+                f"target_lead={(q_target - q_seed).round(4).tolist()}, "
+                f"tau_g={self.last_gravity_tau.round(3).tolist()}, "
+                f"tau_measured={self.last_measured_tau.round(3).tolist()}, "
+                f"effort_est={commanded_effort.round(3).tolist()}, "
+                f"motor_status={[f'0x{int(code):X}' for code in self.last_motor_status]}"
             )
             self.last_semantic_log_time = now
         return self.last_arm_offset

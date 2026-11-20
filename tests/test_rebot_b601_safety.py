@@ -10,6 +10,7 @@ from arm_control.rebot_b601 import (
     ramp_joint_target_with_tracking_window,
     resolve_native_frame_ids,
     scale_vector_to_max_abs,
+    send_mit_checked,
     validate_tabletop_startup,
 )
 
@@ -194,3 +195,35 @@ def test_semantic_target_can_accumulate_safe_lead_over_static_feedback():
         )
 
     np.testing.assert_allclose(target, [-0.012, -0.018, 0.010])
+
+
+def test_checked_mit_send_reports_joint_name_and_keeps_other_holds_alive():
+    class FakeMotor:
+        def __init__(self, failure=None):
+            self.failure = failure
+            self.commands = []
+
+        def send_mit(self, *command):
+            self.commands.append(command)
+            if self.failure is not None:
+                raise self.failure
+
+    motors = {
+        "joint1": FakeMotor(),
+        "joint2": FakeMotor(RuntimeError("serial write rejected")),
+        "joint3": FakeMotor(),
+    }
+
+    with pytest.raises(RuntimeError, match=r"joint2.*serial write rejected"):
+        send_mit_checked(
+            motors,
+            ["joint1", "joint2", "joint3"],
+            [0.1, 0.2, 0.3],
+            [0.0, 0.0, 0.0],
+            [120.0, 120.0, 120.0],
+            [8.0, 8.0, 8.0],
+            [1.0, 2.0, 3.0],
+        )
+
+    assert all(len(motor.commands) == 1 for motor in motors.values())
+    assert motors["joint3"].commands[0] == (0.3, 0.0, 120.0, 8.0, 3.0)

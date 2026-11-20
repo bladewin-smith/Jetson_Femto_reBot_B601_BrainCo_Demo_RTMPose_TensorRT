@@ -226,7 +226,11 @@ run_b601_semantic_test() {
     -p b601_semantic_joint_gains:='[0.65,-0.60,0.18,0.15,0.25]' \
     -p b601_semantic_max_joint_offset_rad:='[0.035,0.045,0.050,0.030,0.005,0.035]' \
     -p b601_semantic_max_step_rad:='[0.0025,0.0020,0.0020,0.0015,0.0010,0.0020]' \
-    -p b601_semantic_max_tracking_error_rad:='[0.012,0.018,0.018,0.012,0.008,0.015]' \
+    -p b601_joint_kp:='[120.0,120.0,120.0,45.0,35.0,30.0]' \
+    -p b601_joint_kd:='[8.0,8.0,8.0,2.0,2.0,2.0]' \
+    -p b601_semantic_max_tracking_error_rad:='[0.012,0.024,0.040,0.025,0.008,0.015]' \
+    -p b601_semantic_stall_error_rad:='[0.010,0.015,0.025,0.015,0.010,0.012]' \
+    -p b601_semantic_stall_timeout_s:=1.5 \
     -p b601_semantic_vertical_max_lift_m:=0.012 \
     -p b601_semantic_min_lift_before_articulation_m:=0.008 \
     -p b601_semantic_min_chain_clearance_m:=0.001 \
@@ -245,8 +249,11 @@ run_b601_semantic_test() {
 日志中的 `tcp_lift` 应达到约 `0.008m`、`chain_clearance` 应达到约 `0.001m`，并出现
 `articulation=ready`；`actual_vertical_error` 应逐步降到约 `0.003m` 以下。
 `q_target` 会从上一次目标连续爬坡，并由 `target_lead` 显示它相对实测关节角积累的
-有限位置误差。然后再做对应的单一小动作。按 `H` 验证慢速回桌，确认完成后按 `Q`
-退出，再进行下一组。
+有限位置误差。`tau_g` 是重力前馈，`tau_measured` 是电机反馈力矩，`effort_est`
+是位置误差项与重力项的合计估算，正常使能时六个 `motor_status` 均应为 `0x1`。
+如果某关节在有足够目标误差时持续静止，看门狗会保持实测姿态并明确打印关节名；
+此时不要继续加大增益，应检查该电机、接头和 24 V 电源。然后再做对应的单一小动作。
+按 `H` 验证慢速回桌，确认完成后按 `Q` 退出，再进行下一组。
 
 ```bash
 # 0. 先验证纯上下协同；除 J2/J3/J4 外不应有动作

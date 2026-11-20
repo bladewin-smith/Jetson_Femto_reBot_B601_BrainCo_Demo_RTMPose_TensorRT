@@ -34,16 +34,16 @@ joints:
     feedback_id: 0x14
     model: "4310"
     vendor: "damiao"
-    MIT: {kp: 18.0, kd: 2.0}
+    MIT: {kp: 45.0, kd: 2.0}
   - name: joint5
     motor_id: 0x05
     feedback_id: 0x15
     model: "4310"
     vendor: "damiao"
-    MIT: {kp: 18.0, kd: 2.0}
+    MIT: {kp: 35.0, kd: 2.0}
   - name: joint6
     motor_id: 0x06
     feedback_id: 0x16
     model: "4310"
     vendor: "damiao"
-    MIT: {kp: 18.0, kd: 2.0}
+    MIT: {kp: 30.0, kd: 2.0}
