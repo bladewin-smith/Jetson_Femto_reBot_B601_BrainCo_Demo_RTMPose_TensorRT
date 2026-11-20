@@ -442,6 +442,112 @@ def slew_limit_vector(
     return prior + np.clip(target - prior, -maximum_step, maximum_step)
 
 
+def acceleration_limited_vector_target(
+    requested: Sequence[float],
+    previous: Sequence[float],
+    previous_velocity: Sequence[float],
+    max_velocity: Sequence[float],
+    max_acceleration: Sequence[float],
+    deadband: Sequence[float],
+    dt_s: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply the scalar acceleration limiter independently to each task axis."""
+
+    vectors = [
+        np.asarray(value, dtype=np.float64).reshape(-1)
+        for value in (
+            requested,
+            previous,
+            previous_velocity,
+            max_velocity,
+            max_acceleration,
+            deadband,
+        )
+    ]
+    if not all(value.shape == vectors[0].shape for value in vectors[1:]):
+        raise ValueError("acceleration-limit vectors must have matching shapes")
+    target = np.empty_like(vectors[0])
+    velocity = np.empty_like(vectors[0])
+    for index in range(vectors[0].size):
+        target[index], velocity[index] = acceleration_limited_scalar_target(
+            float(vectors[0][index]),
+            float(vectors[1][index]),
+            float(vectors[2][index]),
+            float(vectors[3][index]),
+            float(vectors[4][index]),
+            float(vectors[5][index]),
+            dt_s,
+        )
+    return target, velocity
+
+
+def confirm_vector_reversals(
+    requested: Sequence[float],
+    accepted: Sequence[float],
+    active_direction: Sequence[int],
+    candidate_direction: Sequence[int],
+    candidate_count: Sequence[int],
+    reverse_deadband: Sequence[float],
+    confirm_samples: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Reject small or short-lived task-direction reversals.
+
+    The absolute palm displacement is a noisy vision signal.  Once an axis has
+    started moving in one direction, an opposite target must remain beyond the
+    reversal deadband for ``confirm_samples`` consecutive control updates.  A
+    same-direction target is accepted immediately, preserving normal response.
+    """
+
+    target = np.asarray(requested, dtype=np.float64).reshape(-1)
+    stable = np.asarray(accepted, dtype=np.float64).reshape(-1).copy()
+    active = np.asarray(active_direction, dtype=np.int8).reshape(-1).copy()
+    candidate = np.asarray(candidate_direction, dtype=np.int8).reshape(-1).copy()
+    count = np.asarray(candidate_count, dtype=np.int64).reshape(-1).copy()
+    deadband = np.asarray(reverse_deadband, dtype=np.float64).reshape(-1)
+    if not (
+        target.shape
+        == stable.shape
+        == active.shape
+        == candidate.shape
+        == count.shape
+        == deadband.shape
+    ):
+        raise ValueError("direction-confirmation vectors must have matching shapes")
+    if not all(
+        np.all(np.isfinite(value)) for value in (target, stable, deadband)
+    ):
+        raise ValueError("direction-confirmation values must be finite")
+    if np.any(deadband < 0.0) or int(confirm_samples) < 1:
+        raise ValueError(
+            "reversal deadbands must be non-negative and confirmation positive"
+        )
+
+    for index in range(target.size):
+        delta = float(target[index] - stable[index])
+        direction = 0 if abs(delta) <= deadband[index] else (1 if delta > 0.0 else -1)
+        if direction == 0:
+            candidate[index] = 0
+            count[index] = 0
+            continue
+        if active[index] == 0 or direction == active[index]:
+            stable[index] = target[index]
+            active[index] = direction
+            candidate[index] = 0
+            count[index] = 0
+            continue
+        if candidate[index] == direction:
+            count[index] += 1
+        else:
+            candidate[index] = direction
+            count[index] = 1
+        if count[index] >= int(confirm_samples):
+            stable[index] = target[index]
+            active[index] = direction
+            candidate[index] = 0
+            count[index] = 0
+    return stable, active, candidate, count
+
+
 def acceleration_limited_scalar_target(
     requested: float,
     previous: float,
@@ -554,6 +660,7 @@ def confirm_directional_wrist_twist(
     activate_rad: float,
     release_rad: float,
     confirm_samples: int,
+    reverse_confirm_samples: int | None = None,
 ) -> tuple[int, float, int, int]:
     """Debounce wrist-twist direction before changing the J6 command.
 
@@ -571,7 +678,12 @@ def confirm_directional_wrist_twist(
         raise ValueError("wrist-twist confirmation inputs must be finite")
     if active_direction not in (-1, 0, 1) or candidate_direction not in (-1, 0, 1):
         raise ValueError("wrist-twist directions must be -1, 0, or 1")
-    if confirm_samples < 1 or candidate_count < 0:
+    reverse_samples = (
+        int(confirm_samples)
+        if reverse_confirm_samples is None
+        else int(reverse_confirm_samples)
+    )
+    if confirm_samples < 1 or reverse_samples < 1 or candidate_count < 0:
         raise ValueError("wrist-twist confirmation counts must be positive")
     if release_rad < 0.0 or activate_rad <= release_rad:
         raise ValueError("wrist-twist activation must exceed its release threshold")
@@ -599,7 +711,14 @@ def confirm_directional_wrist_twist(
         candidate_count = 1
     else:
         candidate_count += 1
-    if candidate_count < confirm_samples:
+    required_samples = (
+        reverse_samples
+        if active_direction != 0
+        and candidate_direction != 0
+        and candidate_direction != active_direction
+        else int(confirm_samples)
+    )
+    if candidate_count < required_samples:
         return (
             active_direction,
             float(held_delta_rad),
@@ -1033,6 +1152,11 @@ class B601PalmFollower:
                 "b601_wrist_twist_confirm_samples", 4
             ).value
         )
+        self.wrist_twist_reverse_confirm_samples = int(
+            node.declare_parameter(
+                "b601_wrist_twist_reverse_confirm_samples", 7
+            ).value
+        )
         if (
             not np.isfinite(self.wrist_twist_filter_alpha)
             or not 0.0 < self.wrist_twist_filter_alpha <= 1.0
@@ -1043,11 +1167,14 @@ class B601PalmFollower:
             or self.wrist_twist_release_rad < 0.0
             or self.wrist_twist_activate_rad <= self.wrist_twist_release_rad
             or self.wrist_twist_confirm_samples < 1
+            or self.wrist_twist_reverse_confirm_samples
+            < self.wrist_twist_confirm_samples
         ):
             raise ValueError(
                 "B601 wrist-twist filter alpha must be in (0, 1] and "
                 "maximum innovation in (0, 180] degrees; activation must "
-                "exceed release and confirmation samples must be positive"
+                "exceed release; reversal confirmation must be at least the "
+                "normal positive confirmation count"
             )
         self.semantic_max_joint_offset = _positive_vector(
             node.declare_parameter(
@@ -1288,6 +1415,65 @@ class B601PalmFollower:
             2,
             "b601_semantic_planar_command_max_velocity_m_s",
         )
+        self.semantic_planar_command_max_acceleration = _positive_vector(
+            node.declare_parameter(
+                "b601_semantic_planar_command_max_acceleration_m_s2",
+                [0.18, 0.16],
+            ).value,
+            2,
+            "b601_semantic_planar_command_max_acceleration_m_s2",
+        )
+        self.semantic_planar_command_deadband = _positive_vector(
+            node.declare_parameter(
+                "b601_semantic_planar_command_deadband_m", [0.0015, 0.0015]
+            ).value,
+            2,
+            "b601_semantic_planar_command_deadband_m",
+        )
+        self.semantic_motion_reverse_deadband = _positive_vector(
+            node.declare_parameter(
+                "b601_semantic_motion_reverse_deadband_m",
+                [0.006, 0.006, 0.005],
+            ).value,
+            3,
+            "b601_semantic_motion_reverse_deadband_m",
+        )
+        self.semantic_motion_reverse_confirm_samples = int(
+            node.declare_parameter(
+                "b601_semantic_motion_reverse_confirm_samples", 4
+            ).value
+        )
+        if not 1 <= self.semantic_motion_reverse_confirm_samples <= 30:
+            raise ValueError(
+                "b601_semantic_motion_reverse_confirm_samples must be between 1 and 30"
+            )
+        self.semantic_j1_target_max_velocity = float(
+            node.declare_parameter(
+                "b601_semantic_j1_target_max_velocity_rad_s", 0.08
+            ).value
+        )
+        self.semantic_j1_target_max_acceleration = float(
+            node.declare_parameter(
+                "b601_semantic_j1_target_max_acceleration_rad_s2", 0.35
+            ).value
+        )
+        self.semantic_j1_target_deadband = float(
+            node.declare_parameter(
+                "b601_semantic_j1_target_deadband_rad", 0.0015
+            ).value
+        )
+        if (
+            not np.isfinite(self.semantic_j1_target_max_velocity)
+            or self.semantic_j1_target_max_velocity <= 0.0
+            or not np.isfinite(self.semantic_j1_target_max_acceleration)
+            or self.semantic_j1_target_max_acceleration <= 0.0
+            or not np.isfinite(self.semantic_j1_target_deadband)
+            or self.semantic_j1_target_deadband < 0.0
+        ):
+            raise ValueError(
+                "B601 J1 target velocity/acceleration must be positive and "
+                "deadband must be finite and non-negative"
+            )
         self.semantic_j4_target_max_velocity = float(
             node.declare_parameter(
                 "b601_semantic_j4_target_max_velocity_rad_s", 0.025
@@ -1429,7 +1615,13 @@ class B601PalmFollower:
         self.last_semantic_planar_error_m = np.zeros(2, dtype=np.float64)
         self.last_semantic_forward_gate = 0.0
         self.semantic_planar_command_m = np.zeros(2, dtype=np.float64)
+        self.semantic_planar_command_velocity_m_s = np.zeros(2, dtype=np.float64)
         self.last_semantic_planar_command_time = 0.0
+        self.semantic_motion_target_m = np.zeros(3, dtype=np.float64)
+        self.semantic_motion_active_direction = np.zeros(3, dtype=np.int8)
+        self.semantic_motion_candidate_direction = np.zeros(3, dtype=np.int8)
+        self.semantic_motion_candidate_count = np.zeros(3, dtype=np.int64)
+        self.semantic_j1_target_velocity = 0.0
         self.semantic_j4_target_velocity = 0.0
         self.semantic_j6_target_velocity = 0.0
         self.last_semantic_vertical_primary_progress = 0.0
@@ -1818,7 +2010,13 @@ class B601PalmFollower:
 
     def _reset_semantic_smoothing(self, now_s: float = 0.0) -> None:
         self.semantic_planar_command_m.fill(0.0)
+        self.semantic_planar_command_velocity_m_s.fill(0.0)
         self.last_semantic_planar_command_time = float(now_s)
+        self.semantic_motion_target_m.fill(0.0)
+        self.semantic_motion_active_direction.fill(0)
+        self.semantic_motion_candidate_direction.fill(0)
+        self.semantic_motion_candidate_count.fill(0)
+        self.semantic_j1_target_velocity = 0.0
         self.semantic_j4_target_velocity = 0.0
         self.semantic_j6_target_velocity = 0.0
         self._reset_wrist_twist_confirmation()
@@ -1998,10 +2196,7 @@ class B601PalmFollower:
         ):
             with self.target_lock:
                 self.target_q = q_seed.copy()
-            self.last_semantic_planar_command_time = now
-            self.semantic_j4_target_velocity = 0.0
-            self.semantic_j6_target_velocity = 0.0
-            self._reset_wrist_twist_confirmation()
+            self._reset_semantic_smoothing(now)
             self._reset_filters()
             if now - self.last_semantic_log_time >= 1.0:
                 self.logger.warn(
@@ -2033,6 +2228,22 @@ class B601PalmFollower:
         )
         lift *= self.semantic_planar_input_scale[1]
         lift = float(np.clip(lift, 0.0, self.semantic_vertical_max_lift_m))
+        raw_motion_target = np.asarray([lateral, forward, lift], dtype=np.float64)
+        (
+            stable_motion_target,
+            next_motion_active_direction,
+            next_motion_candidate_direction,
+            next_motion_candidate_count,
+        ) = confirm_vector_reversals(
+            raw_motion_target,
+            self.semantic_motion_target_m,
+            self.semantic_motion_active_direction,
+            self.semantic_motion_candidate_direction,
+            self.semantic_motion_candidate_count,
+            self.semantic_motion_reverse_deadband,
+            self.semantic_motion_reverse_confirm_samples,
+        )
+        lateral, forward, lift = [float(value) for value in stable_motion_target]
 
         tcp_lift, chain_clearance = self._semantic_clearance_from_table(q_seed)
         tcp_fraction = (
@@ -2111,6 +2322,7 @@ class B601PalmFollower:
                 self.wrist_twist_activate_rad,
                 self.wrist_twist_release_rad,
                 self.wrist_twist_confirm_samples,
+                self.wrist_twist_reverse_confirm_samples,
             )
         else:
             roll_delta = 0.0
@@ -2169,10 +2381,13 @@ class B601PalmFollower:
                 )
             )
         )
-        planar_command = slew_limit_vector(
+        planar_command, planar_velocity = acceleration_limited_vector_target(
             [requested_forward_target, requested_lift_target],
             self.semantic_planar_command_m,
+            self.semantic_planar_command_velocity_m_s,
             self.semantic_planar_command_max_velocity,
+            self.semantic_planar_command_max_acceleration,
+            self.semantic_planar_command_deadband,
             planar_dt,
         )
         forward_target = float(planar_command[0])
@@ -2235,6 +2450,16 @@ class B601PalmFollower:
             if self.last_submit_time <= 0.0
             else float(np.clip(now - self.last_submit_time, 0.001, 0.2))
         )
+        j1_target, j1_velocity = acceleration_limited_scalar_target(
+            float(q_target[0]),
+            float(previous_target[0]),
+            self.semantic_j1_target_velocity,
+            self.semantic_j1_target_max_velocity,
+            self.semantic_j1_target_max_acceleration,
+            self.semantic_j1_target_deadband,
+            target_dt,
+        )
+        q_target[0] = j1_target
         j4_target, j4_velocity = acceleration_limited_scalar_target(
             float(q_target[3]),
             float(previous_target[3]),
@@ -2257,6 +2482,8 @@ class B601PalmFollower:
         q_target[5] = j6_target
         if not self._semantic_table_clearance_ok(q_seed, q_target):
             self.last_semantic_planar_command_time = now
+            self.semantic_planar_command_velocity_m_s.fill(0.0)
+            self.semantic_j1_target_velocity = 0.0
             self.semantic_j4_target_velocity = 0.0
             self.semantic_j6_target_velocity = 0.0
             if now - self.last_semantic_log_time >= 1.0:
@@ -2268,6 +2495,8 @@ class B601PalmFollower:
             return self.last_arm_offset
         if not self._joint_target_is_safe(q_target, q_seed):
             self.last_semantic_planar_command_time = now
+            self.semantic_planar_command_velocity_m_s.fill(0.0)
+            self.semantic_j1_target_velocity = 0.0
             self.semantic_j4_target_velocity = 0.0
             self.semantic_j6_target_velocity = 0.0
             return self.last_arm_offset
@@ -2275,7 +2504,13 @@ class B601PalmFollower:
         with self.target_lock:
             self.target_q = q_target
         self.semantic_planar_command_m = planar_command
+        self.semantic_planar_command_velocity_m_s = planar_velocity
         self.last_semantic_planar_command_time = now
+        self.semantic_motion_target_m = stable_motion_target
+        self.semantic_motion_active_direction = next_motion_active_direction
+        self.semantic_motion_candidate_direction = next_motion_candidate_direction
+        self.semantic_motion_candidate_count = next_motion_candidate_count
+        self.semantic_j1_target_velocity = j1_velocity
         self.semantic_j4_target_velocity = j4_velocity
         self.semantic_j6_target_velocity = j6_velocity
         self.last_submit_time = now
@@ -2295,9 +2530,14 @@ class B601PalmFollower:
             )
             self.logger.info(
                 "B601 semantic: "
-                f"side={observation.side}, lateral={lateral:+.4f}m, "
+                f"side={observation.side}, "
+                f"raw_motion={raw_motion_target.round(4).tolist()}m, "
+                f"lateral={lateral:+.4f}m, "
                 f"forward={forward:+.4f}m, planar_forward={forward_target:+.4f}m, "
                 f"lift={lift_target:+.4f}m, forward_gate={forward_gate:.2f}, "
+                f"planar_velocity={planar_velocity.round(4).tolist()}m/s, "
+                f"reverse_pending={next_motion_candidate_direction.tolist()}/"
+                f"{next_motion_candidate_count.tolist()}, "
                 f"tcp_lift={tcp_lift:+.4f}m, "
                 f"chain_clearance={chain_clearance:+.4f}m, "
                 f"solver_error=[forward={self.last_semantic_planar_error_m[0]:+.4f}, "
@@ -2306,6 +2546,7 @@ class B601PalmFollower:
                 f"height={actual_planar_error[1]:+.4f}]m, "
                 f"J3_progress={self.last_semantic_vertical_primary_progress:.2f}, "
                 f"follower_limit={self.last_semantic_vertical_follower_limit:.2f}, "
+                f"J1_target_velocity={self.semantic_j1_target_velocity:+.4f}rad/s, "
                 f"J4_target_velocity={self.semantic_j4_target_velocity:+.4f}rad/s, "
                 f"J6_target_velocity={self.semantic_j6_target_velocity:+.4f}rad/s, "
                 f"articulation={'ready' if articulation_ready else 'locked'}, "
@@ -2314,7 +2555,9 @@ class B601PalmFollower:
                 f"J6_delta={np.rad2deg(roll_delta):+.1f}deg, "
                 f"J6_confirmed={np.rad2deg(self.semantic_j6_held_delta_rad):+.1f}deg, "
                 f"J6_direction={self.semantic_j6_active_direction:+d}, "
-                f"J6_pending={self.semantic_j6_candidate_count}/{self.wrist_twist_confirm_samples}, "
+                f"J6_pending={self.semantic_j6_candidate_count}/"
+                f"{self.wrist_twist_confirm_samples}:"
+                f"{self.wrist_twist_reverse_confirm_samples}, "
                 f"J6_offset={np.rad2deg(self.semantic_j6_command_offset_rad):+.1f}deg, "
                 f"J6_measured_offset={np.rad2deg(q_seed[5] - q_reference[5]):+.1f}deg, "
                 f"q_measured={q_seed.round(4).tolist()}, "

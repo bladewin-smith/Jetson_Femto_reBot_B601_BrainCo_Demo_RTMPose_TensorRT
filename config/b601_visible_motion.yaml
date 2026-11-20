@@ -1,13 +1,16 @@
 hand_palm_b601_control_node:
   ros__parameters:
     b601_control_mode: semantic_joint
+    # Camera-space palm centroid smoothing before semantic mapping.
+    palm_filter_alpha: 0.30
     b601_semantic_joint_gains: [0.65, -0.60, 0.18, 0.15, 0.45]
     b601_semantic_angle_deadband_deg: [5.0, 5.0, 3.0]
-    b601_wrist_twist_filter_alpha: 0.15
+    b601_wrist_twist_filter_alpha: 0.12
     b601_wrist_twist_max_innovation_deg: 12.0
     b601_wrist_twist_activate_deg: 12.0
     b601_wrist_twist_release_deg: 6.0
     b601_wrist_twist_confirm_samples: 4
+    b601_wrist_twist_reverse_confirm_samples: 7
     b601_wrist_twist_min_joint_offset_rad: 0.140
     b601_semantic_max_joint_offset_rad: [0.035, 0.080, 0.100, 0.070, 0.008, 0.300]
     b601_semantic_max_step_rad: [0.0025, 0.0025, 0.0030, 0.0020, 0.0010, 0.0060]
@@ -31,6 +34,14 @@ hand_palm_b601_control_node:
     b601_semantic_planar_joint_mobility: [0.85, 1.00, 0.50]
     b601_semantic_planar_task_weights: [1.00, 0.65, 0.85, 1.00]
     b601_semantic_planar_command_max_velocity_m_s: [0.040, 0.035]
+    # Reject brief direction flips, then brake/reverse with bounded acceleration.
+    b601_semantic_motion_reverse_deadband_m: [0.006, 0.006, 0.005]
+    b601_semantic_motion_reverse_confirm_samples: 4
+    b601_semantic_planar_command_max_acceleration_m_s2: [0.18, 0.16]
+    b601_semantic_planar_command_deadband_m: [0.0015, 0.0015]
+    b601_semantic_j1_target_max_velocity_rad_s: 0.08
+    b601_semantic_j1_target_max_acceleration_rad_s2: 0.35
+    b601_semantic_j1_target_deadband_rad: 0.0015
     b601_semantic_j4_target_max_velocity_rad_s: 0.025
     b601_semantic_j4_target_max_acceleration_rad_s2: 0.10
     b601_semantic_j4_target_deadband_rad: 0.0015

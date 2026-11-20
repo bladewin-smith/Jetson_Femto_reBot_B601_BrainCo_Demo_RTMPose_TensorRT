@@ -1502,7 +1502,10 @@ class HandKinematics:
         if len(palm_points) < 3:
             return None, None
 
-        palm_point = np.mean(palm_points, axis=0)
+        # Depth around an MCP landmark can occasionally land on the background
+        # or sleeve.  A coordinate-wise median keeps one or two bad palm depth
+        # patches from moving the control centroid in the opposite direction.
+        palm_point = np.median(np.asarray(palm_points, dtype=np.float64), axis=0)
         reference_point = self.palm_reference_points.get(prefix)
         if reference_point is None:
             reference_point = palm_point.copy()

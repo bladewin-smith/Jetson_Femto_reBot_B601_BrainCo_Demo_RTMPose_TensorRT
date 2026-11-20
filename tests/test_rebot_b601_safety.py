@@ -5,7 +5,9 @@ from arm_control.rebot_b601 import (
     B601PalmFollower,
     StartupGuardError,
     acceleration_limited_scalar_target,
+    acceleration_limited_vector_target,
     apply_tabletop_motion_envelope,
+    confirm_vector_reversals,
     confirm_directional_wrist_twist,
     filtered_wrapped_angle_delta,
     horizontal_radial_axis,
@@ -184,6 +186,78 @@ def test_planar_command_slew_limit_rejects_single_frame_jump():
     np.testing.assert_allclose(limited, [0.0024, 0.0021])
 
 
+def test_planar_acceleration_limiter_brakes_before_reversing():
+    target = np.zeros(2)
+    velocity = np.zeros(2)
+    target, velocity = acceleration_limited_vector_target(
+        requested=[0.04, 0.03],
+        previous=target,
+        previous_velocity=velocity,
+        max_velocity=[0.05, 0.04],
+        max_acceleration=[0.20, 0.16],
+        deadband=[0.0001, 0.0001],
+        dt_s=0.05,
+    )
+    np.testing.assert_allclose(velocity, [0.01, 0.008])
+
+    _, reversed_velocity = acceleration_limited_vector_target(
+        requested=[-0.04, -0.03],
+        previous=target,
+        previous_velocity=velocity,
+        max_velocity=[0.05, 0.04],
+        max_acceleration=[0.20, 0.16],
+        deadband=[0.0001, 0.0001],
+        dt_s=0.05,
+    )
+    np.testing.assert_allclose(reversed_velocity, [0.0, 0.0], atol=1e-12)
+
+
+def test_motion_reversal_requires_consecutive_samples_and_ignores_jitter():
+    stable = np.zeros(3)
+    active = np.zeros(3, dtype=np.int8)
+    candidate = np.zeros(3, dtype=np.int8)
+    count = np.zeros(3, dtype=np.int64)
+
+    stable, active, candidate, count = confirm_vector_reversals(
+        [-0.05, 0.03, 0.04],
+        stable,
+        active,
+        candidate,
+        count,
+        [0.006, 0.006, 0.005],
+        4,
+    )
+    np.testing.assert_allclose(stable, [-0.05, 0.03, 0.04])
+    np.testing.assert_array_equal(active, [-1, 1, 1])
+
+    # One large contradictory depth frame and one small lateral wobble are held.
+    stable, active, candidate, count = confirm_vector_reversals(
+        [0.02, -0.04, 0.037],
+        stable,
+        active,
+        candidate,
+        count,
+        [0.006, 0.006, 0.005],
+        4,
+    )
+    np.testing.assert_allclose(stable, [-0.05, 0.03, 0.04])
+    np.testing.assert_array_equal(candidate, [1, -1, 0])
+    np.testing.assert_array_equal(count, [1, 1, 0])
+
+    for _ in range(3):
+        stable, active, candidate, count = confirm_vector_reversals(
+            [0.02, -0.04, 0.037],
+            stable,
+            active,
+            candidate,
+            count,
+            [0.006, 0.006, 0.005],
+            4,
+        )
+    np.testing.assert_allclose(stable, [0.02, -0.04, 0.04])
+    np.testing.assert_array_equal(active, [1, -1, 1])
+
+
 def test_j4_target_limiter_bounds_velocity_acceleration_and_deadband():
     target = 0.0
     velocity = 0.0
@@ -303,6 +377,29 @@ def test_wrist_twist_direction_requires_confirmation_and_holds_through_spike():
             confirm_samples=4,
         )
     assert state == (0, 0.0, 0, 0)
+
+
+def test_wrist_twist_reversal_can_require_longer_confirmation():
+    state = (1, np.deg2rad(20.0), 0, 0)
+    for _ in range(6):
+        state = confirm_directional_wrist_twist(
+            np.deg2rad(-25.0),
+            *state,
+            activate_rad=np.deg2rad(12.0),
+            release_rad=np.deg2rad(6.0),
+            confirm_samples=4,
+            reverse_confirm_samples=7,
+        )
+        assert state[0] == 1
+    state = confirm_directional_wrist_twist(
+        np.deg2rad(-25.0),
+        *state,
+        activate_rad=np.deg2rad(12.0),
+        release_rad=np.deg2rad(6.0),
+        confirm_samples=4,
+        reverse_confirm_samples=7,
+    )
+    assert state[0] == -1
 
 
 def test_weighted_planar_dls_biases_motion_toward_more_mobile_joint():
