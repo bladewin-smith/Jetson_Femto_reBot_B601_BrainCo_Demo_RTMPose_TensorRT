@@ -226,6 +226,17 @@ def scale_vector_to_max_abs(
     return result
 
 
+def resolve_native_frame_ids(model: Any, frame_names: Sequence[str]) -> list[int]:
+    """Resolve Pinocchio frame IDs as native Python integers."""
+
+    resolved = [int(model.getFrameId(str(name))) for name in frame_names]
+    if any(frame_id < 0 or frame_id >= int(model.nframes) for frame_id in resolved):
+        raise ValueError(
+            "B601 DM URDF is missing one or more required semantic-control frames"
+        )
+    return resolved
+
+
 class B601PalmFollower:
     """B601-DM implementation of the palm-follower interface used by the UI."""
 
@@ -511,6 +522,14 @@ class B601PalmFollower:
             ),
             0.0,
         )
+        self.semantic_max_observation_displacement_m = _positive_vector(
+            node.declare_parameter(
+                "b601_semantic_max_observation_displacement_m",
+                [0.35, 0.35, 0.35],
+            ).value,
+            3,
+            "b601_semantic_max_observation_displacement_m",
+        )
         self.semantic_angle_deadband_rad = np.deg2rad(
             np.maximum(
                 _vector(
@@ -790,15 +809,13 @@ class B601PalmFollower:
                 f"B601 end-effector frame {self.end_effector_frame!r} is absent from the DM URDF"
             )
         self._end_frame_id = frame_id
-        self._articulation_clearance_frame_ids = np.asarray(
-            [self._model.getFrameId(name) for name in ("link3", "link4", "end_link")],
-            dtype=np.int64,
+        # Pinocchio's aligned-vector Python binding rejects numpy integer
+        # scalars as indices.  Keep native ints while retaining list-based
+        # advanced indexing for the NumPy height arrays below.
+        self._articulation_clearance_frame_ids = resolve_native_frame_ids(
+            self._model,
+            ("link3", "link4", "end_link"),
         )
-        if np.any(self._articulation_clearance_frame_ids >= self._model.nframes):
-            raise ValueError(
-                "B601 DM URDF is missing a frame required by the tabletop "
-                "articulation-clearance guard"
-            )
         self._joint_lower = self._model.lowerPositionLimit[: self.ARM_DOF].copy()
         self._joint_upper = self._model.upperPositionLimit[: self.ARM_DOF].copy()
 
@@ -1104,6 +1121,20 @@ class B601PalmFollower:
             "semantic palm displacement",
         )
         camera_offset *= self.palm_to_arm_scale
+        if np.any(
+            np.abs(camera_offset)
+            > self.semantic_max_observation_displacement_m
+        ):
+            with self.target_lock:
+                self.target_q = q_seed.copy()
+            self._reset_filters()
+            if now - self.last_semantic_log_time >= 1.0:
+                self.logger.warn(
+                    "Holding B601 measured pose: semantic palm displacement "
+                    f"is implausible ({camera_offset.round(3).tolist()}m)"
+                )
+                self.last_semantic_log_time = now
+            return self.last_arm_offset
         camera_offset = self._anti_drift_filter_offset(camera_offset)
         lateral = self._scalar_deadband(
             camera_offset[0], self.semantic_linear_deadband_m[0]

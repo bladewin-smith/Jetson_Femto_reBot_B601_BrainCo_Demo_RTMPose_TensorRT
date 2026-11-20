@@ -7,6 +7,7 @@ from arm_control.rebot_b601 import (
     joint_tracking_bounds,
     joint_target_safety_violations,
     minimum_jerk_blend,
+    resolve_native_frame_ids,
     scale_vector_to_max_abs,
     validate_tabletop_startup,
 )
@@ -159,3 +160,19 @@ def test_coordinated_joint_step_scaling_preserves_direction():
 
     assert np.max(np.abs(scaled)) == pytest.approx(0.012)
     np.testing.assert_allclose(scaled / raw, np.full(3, 0.012 / 0.044))
+
+
+def test_pinocchio_frame_ids_are_converted_to_native_integers():
+    class FakeModel:
+        nframes = 10
+
+        def getFrameId(self, name):
+            return np.int64({"link3": 3, "link4": 4, "end_link": 9}[name])
+
+    frame_ids = resolve_native_frame_ids(
+        FakeModel(),
+        ("link3", "link4", "end_link"),
+    )
+
+    assert frame_ids == [3, 4, 9]
+    assert all(type(frame_id) is int for frame_id in frame_ids)

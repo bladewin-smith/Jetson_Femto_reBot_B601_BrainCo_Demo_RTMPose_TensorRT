@@ -170,7 +170,9 @@ python scripts/camera_arm_b601_control_pose_hands.py --ros-args \
 
 J5 在该模式下保持本次跟踪开始时的参考角。垂直通道只允许从经过验证的桌面姿态
 向上运动；手掌下移表示回落到桌面参考高度，不能命令末端进入桌面以下。控制器还会
-比较 URDF 中所有 frame 与启动桌面姿态的高度，并拒绝降低到容差以下的目标。
+比较 URDF 中所有 frame 与启动桌面姿态的高度，并拒绝降低到容差以下的目标。任一
+相机轴上的掌心位移超过 `b601_semantic_max_observation_displacement_m`（默认 0.35m）
+时视为跟踪离群值，控制器会保持实测关节姿态并重置视觉滤波器。
 
 六个 `b601_semantic_channel_enable` 值依次表示：
 `[J1左右, J2深度, J3肘, J4腕, J6滚转, J2/J3/J4上下]`。为了避免贴桌拖动，
