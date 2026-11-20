@@ -226,6 +226,46 @@ def scale_vector_to_max_abs(
     return result
 
 
+def ramp_joint_target_with_tracking_window(
+    desired_rad: Sequence[float],
+    measured_rad: Sequence[float],
+    previous_target_rad: Sequence[float],
+    max_step_rad: Sequence[float],
+    max_tracking_error_rad: Sequence[float],
+) -> np.ndarray:
+    """Ramp from the prior target while bounding target lead over feedback."""
+
+    desired = np.asarray(desired_rad, dtype=np.float64).reshape(-1)
+    measured = np.asarray(measured_rad, dtype=np.float64).reshape(-1)
+    previous = np.asarray(previous_target_rad, dtype=np.float64).reshape(-1)
+    max_step = np.asarray(max_step_rad, dtype=np.float64).reshape(-1)
+    max_tracking_error = np.asarray(
+        max_tracking_error_rad, dtype=np.float64
+    ).reshape(-1)
+    if not (
+        desired.shape
+        == measured.shape
+        == previous.shape
+        == max_step.shape
+        == max_tracking_error.shape
+    ):
+        raise ValueError("semantic joint-ramp vectors must have matching shapes")
+    if not all(
+        np.all(np.isfinite(values))
+        for values in (desired, measured, previous, max_step, max_tracking_error)
+    ):
+        raise ValueError("semantic joint-ramp vectors must contain finite values")
+    if np.any(max_step <= 0.0) or np.any(max_tracking_error <= 0.0):
+        raise ValueError("semantic joint-ramp limits must be positive")
+
+    ramped = previous + np.clip(desired - previous, -max_step, max_step)
+    return measured + np.clip(
+        ramped - measured,
+        -max_tracking_error,
+        max_tracking_error,
+    )
+
+
 def resolve_native_frame_ids(model: Any, frame_names: Sequence[str]) -> list[int]:
     """Resolve Pinocchio frame IDs as native Python integers."""
 
@@ -557,6 +597,14 @@ class B601PalmFollower:
             ).value,
             6,
             "b601_semantic_max_step_rad",
+        )
+        self.semantic_max_tracking_error = _positive_vector(
+            node.declare_parameter(
+                "b601_semantic_max_tracking_error_rad",
+                [0.012, 0.018, 0.018, 0.012, 0.008, 0.015],
+            ).value,
+            6,
+            "b601_semantic_max_tracking_error_rad",
         )
         self.semantic_vertical_max_lift_m = float(
             node.declare_parameter(
@@ -1203,10 +1251,18 @@ class B601PalmFollower:
             q_reference + self.semantic_max_joint_offset,
         )
         q_desired = np.clip(q_desired, lower, upper)
-        q_target = q_seed + np.clip(
-            q_desired - q_seed,
-            -self.semantic_max_step,
+        with self.target_lock:
+            previous_target = (
+                q_seed.copy()
+                if self.target_q is None
+                else self.target_q.copy()
+            )
+        q_target = ramp_joint_target_with_tracking_window(
+            q_desired,
+            q_seed,
+            previous_target,
             self.semantic_max_step,
+            self.semantic_max_tracking_error,
         )
         if not self._semantic_table_clearance_ok(q_seed, q_target):
             if now - self.last_semantic_log_time >= 1.0:
@@ -1225,18 +1281,26 @@ class B601PalmFollower:
         self.last_arm_offset = np.array([lateral, forward, lift], dtype=np.float64)
         self.first_tracking_motion_ok = True
         if now - self.last_semantic_log_time >= 1.0:
+            actual_vertical_error = self._semantic_vertical_error_at_q(
+                q_seed,
+                lift,
+            )
             self.logger.info(
                 "B601 semantic: "
                 f"side={observation.side}, lateral={lateral:+.4f}m, "
                 f"forward={forward:+.4f}m, lift={lift:+.4f}m, "
                 f"tcp_lift={tcp_lift:+.4f}m, "
                 f"chain_clearance={chain_clearance:+.4f}m, "
-                f"vertical_error={self.last_semantic_vertical_error_m:+.4f}m, "
+                f"solver_error={self.last_semantic_vertical_error_m:+.4f}m, "
+                f"actual_vertical_error={actual_vertical_error:+.4f}m, "
                 f"articulation={'ready' if articulation_ready else 'locked'}, "
                 f"elbow={np.rad2deg(elbow_delta):+.1f}deg, "
                 f"wrist={np.rad2deg(wrist_delta):+.1f}deg, "
                 f"roll={np.rad2deg(roll_delta):+.1f}deg, "
-                f"q_target={q_target.round(4).tolist()}"
+                f"q_measured={q_seed.round(4).tolist()}, "
+                f"q_desired={q_desired.round(4).tolist()}, "
+                f"q_target={q_target.round(4).tolist()}, "
+                f"target_lead={(q_target - q_seed).round(4).tolist()}"
             )
             self.last_semantic_log_time = now
         return self.last_arm_offset
@@ -1393,6 +1457,24 @@ class B601PalmFollower:
             )
         )
         return tcp_lift, chain_clearance
+
+    def _semantic_vertical_error_at_q(
+        self,
+        q: np.ndarray,
+        lift_m: float,
+    ) -> float:
+        if self.semantic_reference_frame_heights is None:
+            return 0.0
+        target_heights = (
+            self.semantic_reference_frame_heights[
+                self._articulation_clearance_frame_ids
+            ]
+            + self.semantic_vertical_height_profile * float(lift_m)
+        )
+        actual_heights = self._frame_heights(q)[
+            self._articulation_clearance_frame_ids
+        ]
+        return float(np.max(np.abs(target_heights - actual_heights)))
 
     def update_from_palm_displacement(self, displacement: Sequence[float] | None):
         if not self.enabled or self.initial_pose is None or displacement is None:

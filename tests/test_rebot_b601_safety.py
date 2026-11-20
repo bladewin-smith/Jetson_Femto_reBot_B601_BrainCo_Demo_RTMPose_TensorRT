@@ -7,6 +7,7 @@ from arm_control.rebot_b601 import (
     joint_tracking_bounds,
     joint_target_safety_violations,
     minimum_jerk_blend,
+    ramp_joint_target_with_tracking_window,
     resolve_native_frame_ids,
     scale_vector_to_max_abs,
     validate_tabletop_startup,
@@ -176,3 +177,20 @@ def test_pinocchio_frame_ids_are_converted_to_native_integers():
 
     assert frame_ids == [3, 4, 9]
     assert all(type(frame_id) is int for frame_id in frame_ids)
+
+
+def test_semantic_target_can_accumulate_safe_lead_over_static_feedback():
+    measured = np.zeros(3)
+    target = measured.copy()
+    desired = np.array([-0.05, -0.05, 0.03])
+
+    for _ in range(20):
+        target = ramp_joint_target_with_tracking_window(
+            desired,
+            measured,
+            target,
+            [0.002, 0.002, 0.0015],
+            [0.012, 0.018, 0.010],
+        )
+
+    np.testing.assert_allclose(target, [-0.012, -0.018, 0.010])
