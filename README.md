@@ -174,14 +174,17 @@ J5 在该模式下保持本次跟踪开始时的参考角。垂直通道只允�
 
 六个 `b601_semantic_channel_enable` 值依次表示：
 `[J1左右, J2深度, J3肘, J4腕, J6滚转, J2/J3/J4上下]`。为了避免贴桌拖动，
-肘部、腕部和 TCP 三个模型 frame 相对桌面姿态的最小净空达到
-`b601_semantic_min_lift_before_articulation_m` 之前，前五个通道保持锁定。每次控制手
-左右切换也会重新采集人体角度和当前关节参考，避免瞬时跳变。
+TCP 实际抬升达到 `b601_semantic_min_lift_before_articulation_m`，并且肘部、腕部和
+TCP 三个模型 frame 的最小净空达到 `b601_semantic_min_chain_clearance_m` 之前，前五个
+通道保持锁定。上下控制分别给这三个 frame 分配 50%、82%、100% 的目标抬升量，
+避免只抬末端而让中间连杆继续贴桌。每次控制手左右切换也会重新采集人体角度和当前
+关节参考，避免瞬时跳变。
 
 ### 安全的小幅度分通道验证
 
-必须先完成上面的桌面姿态标定。下面刻意把各轴总偏移限制在约 `0.3–1.7°`、每帧
-限制在约 `0.086°`，灵巧手保持关闭。引擎路径使用已经在同一台 Jetson 上验收过的
+必须先完成上面的桌面姿态标定。下面把各轴总偏移限制在约 `0.3–2.9°`、每帧限制
+在约 `0.14°`，仍属于小幅验证范围，灵巧手保持关闭。引擎路径使用已经在同一台
+Jetson 上验收过的
 RealMan 旧仓库引擎文件；不要跨 JetPack/TensorRT 版本复制 engine。
 
 ```bash
@@ -218,11 +221,14 @@ run_b601_semantic_test() {
     -p b601_tabletop_joint_tolerance_rad:='[0.12,0.12,0.12,0.12,0.12,0.12]' \
     -p b601_control_mode:=semantic_joint \
     -p b601_semantic_channel_enable:="$CHANNELS" \
-    -p b601_semantic_joint_gains:='[0.40,-0.40,0.10,0.08,0.10]' \
-    -p b601_semantic_max_joint_offset_rad:='[0.018,0.030,0.030,0.018,0.005,0.015]' \
-    -p b601_semantic_max_step_rad:='[0.0015,0.0015,0.0015,0.0015,0.0010,0.0015]' \
+    -p b601_semantic_joint_gains:='[0.65,-0.60,0.18,0.15,0.25]' \
+    -p b601_semantic_max_joint_offset_rad:='[0.035,0.045,0.050,0.030,0.005,0.035]' \
+    -p b601_semantic_max_step_rad:='[0.0025,0.0020,0.0020,0.0015,0.0010,0.0020]' \
     -p b601_semantic_vertical_max_lift_m:=0.012 \
     -p b601_semantic_min_lift_before_articulation_m:=0.008 \
+    -p b601_semantic_min_chain_clearance_m:=0.001 \
+    -p b601_semantic_vertical_height_profile:='[0.50,0.82,1.0]' \
+    -p b601_semantic_vertical_orientation_weight_m_per_rad:=0.02 \
     -p b601_semantic_table_clearance_tolerance_m:=0.001 \
     -p control_hand_side:=right \
     -p control_hand_fallback_enabled:=false \
@@ -232,9 +238,10 @@ run_b601_semantic_test() {
 }
 ```
 
-每次只执行下面一组。启动后保持人体静止，按 `S` 采集参考；先把掌心缓慢抬高，
-看到日志 `articulation=ready` 后，再做对应的单一小动作。按 `H` 验证慢速回桌，确认
-完成后按 `Q` 退出，再进行下一组。
+每次只执行下面一组。启动后保持人体静止，按 `S` 采集参考；先把掌心缓慢抬高。
+日志中的 `tcp_lift` 应达到约 `0.008m`、`chain_clearance` 应达到约 `0.001m`，并出现
+`articulation=ready`；`vertical_error` 应逐步降到约 `0.003m` 以下。然后再做对应的
+单一小动作。按 `H` 验证慢速回桌，确认完成后按 `Q` 退出，再进行下一组。
 
 ```bash
 # 0. 先验证纯上下协同；除 J2/J3/J4 外不应有动作

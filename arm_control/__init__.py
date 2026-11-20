@@ -6,6 +6,7 @@ from .rebot_b601 import (
     apply_tabletop_motion_envelope,
     joint_tracking_bounds,
     minimum_jerk_blend,
+    scale_vector_to_max_abs,
     validate_tabletop_startup,
 )
 from .semantic_motion import (
@@ -21,6 +22,7 @@ __all__ = [
     "apply_tabletop_motion_envelope",
     "joint_tracking_bounds",
     "minimum_jerk_blend",
+    "scale_vector_to_max_abs",
     "validate_tabletop_startup",
     "OperatorArmMotion",
     "build_operator_arm_motion",

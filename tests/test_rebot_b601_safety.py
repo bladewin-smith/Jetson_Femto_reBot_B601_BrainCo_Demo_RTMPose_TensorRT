@@ -7,6 +7,7 @@ from arm_control.rebot_b601 import (
     joint_tracking_bounds,
     joint_target_safety_violations,
     minimum_jerk_blend,
+    scale_vector_to_max_abs,
     validate_tabletop_startup,
 )
 
@@ -149,3 +150,12 @@ def test_joint_tracking_bounds_keep_validated_table_pose_reachable():
 
     np.testing.assert_allclose(lower, [-2.75, -3.09, -3.09])
     np.testing.assert_allclose(upper, [2.75, -0.009, -0.011])
+
+
+def test_coordinated_joint_step_scaling_preserves_direction():
+    raw = np.array([-0.023, -0.044, 0.018])
+
+    scaled = scale_vector_to_max_abs(raw, 0.012)
+
+    assert np.max(np.abs(scaled)) == pytest.approx(0.012)
+    np.testing.assert_allclose(scaled / raw, np.full(3, 0.012 / 0.044))

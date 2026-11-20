@@ -209,6 +209,23 @@ def joint_tracking_bounds(
     return np.maximum(lower_guard, lower), np.minimum(upper_guard, upper)
 
 
+def scale_vector_to_max_abs(
+    values: Sequence[float], max_abs_value: float
+) -> np.ndarray:
+    """Limit a vector without changing its coordinated joint direction."""
+
+    result = np.asarray(values, dtype=np.float64).reshape(-1)
+    maximum = float(max_abs_value)
+    if not np.all(np.isfinite(result)):
+        raise ValueError("coordinated joint step must contain only finite values")
+    if not np.isfinite(maximum) or maximum <= 0.0:
+        raise ValueError("max_abs_value must be positive and finite")
+    peak = float(np.max(np.abs(result))) if result.size else 0.0
+    if peak > maximum:
+        result = result * (maximum / peak)
+    return result
+
+
 class B601PalmFollower:
     """B601-DM implementation of the palm-follower interface used by the UI."""
 
@@ -555,6 +572,18 @@ class B601PalmFollower:
                 "b601_semantic_min_lift_before_articulation_m cannot exceed "
                 "b601_semantic_vertical_max_lift_m"
             )
+        self.semantic_min_chain_clearance_m = float(
+            node.declare_parameter(
+                "b601_semantic_min_chain_clearance_m", 0.001
+            ).value
+        )
+        if (
+            not np.isfinite(self.semantic_min_chain_clearance_m)
+            or self.semantic_min_chain_clearance_m < 0.0
+        ):
+            raise ValueError(
+                "b601_semantic_min_chain_clearance_m must be finite and non-negative"
+            )
         self.semantic_vertical_joint_mask = _vector(
             node.declare_parameter(
                 "b601_semantic_vertical_joint_mask",
@@ -572,7 +601,33 @@ class B601PalmFollower:
         )
         self.semantic_vertical_orientation_weight = float(
             node.declare_parameter(
-                "b601_semantic_vertical_orientation_weight_m_per_rad", 0.12
+                "b601_semantic_vertical_orientation_weight_m_per_rad", 0.02
+            ).value
+        )
+        self.semantic_vertical_height_profile = _positive_vector(
+            node.declare_parameter(
+                "b601_semantic_vertical_height_profile", [0.50, 0.82, 1.0]
+            ).value,
+            3,
+            "b601_semantic_vertical_height_profile",
+        )
+        if (
+            np.any(self.semantic_vertical_height_profile > 1.0)
+            or np.any(np.diff(self.semantic_vertical_height_profile) < 0.0)
+            or not np.isclose(self.semantic_vertical_height_profile[-1], 1.0)
+        ):
+            raise ValueError(
+                "b601_semantic_vertical_height_profile must be non-decreasing, "
+                "at most 1.0, and end at 1.0"
+            )
+        self.semantic_vertical_solver_step_rad = float(
+            node.declare_parameter(
+                "b601_semantic_vertical_solver_step_rad", 0.012
+            ).value
+        )
+        self.semantic_vertical_solver_iterations = int(
+            node.declare_parameter(
+                "b601_semantic_vertical_solver_iterations", 8
             ).value
         )
         self.semantic_table_clearance_tolerance_m = float(
@@ -591,6 +646,17 @@ class B601PalmFollower:
         ):
             raise ValueError(
                 "b601_semantic_vertical_orientation_weight_m_per_rad cannot be negative"
+            )
+        if (
+            not np.isfinite(self.semantic_vertical_solver_step_rad)
+            or self.semantic_vertical_solver_step_rad <= 0.0
+        ):
+            raise ValueError(
+                "b601_semantic_vertical_solver_step_rad must be positive and finite"
+            )
+        if not 1 <= self.semantic_vertical_solver_iterations <= 50:
+            raise ValueError(
+                "b601_semantic_vertical_solver_iterations must be between 1 and 50"
             )
         if (
             not np.isfinite(self.semantic_table_clearance_tolerance_m)
@@ -614,6 +680,7 @@ class B601PalmFollower:
         self.startup_joint_reference = None
         self.table_frame_heights = None
         self.semantic_control_reference_q = None
+        self.semantic_reference_frame_heights = None
         self.semantic_control_side = None
         self.semantic_signal_references = {}
         self.semantic_signal_deltas = {
@@ -622,6 +689,7 @@ class B601PalmFollower:
             "roll": 0.0,
         }
         self.last_semantic_log_time = 0.0
+        self.last_semantic_vertical_error_m = 0.0
         self.last_commanded_pose = None
         self.last_target_pose = None
         self.last_arm_offset = np.zeros(3, dtype=np.float64)
@@ -909,9 +977,11 @@ class B601PalmFollower:
             self.target_q = q.copy()
         self._set_reference_from_q(q)
         self.semantic_control_reference_q = q.copy()
+        self.semantic_reference_frame_heights = self._frame_heights(q)
         self.semantic_control_side = None
         self.semantic_signal_references.clear()
         self.semantic_signal_deltas.update(elbow=0.0, wrist=0.0, roll=0.0)
+        self.last_semantic_vertical_error_m = 0.0
         self.last_target_pose = list(self.initial_pose)
         self.last_commanded_pose = list(self.initial_pose)
         self.last_arm_offset = np.zeros(3, dtype=np.float64)
@@ -934,6 +1004,7 @@ class B601PalmFollower:
         self.last_target_pose = None
         self.last_submit_time = 0.0
         self.semantic_control_side = None
+        self.semantic_reference_frame_heights = None
         self.semantic_signal_references.clear()
         self.semantic_signal_deltas.update(elbow=0.0, wrist=0.0, roll=0.0)
         self._reset_filters()
@@ -969,6 +1040,7 @@ class B601PalmFollower:
     ) -> None:
         self.semantic_control_side = observation.side
         self.semantic_control_reference_q = q_reference.copy()
+        self.semantic_reference_frame_heights = self._frame_heights(q_reference)
         self.semantic_signal_references = {
             "elbow": observation.elbow_angle_rad,
             "wrist": observation.wrist_pitch_rad,
@@ -1073,9 +1145,10 @@ class B601PalmFollower:
             self.semantic_channel_enable,
             self.semantic_max_joint_offset,
         )
-        current_lift = self._articulation_clearance_from_table(q_seed)
+        tcp_lift, chain_clearance = self._semantic_clearance_from_table(q_seed)
         articulation_ready = (
-            current_lift >= self.semantic_min_lift_before_articulation_m
+            tcp_lift >= self.semantic_min_lift_before_articulation_m
+            and chain_clearance >= self.semantic_min_chain_clearance_m
             and lift >= self.semantic_min_lift_before_articulation_m
         )
         if not articulation_ready:
@@ -1084,6 +1157,8 @@ class B601PalmFollower:
         q_desired = q_reference + direct_offsets
         if self.semantic_channel_enable[5] > 0.5:
             q_desired = self._apply_semantic_vertical(q_desired, lift)
+        else:
+            self.last_semantic_vertical_error_m = 0.0
 
         lower, upper = joint_tracking_bounds(
             self._joint_lower,
@@ -1123,7 +1198,9 @@ class B601PalmFollower:
                 "B601 semantic: "
                 f"side={observation.side}, lateral={lateral:+.4f}m, "
                 f"forward={forward:+.4f}m, lift={lift:+.4f}m, "
-                f"chain_clearance={current_lift:+.4f}m, "
+                f"tcp_lift={tcp_lift:+.4f}m, "
+                f"chain_clearance={chain_clearance:+.4f}m, "
+                f"vertical_error={self.last_semantic_vertical_error_m:+.4f}m, "
                 f"articulation={'ready' if articulation_ready else 'locked'}, "
                 f"elbow={np.rad2deg(elbow_delta):+.1f}deg, "
                 f"wrist={np.rad2deg(wrist_delta):+.1f}deg, "
@@ -1138,14 +1215,20 @@ class B601PalmFollower:
         q_base: np.ndarray,
         lift_m: float,
     ) -> np.ndarray:
-        """Coordinate selected joints to change TCP Z with little rotation."""
+        """Lift elbow, wrist and TCP together with a bounded DLS solve."""
 
         q = np.asarray(q_base, dtype=np.float64).copy()
         columns = np.flatnonzero(self.semantic_vertical_joint_mask > 0.5)
         if columns.size == 0:
             return q
-        target_z = float(self.initial_pose[2]) + float(lift_m)
         q_reference = self.semantic_control_reference_q
+        reference_heights = self.semantic_reference_frame_heights
+        if reference_heights is None:
+            reference_heights = self._frame_heights(q_reference)
+        target_heights = (
+            reference_heights[self._articulation_clearance_frame_ids]
+            + self.semantic_vertical_height_profile * float(lift_m)
+        )
         tracking_lower, tracking_upper = joint_tracking_bounds(
             self._joint_lower,
             self._joint_upper,
@@ -1162,33 +1245,47 @@ class B601PalmFollower:
         )
         q = np.clip(q, lower, upper)
 
-        for _ in range(4):
+        height_error = np.zeros(3, dtype=np.float64)
+        for _ in range(self.semantic_vertical_solver_iterations):
             q_model = self._pad_q_for_model(self._model, q, self.ARM_DOF)
             self._pin.forwardKinematics(
                 self._model, self._kinematics_data, q_model
             )
             self._pin.updateFramePlacements(self._model, self._kinematics_data)
-            current_z = float(
-                self._kinematics_data.oMf[self._end_frame_id].translation[2]
+            current_heights = np.asarray(
+                [
+                    float(self._kinematics_data.oMf[frame_id].translation[2])
+                    for frame_id in self._articulation_clearance_frame_ids
+                ],
+                dtype=np.float64,
             )
-            z_error = target_z - current_z
-            if abs(z_error) < 2e-4:
+            height_error = target_heights - current_heights
+            if float(np.max(np.abs(height_error))) < 2e-4:
                 break
-            jacobian = self._pin.computeFrameJacobian(
-                self._model,
-                self._kinematics_data,
-                q_model,
-                self._end_frame_id,
-                self._pin.ReferenceFrame.WORLD,
-            )
-            selected = jacobian[:, columns]
+            height_rows = []
+            end_jacobian = None
+            for frame_id in self._articulation_clearance_frame_ids:
+                jacobian = self._pin.computeFrameJacobian(
+                    self._model,
+                    self._kinematics_data,
+                    q_model,
+                    int(frame_id),
+                    self._pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
+                )
+                height_rows.append(jacobian[2, columns])
+                if int(frame_id) == self._end_frame_id:
+                    end_jacobian = jacobian[:, columns]
+            if end_jacobian is None:
+                raise RuntimeError("B601 semantic vertical task is missing the TCP frame")
             task = np.vstack(
                 (
-                    selected[2:3, :],
-                    self.semantic_vertical_orientation_weight * selected[3:6, :],
+                    np.asarray(height_rows, dtype=np.float64),
+                    self.semantic_vertical_orientation_weight * end_jacobian[3:6, :],
                 )
             )
-            desired = np.array([z_error, 0.0, 0.0, 0.0], dtype=np.float64)
+            desired = np.concatenate(
+                (height_error, np.zeros(3, dtype=np.float64))
+            )
             regularized = task @ task.T + (
                 self.semantic_vertical_damping**2
             ) * np.eye(task.shape[0])
@@ -1197,9 +1294,25 @@ class B601PalmFollower:
             except np.linalg.LinAlgError:
                 self.logger.warn("B601 semantic vertical Jacobian is singular; holding")
                 return q_base.copy()
-            delta = np.clip(delta, -0.012, 0.012)
-            q[columns] += delta
-            q = np.clip(q, lower, upper)
+            # Element-wise clipping destroys the coordinated J2/J3/J4 ratio
+            # and, in the near-straight table pose, can reverse TCP Z motion.
+            delta = scale_vector_to_max_abs(
+                delta,
+                self.semantic_vertical_solver_step_rad,
+            )
+            proposed = q.copy()
+            proposed[columns] += delta
+            proposed = np.clip(proposed, lower, upper)
+            if float(np.max(np.abs(proposed - q))) < 1e-8:
+                break
+            q = proposed
+
+        final_heights = self._frame_heights(q)[
+            self._articulation_clearance_frame_ids
+        ]
+        self.last_semantic_vertical_error_m = float(
+            np.max(np.abs(target_heights - final_heights))
+        )
         return q
 
     def _frame_heights(self, q: np.ndarray) -> np.ndarray:
@@ -1232,16 +1345,23 @@ class B601PalmFollower:
                 return False
         return True
 
-    def _articulation_clearance_from_table(self, q: np.ndarray) -> float:
+    def _semantic_clearance_from_table(
+        self, q: np.ndarray
+    ) -> tuple[float, float]:
         if self.table_frame_heights is None:
-            return 0.0
+            return 0.0, 0.0
         heights = self._frame_heights(q)
-        return float(
+        tcp_lift = float(
+            heights[self._end_frame_id]
+            - self.table_frame_heights[self._end_frame_id]
+        )
+        chain_clearance = float(
             np.min(
                 heights[self._articulation_clearance_frame_ids]
                 - self.table_frame_heights[self._articulation_clearance_frame_ids]
             )
         )
+        return tcp_lift, chain_clearance
 
     def update_from_palm_displacement(self, displacement: Sequence[float] | None):
         if not self.enabled or self.initial_pose is None or displacement is None:
