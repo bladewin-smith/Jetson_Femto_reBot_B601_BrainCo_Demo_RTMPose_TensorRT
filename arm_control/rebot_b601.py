@@ -99,6 +99,62 @@ def send_mit_checked(
         raise RuntimeError("MIT send failed for " + "; ".join(failures))
 
 
+def limit_mit_target_by_effort(
+    measured_position_rad: Sequence[float],
+    measured_velocity_rad_s: Sequence[float],
+    requested_target_rad: Sequence[float],
+    kp: Sequence[float],
+    kd: Sequence[float],
+    feedforward_torque_nm: Sequence[float],
+    effort_limit_nm: Sequence[float],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Bound the MIT target so estimated total joint effort stays limited.
+
+    For MIT control the approximate commanded effort is
+    ``kp * (q_target - q) - kd * dq + tau_ff``.  Limiting only gravity
+    feed-forward is insufficient once a larger visible-motion position error
+    is allowed.  This helper clips the position contribution while preserving
+    the damping and gravity terms.
+    """
+
+    q = np.asarray(measured_position_rad, dtype=np.float64).reshape(-1)
+    dq = np.asarray(measured_velocity_rad_s, dtype=np.float64).reshape(-1)
+    requested = np.asarray(requested_target_rad, dtype=np.float64).reshape(-1)
+    position_kp = np.asarray(kp, dtype=np.float64).reshape(-1)
+    velocity_kd = np.asarray(kd, dtype=np.float64).reshape(-1)
+    feedforward = np.asarray(feedforward_torque_nm, dtype=np.float64).reshape(-1)
+    limit = np.asarray(effort_limit_nm, dtype=np.float64).reshape(-1)
+    if not (
+        q.shape
+        == dq.shape
+        == requested.shape
+        == position_kp.shape
+        == velocity_kd.shape
+        == feedforward.shape
+        == limit.shape
+    ):
+        raise ValueError("MIT effort-limit vectors must have matching shapes")
+    if not all(
+        np.all(np.isfinite(values))
+        for values in (q, dq, requested, position_kp, velocity_kd, feedforward, limit)
+    ):
+        raise ValueError("MIT effort-limit vectors must contain finite values")
+    if np.any(position_kp <= 0.0) or np.any(limit <= 0.0):
+        raise ValueError("MIT kp and effort limits must be positive")
+
+    non_position_effort = feedforward - velocity_kd * dq
+    requested_position_effort = position_kp * (requested - q)
+    bounded_position_effort = np.clip(
+        requested_position_effort,
+        -limit - non_position_effort,
+        limit - non_position_effort,
+    )
+    bounded_target = q + bounded_position_effort / position_kp
+    estimated_effort = non_position_effort + bounded_position_effort
+    limited = np.abs(bounded_target - requested) > 1e-9
+    return bounded_target, estimated_effort, limited
+
+
 def validate_tabletop_startup(
     positions_rad: Sequence[float],
     velocities_rad_s: Sequence[float],
@@ -481,6 +537,13 @@ class B601PalmFollower:
             self.ARM_DOF,
             "b601_gravity_torque_limit_nm",
         )
+        self.joint_effort_limit = _positive_vector(
+            node.declare_parameter(
+                "b601_joint_effort_limit_nm", [8.0, 10.0, 16.0, 6.0, 4.0, 4.0]
+            ).value,
+            self.ARM_DOF,
+            "b601_joint_effort_limit_nm",
+        )
         self.max_joint_target_delta = _positive_vector(
             node.declare_parameter(
                 "b601_max_joint_target_delta_rad",
@@ -728,8 +791,16 @@ class B601PalmFollower:
                 "b601_semantic_stall_max_velocity_rad_s", 0.003
             ).value
         )
+        # Retained as a declared compatibility parameter for existing launch
+        # commands. Stall detection below is progress-based because a heavily
+        # loaded J3 can move safely below this instantaneous velocity.
+        self.semantic_stall_min_progress_rad = float(
+            node.declare_parameter(
+                "b601_semantic_stall_min_progress_rad", 0.0015
+            ).value
+        )
         self.semantic_stall_timeout_s = float(
-            node.declare_parameter("b601_semantic_stall_timeout_s", 1.5).value
+            node.declare_parameter("b601_semantic_stall_timeout_s", 3.0).value
         )
         if (
             not np.isfinite(self.semantic_stall_max_velocity_rad_s)
@@ -737,6 +808,13 @@ class B601PalmFollower:
         ):
             raise ValueError(
                 "b601_semantic_stall_max_velocity_rad_s must be finite and non-negative"
+            )
+        if (
+            not np.isfinite(self.semantic_stall_min_progress_rad)
+            or self.semantic_stall_min_progress_rad <= 0.0
+        ):
+            raise ValueError(
+                "b601_semantic_stall_min_progress_rad must be positive and finite"
             )
         if (
             not np.isfinite(self.semantic_stall_timeout_s)
@@ -912,8 +990,13 @@ class B601PalmFollower:
         self.last_measured_dq = None
         self.last_measured_tau = np.zeros(self.ARM_DOF, dtype=np.float64)
         self.last_gravity_tau = np.zeros(self.ARM_DOF, dtype=np.float64)
+        self.last_sent_target_q = np.zeros(self.ARM_DOF, dtype=np.float64)
+        self.last_command_effort = np.zeros(self.ARM_DOF, dtype=np.float64)
+        self.last_effort_limited = np.zeros(self.ARM_DOF, dtype=bool)
         self.last_motor_status = np.zeros(self.ARM_DOF, dtype=np.int64)
         self.semantic_stall_started_s = np.full(self.ARM_DOF, np.nan, dtype=np.float64)
+        self.semantic_stall_reference_q = np.full(self.ARM_DOF, np.nan, dtype=np.float64)
+        self.semantic_stall_direction = np.zeros(self.ARM_DOF, dtype=np.float64)
         self.semantic_actuation_fault = None
         self.startup_joint_reference = None
         self.table_frame_heights = None
@@ -1155,10 +1238,19 @@ class B601PalmFollower:
                 with self.target_lock:
                     target_q = q.copy() if self.target_q is None else self.target_q.copy()
                 tau = self._gravity_torque(q)
+                sent_target_q, command_effort, effort_limited = limit_mit_target_by_effort(
+                    q,
+                    dq,
+                    target_q,
+                    self.joint_kp,
+                    self.joint_kd,
+                    tau,
+                    self.joint_effort_limit,
+                )
                 send_mit_checked(
                     robot._motor_map,
                     robot.arm.joint_names,
-                    target_q,
+                    sent_target_q,
                     np.zeros(self.ARM_DOF),
                     self.joint_kp,
                     self.joint_kd,
@@ -1168,8 +1260,11 @@ class B601PalmFollower:
             self.last_measured_dq = dq
             self.last_measured_tau = measured_tau
             self.last_gravity_tau = tau
+            self.last_sent_target_q = sent_target_q
+            self.last_command_effort = command_effort
+            self.last_effort_limited = effort_limited
             self.last_motor_status = status
-            self._update_semantic_stall_watchdog(q, dq, target_q)
+            self._update_semantic_stall_watchdog(q, dq, sent_target_q)
             self.last_control_error = None
         except Exception as exc:
             self.last_control_error = exc
@@ -1190,26 +1285,47 @@ class B601PalmFollower:
 
         if self.control_mode != "semantic_joint" or self.semantic_control_reference_q is None:
             self.semantic_stall_started_s.fill(np.nan)
+            self.semantic_stall_reference_q.fill(np.nan)
+            self.semantic_stall_direction.fill(0.0)
             return
         now = time.monotonic()
-        error = np.abs(np.asarray(target_q) - np.asarray(q))
-        slow = np.abs(np.asarray(dq)) <= self.semantic_stall_max_velocity_rad_s
-        stalled = np.logical_and(error >= self.semantic_stall_error, slow)
-        self.semantic_stall_started_s[~stalled] = np.nan
-        newly_stalled = np.logical_and(stalled, np.isnan(self.semantic_stall_started_s))
-        self.semantic_stall_started_s[newly_stalled] = now
+        signed_error = np.asarray(target_q) - np.asarray(q)
+        demanding = np.abs(signed_error) >= self.semantic_stall_error
+        inactive = ~demanding
+        self.semantic_stall_started_s[inactive] = np.nan
+        self.semantic_stall_reference_q[inactive] = np.nan
+        self.semantic_stall_direction[inactive] = 0.0
+        for index in np.flatnonzero(demanding):
+            direction = float(np.sign(signed_error[index]))
+            uninitialized = np.isnan(self.semantic_stall_started_s[index])
+            direction_changed = direction != self.semantic_stall_direction[index]
+            if uninitialized or direction_changed:
+                self.semantic_stall_started_s[index] = now
+                self.semantic_stall_reference_q[index] = q[index]
+                self.semantic_stall_direction[index] = direction
+                continue
+            progress = direction * (q[index] - self.semantic_stall_reference_q[index])
+            if progress >= self.semantic_stall_min_progress_rad:
+                self.semantic_stall_started_s[index] = now
+                self.semantic_stall_reference_q[index] = q[index]
         timed_out = np.logical_and(
-            stalled,
+            demanding,
             now - self.semantic_stall_started_s >= self.semantic_stall_timeout_s,
         )
         if not np.any(timed_out) or self.semantic_actuation_fault is not None:
             return
         indices = np.flatnonzero(timed_out)
-        details = [
-            f"J{index + 1}(error={target_q[index] - q[index]:+.4f}rad, "
-            f"dq={dq[index]:+.4f}rad/s, status=0x{int(self.last_motor_status[index]):X})"
-            for index in indices
-        ]
+        details = []
+        for index in indices:
+            progress_since_reset = self.semantic_stall_direction[index] * (
+                q[index] - self.semantic_stall_reference_q[index]
+            )
+            details.append(
+                f"J{index + 1}(error={target_q[index] - q[index]:+.4f}rad, "
+                f"progress={progress_since_reset:+.4f}rad, "
+                f"dq={dq[index]:+.4f}rad/s, "
+                f"status=0x{int(self.last_motor_status[index]):X})"
+            )
         self.semantic_actuation_fault = (
             "semantic joint tracking stalled: " + ", ".join(details)
         )
@@ -1302,6 +1418,8 @@ class B601PalmFollower:
         self.first_tracking_motion_ok = False
         self.tracking_cycle_started_at = time.monotonic()
         self.semantic_stall_started_s.fill(np.nan)
+        self.semantic_stall_reference_q.fill(np.nan)
+        self.semantic_stall_direction.fill(0.0)
         self.semantic_actuation_fault = None
         self._reset_filters()
         self.logger.info(
@@ -1323,6 +1441,8 @@ class B601PalmFollower:
         self.semantic_signal_references.clear()
         self.semantic_signal_deltas.update(elbow=0.0, wrist=0.0, roll=0.0)
         self.semantic_stall_started_s.fill(np.nan)
+        self.semantic_stall_reference_q.fill(np.nan)
+        self.semantic_stall_direction.fill(0.0)
         self._reset_filters()
         self.logger.info(
             f"B601 tracking paused; holding measured pose with gravity feed-forward ({reason})"
@@ -1555,9 +1675,6 @@ class B601PalmFollower:
                 q_seed,
                 lift,
             )
-            commanded_effort = (
-                self.joint_kp * (q_target - q_seed) + self.last_gravity_tau
-            )
             self.logger.info(
                 "B601 semantic: "
                 f"side={observation.side}, lateral={lateral:+.4f}m, "
@@ -1576,9 +1693,11 @@ class B601PalmFollower:
                 f"q_desired={q_desired.round(4).tolist()}, "
                 f"q_target={q_target.round(4).tolist()}, "
                 f"target_lead={(q_target - q_seed).round(4).tolist()}, "
+                f"q_sent={self.last_sent_target_q.round(4).tolist()}, "
                 f"tau_g={self.last_gravity_tau.round(3).tolist()}, "
                 f"tau_measured={self.last_measured_tau.round(3).tolist()}, "
-                f"effort_est={commanded_effort.round(3).tolist()}, "
+                f"effort_cmd={self.last_command_effort.round(3).tolist()}, "
+                f"effort_limited={self.last_effort_limited.tolist()}, "
                 f"motor_status={[f'0x{int(code):X}' for code in self.last_motor_status]}"
             )
             self.last_semantic_log_time = now

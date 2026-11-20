@@ -182,12 +182,26 @@ TCP 三个模型 frame 的最小净空达到 `b601_semantic_min_chain_clearance_
 避免只抬末端而让中间连杆继续贴桌。每次控制手左右切换也会重新采集人体角度和当前
 关节参考，避免瞬时跳变。
 
-### 安全的小幅度分通道验证
+### 安全的明显运动分通道验证
 
-必须先完成上面的桌面姿态标定。下面把各轴总偏移限制在约 `0.3–2.9°`、每帧限制
-在约 `0.14°`，仍属于小幅验证范围，灵巧手保持关闭。引擎路径使用已经在同一台
+必须先完成上面的桌面姿态标定。下面的第一阶段已经提高到肉眼可见但仍受约束的
+验证范围：目标 TCP 抬升约 `25 mm`，J2/J3/J4 最大偏移约 `4.6°/5.7°/4.0°`，
+同时把六轴 MIT 总指令力矩分别限制为 `8/10/16/6/4/4 Nm`。灵巧手保持关闭。
+引擎路径使用已经在同一台
 Jetson 上验收过的
 RealMan 旧仓库引擎文件；不要跨 JetPack/TensorRT 版本复制 engine。
+
+为避免旧 shell 函数继续覆盖成 12 mm 小幅参数，仓库同时提供可直接运行的明显运动
+验证入口。`TABLE_Q` 必须使用本机最新读取的桌面姿态：
+
+```bash
+cd "$HOME/ws/Jetson_Femto_reBot_B601_BrainCo_Demo_RTMPose_TensorRT"
+export TABLE_Q='[q1,q2,q3,q4,q5,q6]'
+bash scripts/run_b601_visible_lift.sh '[0.0,0.0,0.0,0.0,0.0,1.0]'
+```
+
+该入口固定读取 `config/b601_visible_motion.yaml`，因此不要再用旧的 `run_stage_v2`
+验证这一档参数。下面保留完整展开形式，便于逐项检查或继续调参。
 
 ```bash
 REPO="$HOME/ws/Jetson_Femto_reBot_B601_BrainCo_Demo_RTMPose_TensorRT"
@@ -224,19 +238,23 @@ run_b601_semantic_test() {
     -p b601_control_mode:=semantic_joint \
     -p b601_semantic_channel_enable:="$CHANNELS" \
     -p b601_semantic_joint_gains:='[0.65,-0.60,0.18,0.15,0.25]' \
-    -p b601_semantic_max_joint_offset_rad:='[0.035,0.045,0.050,0.030,0.005,0.035]' \
-    -p b601_semantic_max_step_rad:='[0.0025,0.0020,0.0020,0.0015,0.0010,0.0020]' \
-    -p b601_joint_kp:='[120.0,120.0,120.0,45.0,35.0,30.0]' \
+    -p b601_semantic_max_joint_offset_rad:='[0.035,0.080,0.100,0.070,0.008,0.035]' \
+    -p b601_semantic_max_step_rad:='[0.0025,0.0025,0.0030,0.0020,0.0010,0.0020]' \
+    -p b601_joint_kp:='[120.0,120.0,180.0,45.0,35.0,30.0]' \
     -p b601_joint_kd:='[8.0,8.0,8.0,2.0,2.0,2.0]' \
-    -p b601_semantic_max_tracking_error_rad:='[0.012,0.024,0.040,0.025,0.008,0.015]' \
-    -p b601_semantic_stall_error_rad:='[0.010,0.015,0.025,0.015,0.010,0.012]' \
-    -p b601_semantic_stall_timeout_s:=1.5 \
+    -p b601_joint_effort_limit_nm:='[8.0,10.0,16.0,6.0,4.0,4.0]' \
+    -p b601_semantic_max_tracking_error_rad:='[0.012,0.020,0.055,0.025,0.008,0.015]' \
+    -p b601_semantic_stall_error_rad:='[0.010,0.015,0.030,0.015,0.010,0.012]' \
+    -p b601_semantic_stall_min_progress_rad:=0.0015 \
+    -p b601_semantic_stall_timeout_s:=4.0 \
     -p b601_semantic_vertical_primary_joint:=3 \
     -p b601_semantic_vertical_follower_progress_lead:=0.15 \
-    -p b601_semantic_vertical_max_lift_m:=0.012 \
-    -p b601_semantic_min_lift_before_articulation_m:=0.008 \
+    -p b601_semantic_vertical_max_lift_m:=0.025 \
+    -p b601_semantic_min_lift_before_articulation_m:=0.018 \
     -p b601_semantic_min_chain_clearance_m:=0.001 \
     -p b601_semantic_vertical_height_profile:='[0.50,0.82,1.0]' \
+    -p b601_semantic_vertical_solver_step_rad:=0.015 \
+    -p b601_semantic_vertical_solver_iterations:=12 \
     -p b601_semantic_vertical_orientation_weight_m_per_rad:=0.02 \
     -p b601_semantic_table_clearance_tolerance_m:=0.001 \
     -p control_hand_side:=right \
@@ -248,11 +266,14 @@ run_b601_semantic_test() {
 ```
 
 每次只执行下面一组。启动后保持人体静止，按 `S` 采集参考；先把掌心缓慢抬高。
-日志中的 `tcp_lift` 应达到约 `0.008m`、`chain_clearance` 应达到约 `0.001m`，并出现
-`articulation=ready`；`actual_vertical_error` 应逐步降到约 `0.003m` 以下。
+日志中的 `tcp_lift` 应比按 `S` 时增加至少约 `0.015m`，最终目标约 `0.025m`；
+`chain_clearance` 应达到约 `0.001m`，并出现 `articulation=ready`；
+`actual_vertical_error` 应逐步降到约 `0.005m` 以下。
 `q_target` 会从上一次目标连续爬坡，并由 `target_lead` 显示它相对实测关节角积累的
-有限位置误差。`tau_g` 是重力前馈，`tau_measured` 是电机反馈力矩，`effort_est`
-是位置误差项与重力项的合计估算，正常使能时六个 `motor_status` 均应为 `0x1`。
+有限位置误差。`q_sent` 是经过总力矩限制后真正发送的目标；`tau_g` 是重力前馈，
+`tau_measured` 是电机反馈力矩，`effort_cmd` 是包含位置、阻尼与重力项的指令估算，
+任何 `effort_limited=true` 表示该轴已被软件力矩上限截断。正常使能时六个
+`motor_status` 均应为 `0x1`。
 抬升阶段以负载最大的 J3 实测进度为主时钟，`J3_progress` 表示其已完成比例，
 `follower_limit` 是 J2/J4 当时允许达到的最大比例，避免两个快关节先运动反而压低末端。
 如果某关节在有足够目标误差时持续静止，看门狗会保持实测姿态并明确打印关节名；

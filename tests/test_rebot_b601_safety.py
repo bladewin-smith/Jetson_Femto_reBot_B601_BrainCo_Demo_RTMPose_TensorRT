@@ -7,6 +7,7 @@ from arm_control.rebot_b601 import (
     apply_tabletop_motion_envelope,
     joint_tracking_bounds,
     joint_target_safety_violations,
+    limit_mit_target_by_effort,
     minimum_jerk_blend,
     ramp_joint_target_with_tracking_window,
     resolve_native_frame_ids,
@@ -272,3 +273,49 @@ def test_table_clearance_allows_monotonic_recovery_from_small_tracking_dip():
         np.array([-0.0015, 0.0]),
         np.array([-0.0020, 0.0]),
     )
+
+
+def test_mit_target_is_clipped_by_total_effort_not_only_feedforward():
+    target, effort, limited = limit_mit_target_by_effort(
+        measured_position_rad=[0.0, 0.0],
+        measured_velocity_rad_s=[0.0, 0.0],
+        requested_target_rad=[1.0, -1.0],
+        kp=[10.0, 10.0],
+        kd=[1.0, 1.0],
+        feedforward_torque_nm=[3.0, -3.0],
+        effort_limit_nm=[5.0, 5.0],
+    )
+
+    np.testing.assert_allclose(target, [0.2, -0.2])
+    np.testing.assert_allclose(effort, [5.0, -5.0])
+    assert limited.tolist() == [True, True]
+
+
+def test_stall_watchdog_accepts_slow_but_measurable_progress(monkeypatch):
+    import arm_control.rebot_b601 as backend
+
+    follower = object.__new__(B601PalmFollower)
+    follower.control_mode = "semantic_joint"
+    follower.semantic_control_reference_q = np.zeros(2)
+    follower.semantic_stall_error = np.array([0.02, 0.02])
+    follower.semantic_stall_min_progress_rad = 0.0015
+    follower.semantic_stall_timeout_s = 3.0
+    follower.semantic_stall_started_s = np.full(2, np.nan)
+    follower.semantic_stall_reference_q = np.full(2, np.nan)
+    follower.semantic_stall_direction = np.zeros(2)
+    follower.semantic_actuation_fault = None
+
+    times = iter([0.0, 2.0, 4.0])
+    monkeypatch.setattr(backend.time, "monotonic", lambda: next(times))
+    target = np.array([0.05, 0.0])
+    follower._update_semantic_stall_watchdog(
+        np.array([0.0, 0.0]), np.zeros(2), target
+    )
+    follower._update_semantic_stall_watchdog(
+        np.array([0.0016, 0.0]), np.zeros(2), target
+    )
+    follower._update_semantic_stall_watchdog(
+        np.array([0.0032, 0.0]), np.zeros(2), target
+    )
+
+    assert follower.semantic_actuation_fault is None
