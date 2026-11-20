@@ -495,6 +495,56 @@ def acceleration_limited_scalar_target(
     return float(previous + step), velocity
 
 
+def filtered_wrapped_angle_delta(
+    value: float,
+    reference: float,
+    previous_delta: float,
+    deadband_rad: float,
+    max_innovation_rad: float,
+    filter_alpha: float,
+) -> float:
+    """Filter a periodic angle delta while bounding one-frame innovations.
+
+    This is used by the independent J6 wrist-twist channel.  Wrapping both the
+    reference delta and the innovation prevents a +/-pi boundary crossing from
+    looking like a full revolution; innovation limiting and low-pass filtering
+    prevent one bad depth frame from producing a visible J6 kick.
+    """
+
+    values = np.asarray(
+        [
+            value,
+            reference,
+            previous_delta,
+            deadband_rad,
+            max_innovation_rad,
+            filter_alpha,
+        ],
+        dtype=np.float64,
+    )
+    if not np.all(np.isfinite(values)):
+        raise ValueError("wrapped-angle filter inputs must be finite")
+    if deadband_rad < 0.0 or not 0.0 < filter_alpha <= 1.0:
+        raise ValueError("angle deadband must be non-negative and alpha in (0, 1]")
+    if not 0.0 < max_innovation_rad <= np.pi:
+        raise ValueError("maximum angle innovation must be in (0, pi]")
+
+    raw_delta = wrap_angle_radians(float(value) - float(reference))
+    magnitude = abs(raw_delta)
+    desired_delta = (
+        0.0
+        if magnitude <= deadband_rad
+        else float(np.copysign(magnitude - deadband_rad, raw_delta))
+    )
+    innovation = wrap_angle_radians(desired_delta - float(previous_delta))
+    limited_innovation = float(
+        np.clip(innovation, -max_innovation_rad, max_innovation_rad)
+    )
+    return wrap_angle_radians(
+        float(previous_delta) + filter_alpha * limited_innovation
+    )
+
+
 def synchronize_vertical_follower_progress(
     reference_rad: Sequence[float],
     desired_rad: Sequence[float],
@@ -848,7 +898,7 @@ class B601PalmFollower:
         self.semantic_joint_gains = _vector(
             node.declare_parameter(
                 "b601_semantic_joint_gains",
-                [0.60, -0.60, 0.20, 0.15, 0.20],
+                [0.60, -0.60, 0.20, 0.15, 0.30],
             ).value,
             5,
             "b601_semantic_joint_gains",
@@ -875,7 +925,7 @@ class B601PalmFollower:
             np.maximum(
                 _vector(
                     node.declare_parameter(
-                        "b601_semantic_angle_deadband_deg", [5.0, 5.0, 7.0]
+                        "b601_semantic_angle_deadband_deg", [5.0, 5.0, 3.0]
                     ).value,
                     3,
                     "b601_semantic_angle_deadband_deg",
@@ -883,10 +933,32 @@ class B601PalmFollower:
                 0.0,
             )
         )
+        self.wrist_twist_filter_alpha = float(
+            node.declare_parameter(
+                "b601_wrist_twist_filter_alpha", 0.30
+            ).value
+        )
+        self.wrist_twist_max_innovation_rad = np.deg2rad(
+            float(
+                node.declare_parameter(
+                    "b601_wrist_twist_max_innovation_deg", 20.0
+                ).value
+            )
+        )
+        if (
+            not np.isfinite(self.wrist_twist_filter_alpha)
+            or not 0.0 < self.wrist_twist_filter_alpha <= 1.0
+            or not np.isfinite(self.wrist_twist_max_innovation_rad)
+            or not 0.0 < self.wrist_twist_max_innovation_rad <= np.pi
+        ):
+            raise ValueError(
+                "B601 wrist-twist filter alpha must be in (0, 1] and "
+                "maximum innovation must be in (0, 180] degrees"
+            )
         self.semantic_max_joint_offset = _positive_vector(
             node.declare_parameter(
                 "b601_semantic_max_joint_offset_rad",
-                [0.035, 0.040, 0.040, 0.030, 0.010, 0.040],
+                [0.035, 0.040, 0.040, 0.030, 0.010, 0.160],
             ).value,
             6,
             "b601_semantic_max_joint_offset_rad",
@@ -902,7 +974,7 @@ class B601PalmFollower:
         self.semantic_max_tracking_error = _positive_vector(
             node.declare_parameter(
                 "b601_semantic_max_tracking_error_rad",
-                [0.012, 0.024, 0.040, 0.025, 0.008, 0.015],
+                [0.012, 0.024, 0.040, 0.025, 0.008, 0.025],
             ).value,
             6,
             "b601_semantic_max_tracking_error_rad",
@@ -1134,6 +1206,33 @@ class B601PalmFollower:
                 "B601 J4 target velocity/acceleration must be positive and "
                 "deadband must be finite and non-negative"
             )
+        self.semantic_j6_target_max_velocity = float(
+            node.declare_parameter(
+                "b601_semantic_j6_target_max_velocity_rad_s", 0.08
+            ).value
+        )
+        self.semantic_j6_target_max_acceleration = float(
+            node.declare_parameter(
+                "b601_semantic_j6_target_max_acceleration_rad_s2", 0.40
+            ).value
+        )
+        self.semantic_j6_target_deadband = float(
+            node.declare_parameter(
+                "b601_semantic_j6_target_deadband_rad", 0.0015
+            ).value
+        )
+        if (
+            not np.isfinite(self.semantic_j6_target_max_velocity)
+            or self.semantic_j6_target_max_velocity <= 0.0
+            or not np.isfinite(self.semantic_j6_target_max_acceleration)
+            or self.semantic_j6_target_max_acceleration <= 0.0
+            or not np.isfinite(self.semantic_j6_target_deadband)
+            or self.semantic_j6_target_deadband < 0.0
+        ):
+            raise ValueError(
+                "B601 J6 target velocity/acceleration must be positive and "
+                "deadband must be finite and non-negative"
+            )
         self.semantic_vertical_solver_step_rad = float(
             node.declare_parameter(
                 "b601_semantic_vertical_solver_step_rad", 0.012
@@ -1208,7 +1307,7 @@ class B601PalmFollower:
         self.semantic_control_side = None
         self.semantic_signal_references = {}
         self.semantic_signal_deltas = {
-            "roll": 0.0,
+            "wrist_twist": 0.0,
         }
         self.last_semantic_log_time = 0.0
         self.last_semantic_vertical_error_m = 0.0
@@ -1217,6 +1316,7 @@ class B601PalmFollower:
         self.semantic_planar_command_m = np.zeros(2, dtype=np.float64)
         self.last_semantic_planar_command_time = 0.0
         self.semantic_j4_target_velocity = 0.0
+        self.semantic_j6_target_velocity = 0.0
         self.last_semantic_vertical_primary_progress = 0.0
         self.last_semantic_vertical_follower_limit = 0.0
         self.last_commanded_pose = None
@@ -1597,6 +1697,7 @@ class B601PalmFollower:
         self.semantic_planar_command_m.fill(0.0)
         self.last_semantic_planar_command_time = float(now_s)
         self.semantic_j4_target_velocity = 0.0
+        self.semantic_j6_target_velocity = 0.0
 
     def begin_tracking_cycle(self, reason: str = "person_start") -> bool:
         if not self.enabled:
@@ -1620,7 +1721,7 @@ class B601PalmFollower:
         self.semantic_reference_frame_heights = self._frame_heights(q)
         self.semantic_control_side = None
         self.semantic_signal_references.clear()
-        self.semantic_signal_deltas.update(roll=0.0)
+        self.semantic_signal_deltas.update(wrist_twist=0.0)
         self.last_semantic_vertical_error_m = 0.0
         self.last_semantic_planar_error_m.fill(0.0)
         self.last_semantic_forward_gate = 0.0
@@ -1653,7 +1754,7 @@ class B601PalmFollower:
         self.semantic_control_side = None
         self.semantic_reference_frame_heights = None
         self.semantic_signal_references.clear()
-        self.semantic_signal_deltas.update(roll=0.0)
+        self.semantic_signal_deltas.update(wrist_twist=0.0)
         self.last_semantic_planar_error_m.fill(0.0)
         self.last_semantic_forward_gate = 0.0
         self._reset_semantic_smoothing()
@@ -1695,9 +1796,9 @@ class B601PalmFollower:
         self.semantic_control_reference_q = q_reference.copy()
         self.semantic_reference_frame_heights = self._frame_heights(q_reference)
         self.semantic_signal_references = {
-            "roll": observation.palm_roll_rad,
+            "wrist_twist": observation.palm_roll_rad,
         }
-        self.semantic_signal_deltas.update(roll=0.0)
+        self.semantic_signal_deltas.update(wrist_twist=0.0)
         self._reset_semantic_smoothing(time.monotonic())
         self._reset_filters()
         self.logger.info(
@@ -1718,10 +1819,19 @@ class B601PalmFollower:
             self.semantic_signal_references[name] = float(value)
             self.semantic_signal_deltas[name] = 0.0
             return 0.0
-        raw_delta = float(value) - float(reference)
-        if name == "roll":
-            raw_delta = wrap_angle_radians(raw_delta)
-        delta = self._scalar_deadband(raw_delta, deadband_rad)
+        if name == "wrist_twist":
+            delta = filtered_wrapped_angle_delta(
+                float(value),
+                float(reference),
+                float(self.semantic_signal_deltas[name]),
+                deadband_rad,
+                self.wrist_twist_max_innovation_rad,
+                self.wrist_twist_filter_alpha,
+            )
+        else:
+            delta = self._scalar_deadband(
+                float(value) - float(reference), deadband_rad
+            )
         self.semantic_signal_deltas[name] = delta
         return delta
 
@@ -1766,6 +1876,7 @@ class B601PalmFollower:
                 self.target_q = q_seed.copy()
             self.last_semantic_planar_command_time = now
             self.semantic_j4_target_velocity = 0.0
+            self.semantic_j6_target_velocity = 0.0
             self._reset_filters()
             if now - self.last_semantic_log_time >= 1.0:
                 self.logger.warn(
@@ -1799,7 +1910,7 @@ class B601PalmFollower:
         lift = float(np.clip(lift, 0.0, self.semantic_vertical_max_lift_m))
 
         roll_delta = self._semantic_angle_delta(
-            "roll",
+            "wrist_twist",
             observation.palm_roll_rad,
             self.semantic_angle_deadband_rad[2],
         )
@@ -1836,14 +1947,17 @@ class B601PalmFollower:
         )
         clearance_fraction = min(tcp_fraction, chain_fraction)
         # Smoothstep avoids a visible target discontinuity at the old hard
-        # articulation threshold.  Forward/J1/J6 motion fades in only as the
-        # measured arm actually clears the tabletop; lift remains available.
+        # articulation threshold.  J1 and the independently estimated J6
+        # wrist twist remain safety-gated until the measured arm clears the
+        # tabletop; their vision signals do not otherwise depend on the planar
+        # J2/J3/J4 solver.
         forward_gate = clearance_fraction**2 * (3.0 - 2.0 * clearance_fraction)
         self.last_semantic_forward_gate = forward_gate
         articulation_ready = (
             clearance_fraction >= 1.0 - 1e-6
         )
-        direct_offsets *= forward_gate
+        direct_offsets[0] *= forward_gate
+        direct_offsets[5] *= forward_gate
         q_reference = self.semantic_control_reference_q
         q_base = q_reference + direct_offsets
         requested_forward_target = (
@@ -1941,9 +2055,20 @@ class B601PalmFollower:
             target_dt,
         )
         q_target[3] = j4_target
+        j6_target, j6_velocity = acceleration_limited_scalar_target(
+            float(q_target[5]),
+            float(previous_target[5]),
+            self.semantic_j6_target_velocity,
+            self.semantic_j6_target_max_velocity,
+            self.semantic_j6_target_max_acceleration,
+            self.semantic_j6_target_deadband,
+            target_dt,
+        )
+        q_target[5] = j6_target
         if not self._semantic_table_clearance_ok(q_seed, q_target):
             self.last_semantic_planar_command_time = now
             self.semantic_j4_target_velocity = 0.0
+            self.semantic_j6_target_velocity = 0.0
             if now - self.last_semantic_log_time >= 1.0:
                 self.logger.warn(
                     "Refusing B601 semantic target: a modeled frame would move "
@@ -1954,6 +2079,7 @@ class B601PalmFollower:
         if not self._joint_target_is_safe(q_target, q_seed):
             self.last_semantic_planar_command_time = now
             self.semantic_j4_target_velocity = 0.0
+            self.semantic_j6_target_velocity = 0.0
             return self.last_arm_offset
 
         with self.target_lock:
@@ -1961,10 +2087,16 @@ class B601PalmFollower:
         self.semantic_planar_command_m = planar_command
         self.last_semantic_planar_command_time = now
         self.semantic_j4_target_velocity = j4_velocity
+        self.semantic_j6_target_velocity = j6_velocity
         self.last_submit_time = now
         self.last_arm_offset = np.array([lateral, forward, lift], dtype=np.float64)
         self.first_tracking_motion_ok = True
         if now - self.last_semantic_log_time >= 1.0:
+            wrist_twist_text = (
+                "invalid"
+                if observation.palm_roll_rad is None
+                else f"{np.rad2deg(observation.palm_roll_rad):+.1f}deg"
+            )
             actual_planar_error = self._semantic_planar_error_at_q(
                 q_seed,
                 q_base,
@@ -1985,8 +2117,10 @@ class B601PalmFollower:
                 f"J3_progress={self.last_semantic_vertical_primary_progress:.2f}, "
                 f"follower_limit={self.last_semantic_vertical_follower_limit:.2f}, "
                 f"J4_target_velocity={self.semantic_j4_target_velocity:+.4f}rad/s, "
+                f"J6_target_velocity={self.semantic_j6_target_velocity:+.4f}rad/s, "
                 f"articulation={'ready' if articulation_ready else 'locked'}, "
-                f"roll={np.rad2deg(roll_delta):+.1f}deg, "
+                f"wrist_twist={wrist_twist_text}, "
+                f"J6_delta={np.rad2deg(roll_delta):+.1f}deg, "
                 f"q_measured={q_seed.round(4).tolist()}, "
                 f"q_desired={q_desired.round(4).tolist()}, "
                 f"q_target={q_target.round(4).tolist()}, "

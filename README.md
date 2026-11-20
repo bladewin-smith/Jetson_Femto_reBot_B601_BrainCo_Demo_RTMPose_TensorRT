@@ -252,13 +252,16 @@ run_b601_semantic_test() {
     -p b601_tabletop_joint_tolerance_rad:='[0.12,0.12,0.12,0.12,0.12,0.12]' \
     -p b601_control_mode:=semantic_joint \
     -p b601_semantic_channel_enable:="$CHANNELS" \
-    -p b601_semantic_joint_gains:='[0.65,-0.60,0.18,0.15,0.25]' \
-    -p b601_semantic_max_joint_offset_rad:='[0.035,0.080,0.100,0.070,0.008,0.035]' \
-    -p b601_semantic_max_step_rad:='[0.0025,0.0025,0.0030,0.0020,0.0010,0.0020]' \
+    -p b601_semantic_joint_gains:='[0.65,-0.60,0.18,0.15,0.30]' \
+    -p b601_semantic_angle_deadband_deg:='[5.0,5.0,3.0]' \
+    -p b601_wrist_twist_filter_alpha:=0.30 \
+    -p b601_wrist_twist_max_innovation_deg:=20.0 \
+    -p b601_semantic_max_joint_offset_rad:='[0.035,0.080,0.100,0.070,0.008,0.160]' \
+    -p b601_semantic_max_step_rad:='[0.0025,0.0025,0.0030,0.0020,0.0010,0.0040]' \
     -p b601_joint_kp:='[120.0,120.0,180.0,30.0,35.0,30.0]' \
     -p b601_joint_kd:='[8.0,8.0,8.0,4.0,2.0,2.0]' \
     -p b601_joint_effort_limit_nm:='[8.0,10.0,16.0,6.0,4.0,4.0]' \
-    -p b601_semantic_max_tracking_error_rad:='[0.012,0.020,0.055,0.018,0.008,0.015]' \
+    -p b601_semantic_max_tracking_error_rad:='[0.012,0.020,0.055,0.018,0.008,0.025]' \
     -p b601_semantic_stall_error_rad:='[0.010,0.015,0.030,0.015,0.010,0.012]' \
     -p b601_semantic_stall_min_progress_rad:=0.0015 \
     -p b601_semantic_stall_timeout_s:=4.0 \
@@ -276,6 +279,9 @@ run_b601_semantic_test() {
     -p b601_semantic_j4_target_max_velocity_rad_s:=0.025 \
     -p b601_semantic_j4_target_max_acceleration_rad_s2:=0.10 \
     -p b601_semantic_j4_target_deadband_rad:=0.0015 \
+    -p b601_semantic_j6_target_max_velocity_rad_s:=0.08 \
+    -p b601_semantic_j6_target_max_acceleration_rad_s2:=0.40 \
+    -p b601_semantic_j6_target_deadband_rad:=0.0015 \
     -p b601_semantic_vertical_solver_step_rad:=0.015 \
     -p b601_semantic_vertical_solver_iterations:=12 \
     -p b601_semantic_vertical_orientation_weight_m_per_rad:=0.02 \
@@ -292,7 +298,8 @@ run_b601_semantic_test() {
 日志中的 `tcp_lift` 应比按 `S` 时增加至少约 `0.015m`，最终目标约 `0.025m`；
 `chain_clearance` 应达到约 `0.001m`，并出现 `articulation=ready`；
 `actual_error` 中的 `height` 应逐步降到约 `0.005m` 以下。机械臂抬升过程中
-`forward_gate` 会从 0 平滑增加到 1；只有它接近 1 后，掌心前后才达到完整幅度。
+`forward_gate` 会从 0 平滑增加到 1；只有它接近 1 后，掌心前后、J1 和 J6
+才达到完整幅度。
 `q_target` 会从上一次目标连续爬坡，并由 `target_lead` 显示它相对实测关节角积累的
 有限位置误差。`q_sent` 是经过总力矩限制后真正发送的目标；`tau_g` 是重力前馈，
 `tau_measured` 是电机反馈力矩，`effort_cmd` 是包含位置、阻尼与重力项的指令估算，
@@ -314,12 +321,25 @@ CHANNELS='[1.0,0.0,0.0,0.0,0.0,1.0]'; run_b601_semantic_test
 # 2. 抬起后，验证掌心整体前后 -> J2/J3/J4 联合解算
 CHANNELS='[0.0,1.0,0.0,0.0,0.0,1.0]'; run_b601_semantic_test
 
-# 3. 抬起后，验证掌面旋转 -> J6
+# 3. 抬起后，屈肘并张开手掌，验证前臂旋前/旋后 -> J6
 CHANNELS='[0.0,0.0,0.0,0.0,1.0,1.0]'; run_b601_semantic_test
 
 # 4. 前三组全部通过后才做组合验证；保留通道固定为 0
 CHANNELS='[1.0,1.0,0.0,0.0,1.0,1.0]'; run_b601_semantic_test
 ```
+
+J6 不再使用食指 MCP 5 到小指 MCP 17 的二维连线角度。新算法使用 RTMPose 的
+21 点手部拓扑和 Orbbec 深度，以腕点和 MCP 5/17（有可靠深度时再加入 MCP 9）
+构造掌面法向量，并以人体
+肩—肘—腕平面的法向量作为零方向，计算它绕肘—腕轴的有符号角度。这与
+[MediaPipe Hands](https://github.com/google-ai-edge/mediapipe/blob/master/docs/solutions/hands.md)
+公开的 21 点三维手部表示一致，但继续复用现有
+[MMPose RTMPose 手部模型](https://github.com/open-mmlab/mmpose/blob/main/demo/docs/en/2d_hand_demo.md)
+和 TensorRT 引擎，不增加第二套推理运行时。单帧角度创新限制、圆周低通滤波以及
+J6 独立速度/加速度限制会抑制深度尖峰；任一必需点没有可靠深度，或手臂几乎完全
+伸直导致肩—肘—腕平面退化时，日志显示 `wrist_twist=invalid`，控制器保持上一 J6
+目标而不是猜测。测试时肘部保持约 60–120° 弯曲，张开手掌，肩、肘、腕和掌心均
+留在画面与深度量程内。`J6_delta` 是滤波后相对按 `S` 时参考姿态的角度。
 
 如果 J1 或 J6 方向与现场期望相反，只翻转 `b601_semantic_joint_gains` 中第 1 或第 5 项；
 前后方向由末端径向几何定义，不应通过翻转某个 J2/J3/J4 增益来修改。若出现持续振荡、

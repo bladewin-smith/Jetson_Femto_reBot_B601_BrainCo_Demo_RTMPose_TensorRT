@@ -6,6 +6,7 @@ from arm_control.rebot_b601 import (
     StartupGuardError,
     acceleration_limited_scalar_target,
     apply_tabletop_motion_envelope,
+    filtered_wrapped_angle_delta,
     horizontal_radial_axis,
     joint_tracking_bounds,
     joint_target_safety_violations,
@@ -224,6 +225,28 @@ def test_j4_target_limiter_bounds_velocity_acceleration_and_deadband():
     )
     assert held == pytest.approx(target)
     assert stopped == pytest.approx(0.0)
+
+
+def test_wrist_twist_filter_wraps_boundary_and_rejects_one_frame_spike():
+    boundary_delta = filtered_wrapped_angle_delta(
+        value=np.deg2rad(-179.0),
+        reference=np.deg2rad(179.0),
+        previous_delta=0.0,
+        deadband_rad=0.0,
+        max_innovation_rad=np.deg2rad(20.0),
+        filter_alpha=1.0,
+    )
+    spike_delta = filtered_wrapped_angle_delta(
+        value=np.deg2rad(155.0),
+        reference=0.0,
+        previous_delta=0.0,
+        deadband_rad=0.0,
+        max_innovation_rad=np.deg2rad(20.0),
+        filter_alpha=0.30,
+    )
+
+    assert np.rad2deg(boundary_delta) == pytest.approx(2.0)
+    assert np.rad2deg(spike_delta) == pytest.approx(6.0)
 
 
 def test_weighted_planar_dls_biases_motion_toward_more_mobile_joint():

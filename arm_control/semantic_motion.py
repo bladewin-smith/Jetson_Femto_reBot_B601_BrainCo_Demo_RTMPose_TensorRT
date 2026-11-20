@@ -96,19 +96,90 @@ def _wrist_pitch(
     return wrap_angle_radians(palm_angle - forearm_angle)
 
 
-def _palm_roll(
-    points_2d: Mapping[str, Sequence[float]], side: str
-) -> float | None:
-    """Return palm rotation in the camera image plane."""
+def _unit_vector(vector: np.ndarray, minimum_norm: float) -> np.ndarray | None:
+    norm = float(np.linalg.norm(vector))
+    if not np.isfinite(norm) or norm < float(minimum_norm):
+        return None
+    return vector / norm
 
-    index_mcp = _point(points_2d, f"{side}_5", 2)
-    pinky_mcp = _point(points_2d, f"{side}_17", 2)
-    if index_mcp is None or pinky_mcp is None:
+
+def _wrist_twist(
+    points_3d: Mapping[str, Sequence[float]], side: str
+) -> float | None:
+    """Return signed palm twist around the human elbow-to-wrist axis.
+
+    The old J6 signal was the image-plane angle of the index-to-pinky MCP
+    line.  That angle mostly follows where the whole arm points and cannot
+    distinguish forearm pronation/supination.  Here the RTMPose 21-landmark
+    hand topology is lifted by Orbbec depth: the wrist and MCP 5/17 (plus MCP 9
+    when available) define the palm plane, while the shoulder/elbow/wrist plane
+    supplies an anatomical zero direction.
+
+    Invalid or near-degenerate geometry deliberately returns ``None`` so the
+    motor controller holds its last safe J6 target instead of following depth
+    noise.  Keeping the elbow visibly bent avoids the arm-plane degeneracy.
+    """
+
+    shoulder = _point(points_3d, f"pose_{side}_shoulder", 3)
+    elbow = _point(points_3d, f"pose_{side}_elbow", 3)
+    hand_wrist = _point(points_3d, f"{side}_0", 3)
+    body_wrist = _point(points_3d, f"pose_{side}_wrist", 3)
+    wrist = hand_wrist if hand_wrist is not None else body_wrist
+    index_mcp = _point(points_3d, f"{side}_5", 3)
+    middle_mcp = _point(points_3d, f"{side}_9", 3)
+    pinky_mcp = _point(points_3d, f"{side}_17", 3)
+    if any(
+        point is None
+        for point in (shoulder, elbow, wrist, index_mcp, pinky_mcp)
+    ):
         return None
-    lateral = index_mcp - pinky_mcp
-    if float(np.linalg.norm(lateral)) < 1e-5:
+
+    forearm_axis = _unit_vector(wrist - elbow, 0.03)
+    upper_arm_axis = _unit_vector(elbow - shoulder, 0.03)
+    if forearm_axis is None or upper_arm_axis is None:
         return None
-    return float(np.arctan2(-lateral[1], lateral[0]))
+
+    # The normal of the upper-arm/forearm plane rotates with gross arm motion,
+    # providing a substantially more stable reference than a camera axis.
+    arm_plane_normal = _unit_vector(
+        np.cross(upper_arm_axis, forearm_axis),
+        0.12,
+    )
+    if arm_plane_normal is None:
+        return None
+
+    palm_knuckles = [index_mcp, pinky_mcp]
+    if middle_mcp is not None:
+        palm_knuckles.append(middle_mcp)
+    palm_center = np.mean(palm_knuckles, axis=0)
+    palm_longitudinal = _unit_vector(palm_center - wrist, 0.015)
+    palm_lateral = _unit_vector(index_mcp - pinky_mcp, 0.015)
+    if palm_longitudinal is None or palm_lateral is None:
+        return None
+    palm_normal = _unit_vector(
+        np.cross(palm_longitudinal, palm_lateral),
+        0.10,
+    )
+    if palm_normal is None:
+        return None
+
+    # A small flexion component makes the raw palm normal non-orthogonal to
+    # the forearm.  Projecting removes it, leaving only twist about that axis.
+    projected_palm_normal = palm_normal - (
+        float(np.dot(palm_normal, forearm_axis)) * forearm_axis
+    )
+    projected_palm_normal = _unit_vector(projected_palm_normal, 0.20)
+    if projected_palm_normal is None:
+        return None
+
+    sine = float(
+        np.dot(
+            forearm_axis,
+            np.cross(arm_plane_normal, projected_palm_normal),
+        )
+    )
+    cosine = float(np.dot(arm_plane_normal, projected_palm_normal))
+    return float(np.arctan2(sine, cosine))
 
 
 def build_operator_arm_motion(
@@ -130,7 +201,7 @@ def build_operator_arm_motion(
         palm_displacement_m=displacement.copy(),
         elbow_angle_rad=_elbow_angle(points_3d, points_2d, side),
         wrist_pitch_rad=_wrist_pitch(points_3d, side),
-        palm_roll_rad=_palm_roll(points_2d, side),
+        palm_roll_rad=_wrist_twist(points_3d, side),
     )
 
 

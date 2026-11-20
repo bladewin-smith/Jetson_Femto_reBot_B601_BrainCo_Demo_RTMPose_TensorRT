@@ -10,11 +10,13 @@ from arm_control.semantic_motion import (
 
 def test_build_operator_arm_motion_extracts_requested_human_channels():
     points_3d = {
-        "pose_right_shoulder": np.array([0.0, 1.0, 1.0]),
+        "pose_right_shoulder": np.array([-1.0, 0.0, 1.0]),
         "pose_right_elbow": np.array([0.0, 0.0, 1.0]),
         "pose_right_wrist": np.array([0.0, -1.0, 1.0]),
         "right_0": np.array([0.0, -1.0, 1.0]),
-        "right_9": np.array([0.0, -1.0, 2.0]),
+        "right_5": np.array([-0.1, -2.0, 1.0]),
+        "right_9": np.array([0.0, -2.0, 1.0]),
+        "right_17": np.array([0.1, -2.0, 1.0]),
     }
     points_2d = {
         "right_5": np.array([200.0, 100.0]),
@@ -30,8 +32,72 @@ def test_build_operator_arm_motion_extracts_requested_human_channels():
 
     assert motion is not None
     np.testing.assert_allclose(motion.palm_displacement_m, [0.03, -0.02, -0.04])
-    assert motion.elbow_angle_rad == pytest.approx(np.pi)
-    assert motion.wrist_pitch_rad == pytest.approx(np.pi / 2.0)
+    assert motion.elbow_angle_rad == pytest.approx(np.pi / 2.0)
+    assert motion.wrist_pitch_rad == pytest.approx(0.0)
+    assert motion.palm_roll_rad == pytest.approx(0.0)
+
+
+def test_wrist_twist_tracks_palm_normal_around_forearm_axis():
+    angle = np.deg2rad(30.0)
+    points_3d = {
+        "pose_right_shoulder": np.array([0.0, 0.0, 0.0]),
+        "pose_right_elbow": np.array([1.0, 0.0, 0.0]),
+        "pose_right_wrist": np.array([1.0, 1.0, 0.0]),
+        "right_0": np.array([1.0, 1.0, 0.0]),
+        "right_5": np.array([1.0 - 0.1 * np.cos(angle), 2.0, 0.1 * np.sin(angle)]),
+        "right_9": np.array([1.0, 2.0, 0.0]),
+        "right_17": np.array([1.0 + 0.1 * np.cos(angle), 2.0, -0.1 * np.sin(angle)]),
+    }
+
+    motion = build_operator_arm_motion(
+        points_3d,
+        {},
+        "right",
+        [0.0, 0.0, 0.0],
+    )
+
+    assert motion is not None
+    assert motion.palm_roll_rad == pytest.approx(angle)
+
+
+def test_wrist_twist_fails_closed_for_straight_arm_or_missing_depth():
+    straight_arm = {
+        "pose_right_shoulder": np.array([0.0, 0.0, 0.0]),
+        "pose_right_elbow": np.array([0.0, 1.0, 0.0]),
+        "right_0": np.array([0.0, 2.0, 0.0]),
+        "right_5": np.array([-0.1, 3.0, 0.0]),
+        "right_9": np.array([0.0, 3.0, 0.0]),
+        "right_17": np.array([0.1, 3.0, 0.0]),
+    }
+
+    straight = build_operator_arm_motion(
+        straight_arm, {}, "right", [0.0, 0.0, 0.0]
+    )
+    missing_depth = build_operator_arm_motion(
+        {},
+        {"right_5": [200.0, 100.0], "right_17": [100.0, 100.0]},
+        "right",
+        [0.0, 0.0, 0.0],
+    )
+
+    assert straight is not None and straight.palm_roll_rad is None
+    assert missing_depth is not None and missing_depth.palm_roll_rad is None
+
+
+def test_wrist_twist_uses_body_wrist_and_two_knuckle_depth_fallback():
+    points_3d = {
+        "pose_right_shoulder": np.array([0.0, 0.0, 0.0]),
+        "pose_right_elbow": np.array([1.0, 0.0, 0.0]),
+        "pose_right_wrist": np.array([1.0, 1.0, 0.0]),
+        "right_5": np.array([0.9, 2.0, 0.0]),
+        "right_17": np.array([1.1, 2.0, 0.0]),
+    }
+
+    motion = build_operator_arm_motion(
+        points_3d, {}, "right", [0.0, 0.0, 0.0]
+    )
+
+    assert motion is not None
     assert motion.palm_roll_rad == pytest.approx(0.0)
 
 
