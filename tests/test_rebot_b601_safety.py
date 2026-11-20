@@ -15,6 +15,7 @@ from arm_control.rebot_b601 import (
     send_mit_checked,
     synchronize_vertical_follower_progress,
     validate_tabletop_startup,
+    weighted_damped_least_squares,
 )
 
 
@@ -165,6 +166,22 @@ def test_coordinated_joint_step_scaling_preserves_direction():
 
     assert np.max(np.abs(scaled)) == pytest.approx(0.012)
     np.testing.assert_allclose(scaled / raw, np.full(3, 0.012 / 0.044))
+
+
+def test_weighted_planar_dls_biases_motion_toward_more_mobile_joint():
+    delta = weighted_damped_least_squares(
+        [[1.0, 1.0, 0.0], [0.0, 1.0, 1.0]],
+        [1.0, 1.0],
+        damping=1e-6,
+        joint_mobility=[1.0, 2.0, 1.0],
+    )
+
+    np.testing.assert_allclose(delta, [0.2, 0.8, 0.2], atol=1e-8)
+    np.testing.assert_allclose(
+        np.asarray([[1.0, 1.0, 0.0], [0.0, 1.0, 1.0]]) @ delta,
+        [1.0, 1.0],
+        atol=1e-8,
+    )
 
 
 def test_pinocchio_frame_ids_are_converted_to_native_integers():

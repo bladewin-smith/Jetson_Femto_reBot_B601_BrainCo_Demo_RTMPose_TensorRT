@@ -17,6 +17,12 @@ hand_palm_b601_control_node:
     b601_semantic_min_lift_before_articulation_m: 0.018
     b601_semantic_min_chain_clearance_m: 0.001
     b601_semantic_vertical_height_profile: [0.50, 0.82, 1.0]
+    # Palm depth/height form one 2-D Cartesian task solved over J2/J3/J4.
+    # Input scale is [forward, height]; mobility is [J2, J3, J4].
+    b601_semantic_planar_input_scale: [0.35, 1.0]
+    b601_semantic_planar_max_forward_m: 0.035
+    b601_semantic_planar_joint_mobility: [0.80, 1.00, 0.70]
+    b601_semantic_planar_task_weights: [1.00, 0.65, 0.85, 1.00]
     b601_semantic_vertical_solver_step_rad: 0.015
     b601_semantic_vertical_solver_iterations: 12
     b601_semantic_vertical_orientation_weight_m_per_rad: 0.02

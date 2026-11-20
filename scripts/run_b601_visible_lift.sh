@@ -37,7 +37,8 @@ if [[ -f /opt/ros/humble/setup.bash ]]; then
 fi
 export PYTHONPATH="$HOME/ws/pyorbbecsdk-2-main:$HOME/ws/brainco-hand-sdk-main/python:$REPO:$REPO/scripts:$REPO/third_party/reBotArm_control_py:${PYTHONPATH:-}"
 
-echo "Visible B601 lift profile: 25 mm target, J3 kp=180, J3 effort limit=16 Nm"
+echo "Visible B601 planar profile: J2/J3/J4 joint forward/height solve, 25 mm lift"
+echo "Forward mapping: 0.35x palm depth, bounded to +/-35 mm after tabletop clearance"
 echo "Channels: $CHANNELS"
 echo "Detector engine: $DET_ENGINE"
 echo "Body-pose engine: $BODY_ENGINE"

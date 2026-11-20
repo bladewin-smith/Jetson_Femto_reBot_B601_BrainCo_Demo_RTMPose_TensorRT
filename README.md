@@ -162,25 +162,26 @@ python scripts/camera_arm_b601_control_pose_hands.py --ros-args \
 | 人体信号 | B601 动作 | 实现 |
 |---|---|---|
 | 掌心左右位移 | J1 底座旋转 | 相机 X 位移直接映射到 J1 |
-| 掌心整体前后位移 | J2 | 相机深度 Z 位移映射到 J2 |
-| 肘关节屈伸 | J3 | 肩-肘-腕夹角相对启动参考值映射到 J3 |
-| 腕关节小幅前后俯仰 | J4 | 前臂和掌轴在相机垂直/深度平面的夹角映射到 J4 |
+| 掌心整体前后位移 | J2 + J3 + J4 | 沿当前底座到 TCP 的水平径向做加权阻尼雅可比解算 |
+| 掌心上下位移 | J2 + J3 + J4 | 与前后位移组成同一个二维任务，同时保持中间连杆净空 |
+| 肘关节屈伸、腕关节俯仰 | 不直接控制关节 | 仍可用于视觉诊断，但不再分别映射到 J3/J4 |
 | 掌面旋转 | J6 | 食指/小指掌指关节连线在图像平面的滚转角映射到 J6 |
-| 掌心上下位移 | J2 + J3 + J4 | 阻尼雅可比最小二乘，同时抑制末端姿态变化 |
 
-J5 在该模式下保持本次跟踪开始时的参考角。垂直通道只允许从经过验证的桌面姿态
+J5 在该模式下保持本次跟踪开始时的参考角。二维解算器把掌心深度和高度作为一个
+连续目标，通过 `b601_semantic_planar_joint_mobility` 调整 J2/J3/J4 的相对参与度，
+不再依赖“肘是否前移”或“腕是否前倾”的判断边界。垂直通道只允许从经过验证的桌面姿态
 向上运动；手掌下移表示回落到桌面参考高度，不能命令末端进入桌面以下。控制器还会
 比较 URDF 中所有 frame 与启动桌面姿态的高度，并拒绝降低到容差以下的目标。任一
 相机轴上的掌心位移超过 `b601_semantic_max_observation_displacement_m`（默认 0.35m）
 时视为跟踪离群值，控制器会保持实测关节姿态并重置视觉滤波器。
 
 六个 `b601_semantic_channel_enable` 值依次表示：
-`[J1左右, J2深度, J3肘, J4腕, J6滚转, J2/J3/J4上下]`。为了避免贴桌拖动，
-TCP 实际抬升达到 `b601_semantic_min_lift_before_articulation_m`，并且肘部、腕部和
-TCP 三个模型 frame 的最小净空达到 `b601_semantic_min_chain_clearance_m` 之前，前五个
-通道保持锁定。上下控制分别给这三个 frame 分配 50%、82%、100% 的目标抬升量，
-避免只抬末端而让中间连杆继续贴桌。每次控制手左右切换也会重新采集人体角度和当前
-关节参考，避免瞬时跳变。
+`[J1左右, J2/J3/J4前后, 保留, 保留, J6滚转, J2/J3/J4上下]`。第 3、4 项仅为兼容
+旧命令保留，设成 0 或 1 都不会再把肘/腕角送给电机。为了避免贴桌拖动，前后、J1、
+J6 会根据 TCP 实际抬升和连杆实际净空从 0 到 1 连续淡入，不再在阈值处突然开关；
+上下通道始终可用于离桌。高度任务分别给 link3、link4、TCP 分配 50%、82%、100%
+的目标抬升量，避免只抬末端而让中间连杆继续贴桌。每次控制手左右切换也会重新采集
+当前人体掌心和关节参考，避免瞬时跳变。
 
 ### 安全的明显运动分通道验证
 
@@ -262,6 +263,10 @@ run_b601_semantic_test() {
     -p b601_semantic_min_lift_before_articulation_m:=0.018 \
     -p b601_semantic_min_chain_clearance_m:=0.001 \
     -p b601_semantic_vertical_height_profile:='[0.50,0.82,1.0]' \
+    -p b601_semantic_planar_input_scale:='[0.35,1.0]' \
+    -p b601_semantic_planar_max_forward_m:=0.035 \
+    -p b601_semantic_planar_joint_mobility:='[0.80,1.00,0.70]' \
+    -p b601_semantic_planar_task_weights:='[1.00,0.65,0.85,1.00]' \
     -p b601_semantic_vertical_solver_step_rad:=0.015 \
     -p b601_semantic_vertical_solver_iterations:=12 \
     -p b601_semantic_vertical_orientation_weight_m_per_rad:=0.02 \
@@ -277,7 +282,8 @@ run_b601_semantic_test() {
 每次只执行下面一组。启动后保持人体静止，按 `S` 采集参考；先把掌心缓慢抬高。
 日志中的 `tcp_lift` 应比按 `S` 时增加至少约 `0.015m`，最终目标约 `0.025m`；
 `chain_clearance` 应达到约 `0.001m`，并出现 `articulation=ready`；
-`actual_vertical_error` 应逐步降到约 `0.005m` 以下。
+`actual_error` 中的 `height` 应逐步降到约 `0.005m` 以下。机械臂抬升过程中
+`forward_gate` 会从 0 平滑增加到 1；只有它接近 1 后，掌心前后才达到完整幅度。
 `q_target` 会从上一次目标连续爬坡，并由 `target_lead` 显示它相对实测关节角积累的
 有限位置误差。`q_sent` 是经过总力矩限制后真正发送的目标；`tau_g` 是重力前馈，
 `tau_measured` 是电机反馈力矩，`effort_cmd` 是包含位置、阻尼与重力项的指令估算，
@@ -296,24 +302,18 @@ CHANNELS='[0.0,0.0,0.0,0.0,0.0,1.0]'; run_b601_semantic_test
 # 1. 抬起后，验证掌心左右 -> J1
 CHANNELS='[1.0,0.0,0.0,0.0,0.0,1.0]'; run_b601_semantic_test
 
-# 2. 抬起后，验证掌心整体前后 -> J2
+# 2. 抬起后，验证掌心整体前后 -> J2/J3/J4 联合解算
 CHANNELS='[0.0,1.0,0.0,0.0,0.0,1.0]'; run_b601_semantic_test
 
-# 3. 抬起后，验证肘屈伸 -> J3
-CHANNELS='[0.0,0.0,1.0,0.0,0.0,1.0]'; run_b601_semantic_test
-
-# 4. 抬起后，验证腕部小幅俯仰 -> J4
-CHANNELS='[0.0,0.0,0.0,1.0,0.0,1.0]'; run_b601_semantic_test
-
-# 5. 抬起后，验证掌面旋转 -> J6
+# 3. 抬起后，验证掌面旋转 -> J6
 CHANNELS='[0.0,0.0,0.0,0.0,1.0,1.0]'; run_b601_semantic_test
 
-# 6. 前六组全部通过后才做组合验证
-CHANNELS='[1.0,1.0,1.0,1.0,1.0,1.0]'; run_b601_semantic_test
+# 4. 前三组全部通过后才做组合验证；保留通道固定为 0
+CHANNELS='[1.0,1.0,0.0,0.0,1.0,1.0]'; run_b601_semantic_test
 ```
 
-如果单个通道方向与现场期望相反，只翻转
-`b601_semantic_joint_gains` 中对应项的正负号，不要同时改多个通道。若出现持续振荡、
+如果 J1 或 J6 方向与现场期望相反，只翻转 `b601_semantic_joint_gains` 中第 1 或第 5 项；
+前后方向由末端径向几何定义，不应通过翻转某个 J2/J3/J4 增益来修改。若出现持续振荡、
 frame 低于桌面的拒绝日志、反馈异常或实际连杆接近桌面，立即停止手势并按 `H`；若
 正常按键失效，则托住机械臂并使用硬件急停。
 

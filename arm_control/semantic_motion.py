@@ -134,17 +134,20 @@ def build_operator_arm_motion(
     )
 
 
-def semantic_joint_offsets(
+def semantic_direct_joint_offsets(
     lateral_m: float,
-    forward_m: float,
-    elbow_delta_rad: float,
-    wrist_delta_rad: float,
     roll_delta_rad: float,
     gains: Sequence[float],
     channel_enable: Sequence[float],
     max_joint_offset_rad: Sequence[float],
 ) -> np.ndarray:
-    """Map human semantic signals to bounded J1/J2/J3/J4/J6 offsets."""
+    """Map the two direct human signals to bounded J1/J6 offsets.
+
+    Palm depth and height are intentionally absent here.  They are solved as
+    one Cartesian planar task over J2/J3/J4 by :class:`B601PalmFollower`.
+    Human elbow and wrist angles are vision diagnostics only and no longer
+    command individual B601 joints.
+    """
 
     gains_array = np.asarray(gains, dtype=np.float64).reshape(-1)
     channels = np.asarray(channel_enable, dtype=np.float64).reshape(-1)
@@ -158,8 +161,5 @@ def semantic_joint_offsets(
 
     offsets = np.zeros(6, dtype=np.float64)
     offsets[0] = channels[0] * gains_array[0] * float(lateral_m)
-    offsets[1] = channels[1] * gains_array[1] * float(forward_m)
-    offsets[2] = channels[2] * gains_array[2] * float(elbow_delta_rad)
-    offsets[3] = channels[3] * gains_array[3] * float(wrist_delta_rad)
     offsets[5] = channels[4] * gains_array[4] * float(roll_delta_rad)
     return np.clip(offsets, -maximum, maximum)

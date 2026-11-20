@@ -29,7 +29,7 @@ import numpy as np
 
 from .semantic_motion import (
     OperatorArmMotion,
-    semantic_joint_offsets,
+    semantic_direct_joint_offsets,
     wrap_angle_radians,
 )
 
@@ -52,6 +52,40 @@ def _positive_vector(values: Sequence[float], size: int, name: str) -> np.ndarra
     if np.any(result <= 0.0):
         raise ValueError(f"{name} values must all be greater than zero")
     return result
+
+
+def weighted_damped_least_squares(
+    jacobian: Sequence[Sequence[float]],
+    error: Sequence[float],
+    damping: float,
+    joint_mobility: Sequence[float],
+) -> np.ndarray:
+    """Solve a task while weighting how much each controlled joint may move.
+
+    ``joint_mobility`` is the diagonal of the joint-space mobility matrix.
+    A larger value lets that joint contribute more to a redundant task; it is
+    not a raw motor command or torque gain.
+    """
+
+    task = np.asarray(jacobian, dtype=np.float64)
+    desired = np.asarray(error, dtype=np.float64).reshape(-1)
+    mobility = np.asarray(joint_mobility, dtype=np.float64).reshape(-1)
+    if task.ndim != 2 or task.shape[0] != desired.size:
+        raise ValueError("Jacobian rows must match the task error size")
+    if task.shape[1] != mobility.size:
+        raise ValueError("Jacobian columns must match the joint mobility size")
+    if not all(np.all(np.isfinite(value)) for value in (task, desired, mobility)):
+        raise ValueError("Weighted DLS inputs must be finite")
+    if np.any(mobility <= 0.0):
+        raise ValueError("Joint mobility values must be positive")
+    if not np.isfinite(damping) or damping <= 0.0:
+        raise ValueError("Weighted DLS damping must be positive and finite")
+
+    mobility_matrix = np.diag(mobility)
+    regularized = task @ mobility_matrix @ task.T + float(damping) ** 2 * np.eye(
+        task.shape[0]
+    )
+    return mobility_matrix @ task.T @ np.linalg.solve(regularized, desired)
 
 
 def send_mit_checked(
@@ -705,11 +739,12 @@ class B601PalmFollower:
             raise ValueError(
                 "b601_control_mode must be 'cartesian' or 'semantic_joint'"
             )
-        # Channels: J1 palm lateral, J2 palm depth, J3 elbow, J4 wrist,
-        # J6 palm roll, and coordinated J2/J3/J4 vertical translation.
+        # Channels: J1 palm lateral, J2/J3/J4 planar forward, two retired
+        # compatibility slots, J6 palm roll, and J2/J3/J4 vertical motion.
+        # Elbow and wrist observations no longer command individual joints.
         self.semantic_channel_enable = _vector(
             node.declare_parameter(
-                "b601_semantic_channel_enable", [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+                "b601_semantic_channel_enable", [1.0, 1.0, 0.0, 0.0, 1.0, 1.0]
             ).value,
             6,
             "b601_semantic_channel_enable",
@@ -882,6 +917,11 @@ class B601PalmFollower:
             node.declare_parameter("b601_semantic_vertical_primary_joint", 3).value
         ) - 1
         vertical_indices = np.flatnonzero(self.semantic_vertical_joint_mask > 0.5)
+        if not np.array_equal(vertical_indices, np.asarray([1, 2, 3])):
+            raise ValueError(
+                "b601_semantic_vertical_joint_mask must select exactly J2/J3/J4 "
+                "for planar palm control"
+            )
         if self.semantic_vertical_primary_joint not in vertical_indices:
             raise ValueError(
                 "b601_semantic_vertical_primary_joint must select an enabled vertical joint"
@@ -931,6 +971,41 @@ class B601PalmFollower:
                 "b601_semantic_vertical_height_profile must be non-decreasing, "
                 "at most 1.0, and end at 1.0"
             )
+        self.semantic_planar_input_scale = _positive_vector(
+            node.declare_parameter(
+                "b601_semantic_planar_input_scale", [0.35, 1.0]
+            ).value,
+            2,
+            "b601_semantic_planar_input_scale",
+        )
+        self.semantic_planar_max_forward_m = float(
+            node.declare_parameter(
+                "b601_semantic_planar_max_forward_m", 0.035
+            ).value
+        )
+        if (
+            not np.isfinite(self.semantic_planar_max_forward_m)
+            or self.semantic_planar_max_forward_m <= 0.0
+        ):
+            raise ValueError(
+                "b601_semantic_planar_max_forward_m must be positive and finite"
+            )
+        self.semantic_planar_joint_mobility = _positive_vector(
+            node.declare_parameter(
+                "b601_semantic_planar_joint_mobility", [0.80, 1.0, 0.70]
+            ).value,
+            3,
+            "b601_semantic_planar_joint_mobility",
+        )
+        # [TCP forward, link3 height, link4 height, TCP height].  These are
+        # task weights, not motor gains or torque multipliers.
+        self.semantic_planar_task_weights = _positive_vector(
+            node.declare_parameter(
+                "b601_semantic_planar_task_weights", [1.0, 0.65, 0.85, 1.0]
+            ).value,
+            4,
+            "b601_semantic_planar_task_weights",
+        )
         self.semantic_vertical_solver_step_rad = float(
             node.declare_parameter(
                 "b601_semantic_vertical_solver_step_rad", 0.012
@@ -1005,12 +1080,12 @@ class B601PalmFollower:
         self.semantic_control_side = None
         self.semantic_signal_references = {}
         self.semantic_signal_deltas = {
-            "elbow": 0.0,
-            "wrist": 0.0,
             "roll": 0.0,
         }
         self.last_semantic_log_time = 0.0
         self.last_semantic_vertical_error_m = 0.0
+        self.last_semantic_planar_error_m = np.zeros(2, dtype=np.float64)
+        self.last_semantic_forward_gate = 0.0
         self.last_semantic_vertical_primary_progress = 0.0
         self.last_semantic_vertical_follower_limit = 0.0
         self.last_commanded_pose = None
@@ -1409,8 +1484,10 @@ class B601PalmFollower:
         self.semantic_reference_frame_heights = self._frame_heights(q)
         self.semantic_control_side = None
         self.semantic_signal_references.clear()
-        self.semantic_signal_deltas.update(elbow=0.0, wrist=0.0, roll=0.0)
+        self.semantic_signal_deltas.update(roll=0.0)
         self.last_semantic_vertical_error_m = 0.0
+        self.last_semantic_planar_error_m.fill(0.0)
+        self.last_semantic_forward_gate = 0.0
         self.last_target_pose = list(self.initial_pose)
         self.last_commanded_pose = list(self.initial_pose)
         self.last_arm_offset = np.zeros(3, dtype=np.float64)
@@ -1439,7 +1516,9 @@ class B601PalmFollower:
         self.semantic_control_side = None
         self.semantic_reference_frame_heights = None
         self.semantic_signal_references.clear()
-        self.semantic_signal_deltas.update(elbow=0.0, wrist=0.0, roll=0.0)
+        self.semantic_signal_deltas.update(roll=0.0)
+        self.last_semantic_planar_error_m.fill(0.0)
+        self.last_semantic_forward_gate = 0.0
         self.semantic_stall_started_s.fill(np.nan)
         self.semantic_stall_reference_q.fill(np.nan)
         self.semantic_stall_direction.fill(0.0)
@@ -1478,11 +1557,9 @@ class B601PalmFollower:
         self.semantic_control_reference_q = q_reference.copy()
         self.semantic_reference_frame_heights = self._frame_heights(q_reference)
         self.semantic_signal_references = {
-            "elbow": observation.elbow_angle_rad,
-            "wrist": observation.wrist_pitch_rad,
             "roll": observation.palm_roll_rad,
         }
-        self.semantic_signal_deltas.update(elbow=0.0, wrist=0.0, roll=0.0)
+        self.semantic_signal_deltas.update(roll=0.0)
         self._reset_filters()
         self.logger.info(
             "B601 semantic observation reference captured: "
@@ -1503,7 +1580,7 @@ class B601PalmFollower:
             self.semantic_signal_deltas[name] = 0.0
             return 0.0
         raw_delta = float(value) - float(reference)
-        if name in ("wrist", "roll"):
+        if name == "roll":
             raw_delta = wrap_angle_radians(raw_delta)
         delta = self._scalar_deadband(raw_delta, deadband_rad)
         self.semantic_signal_deltas[name] = delta
@@ -1564,53 +1641,86 @@ class B601PalmFollower:
         forward = self._scalar_deadband(
             -camera_offset[2], self.semantic_linear_deadband_m[1]
         )
+        forward *= self.semantic_planar_input_scale[0]
+        forward = float(
+            np.clip(
+                forward,
+                -self.semantic_planar_max_forward_m,
+                self.semantic_planar_max_forward_m,
+            )
+        )
         # The table pose is the lower boundary.  A hand moving down commands a
         # return toward zero lift, never motion below the validated table pose.
         lift = self._scalar_deadband(
             -camera_offset[1], self.semantic_linear_deadband_m[2]
         )
+        lift *= self.semantic_planar_input_scale[1]
         lift = float(np.clip(lift, 0.0, self.semantic_vertical_max_lift_m))
 
-        elbow_delta = self._semantic_angle_delta(
-            "elbow",
-            observation.elbow_angle_rad,
-            self.semantic_angle_deadband_rad[0],
-        )
-        wrist_delta = self._semantic_angle_delta(
-            "wrist",
-            observation.wrist_pitch_rad,
-            self.semantic_angle_deadband_rad[1],
-        )
         roll_delta = self._semantic_angle_delta(
             "roll",
             observation.palm_roll_rad,
             self.semantic_angle_deadband_rad[2],
         )
 
-        direct_offsets = semantic_joint_offsets(
+        direct_offsets = semantic_direct_joint_offsets(
             lateral,
-            forward,
-            elbow_delta,
-            wrist_delta,
             roll_delta,
             self.semantic_joint_gains,
             self.semantic_channel_enable,
             self.semantic_max_joint_offset,
         )
         tcp_lift, chain_clearance = self._semantic_clearance_from_table(q_seed)
-        articulation_ready = (
-            tcp_lift >= self.semantic_min_lift_before_articulation_m
-            and chain_clearance >= self.semantic_min_chain_clearance_m
-            and lift >= self.semantic_min_lift_before_articulation_m
+        tcp_fraction = (
+            1.0
+            if self.semantic_min_lift_before_articulation_m <= 0.0
+            else float(
+                np.clip(
+                    tcp_lift / self.semantic_min_lift_before_articulation_m,
+                    0.0,
+                    1.0,
+                )
+            )
         )
-        if not articulation_ready:
-            direct_offsets[:] = 0.0
+        chain_fraction = (
+            1.0
+            if self.semantic_min_chain_clearance_m <= 0.0
+            else float(
+                np.clip(
+                    chain_clearance / self.semantic_min_chain_clearance_m,
+                    0.0,
+                    1.0,
+                )
+            )
+        )
+        clearance_fraction = min(tcp_fraction, chain_fraction)
+        # Smoothstep avoids a visible target discontinuity at the old hard
+        # articulation threshold.  Forward/J1/J6 motion fades in only as the
+        # measured arm actually clears the tabletop; lift remains available.
+        forward_gate = clearance_fraction**2 * (3.0 - 2.0 * clearance_fraction)
+        self.last_semantic_forward_gate = forward_gate
+        articulation_ready = (
+            clearance_fraction >= 1.0 - 1e-6
+        )
+        direct_offsets *= forward_gate
         q_reference = self.semantic_control_reference_q
-        q_desired = q_reference + direct_offsets
-        if self.semantic_channel_enable[5] > 0.5:
-            q_desired = self._apply_semantic_vertical(q_desired, lift)
+        q_base = q_reference + direct_offsets
+        forward_target = (
+            forward * forward_gate
+            if self.semantic_channel_enable[1] > 0.5
+            else 0.0
+        )
+        lift_target = lift if self.semantic_channel_enable[5] > 0.5 else 0.0
+        if abs(forward_target) > 0.0 or lift_target > 0.0:
+            q_desired = self._apply_semantic_planar(
+                q_base,
+                forward_target,
+                lift_target,
+            )
         else:
+            q_desired = q_base
             self.last_semantic_vertical_error_m = 0.0
+            self.last_semantic_planar_error_m.fill(0.0)
 
         lower, upper = joint_tracking_bounds(
             self._joint_lower,
@@ -1637,7 +1747,7 @@ class B601PalmFollower:
             self.semantic_max_step,
             self.semantic_max_tracking_error,
         )
-        if not articulation_ready and lift > 0.0:
+        if not articulation_ready and lift_target > 0.0:
             (
                 q_target,
                 self.last_semantic_vertical_primary_progress,
@@ -1671,23 +1781,26 @@ class B601PalmFollower:
         self.last_arm_offset = np.array([lateral, forward, lift], dtype=np.float64)
         self.first_tracking_motion_ok = True
         if now - self.last_semantic_log_time >= 1.0:
-            actual_vertical_error = self._semantic_vertical_error_at_q(
+            actual_planar_error = self._semantic_planar_error_at_q(
                 q_seed,
-                lift,
+                q_base,
+                forward_target,
+                lift_target,
             )
             self.logger.info(
                 "B601 semantic: "
                 f"side={observation.side}, lateral={lateral:+.4f}m, "
-                f"forward={forward:+.4f}m, lift={lift:+.4f}m, "
+                f"forward={forward:+.4f}m, planar_forward={forward_target:+.4f}m, "
+                f"lift={lift_target:+.4f}m, forward_gate={forward_gate:.2f}, "
                 f"tcp_lift={tcp_lift:+.4f}m, "
                 f"chain_clearance={chain_clearance:+.4f}m, "
-                f"solver_error={self.last_semantic_vertical_error_m:+.4f}m, "
-                f"actual_vertical_error={actual_vertical_error:+.4f}m, "
+                f"solver_error=[forward={self.last_semantic_planar_error_m[0]:+.4f}, "
+                f"height={self.last_semantic_planar_error_m[1]:+.4f}]m, "
+                f"actual_error=[forward={actual_planar_error[0]:+.4f}, "
+                f"height={actual_planar_error[1]:+.4f}]m, "
                 f"J3_progress={self.last_semantic_vertical_primary_progress:.2f}, "
                 f"follower_limit={self.last_semantic_vertical_follower_limit:.2f}, "
                 f"articulation={'ready' if articulation_ready else 'locked'}, "
-                f"elbow={np.rad2deg(elbow_delta):+.1f}deg, "
-                f"wrist={np.rad2deg(wrist_delta):+.1f}deg, "
                 f"roll={np.rad2deg(roll_delta):+.1f}deg, "
                 f"q_measured={q_seed.round(4).tolist()}, "
                 f"q_desired={q_desired.round(4).tolist()}, "
@@ -1703,21 +1816,39 @@ class B601PalmFollower:
             self.last_semantic_log_time = now
         return self.last_arm_offset
 
-    def _apply_semantic_vertical(
+    def _apply_semantic_planar(
         self,
         q_base: np.ndarray,
+        forward_m: float,
         lift_m: float,
     ) -> np.ndarray:
-        """Lift elbow, wrist and TCP together with a bounded DLS solve."""
+        """Solve palm forward/height together over J2/J3/J4.
+
+        The forward axis is the current horizontal base-to-TCP radial axis.
+        This makes the task independent of J1's yaw.  Three link-height tasks
+        retain the tabletop-safe lift profile while a weighted joint-space
+        metric determines how J2/J3/J4 share the requested motion.
+        """
 
         q = np.asarray(q_base, dtype=np.float64).copy()
         columns = np.flatnonzero(self.semantic_vertical_joint_mask > 0.5)
         if columns.size == 0:
             return q
         q_reference = self.semantic_control_reference_q
-        reference_heights = self.semantic_reference_frame_heights
-        if reference_heights is None:
-            reference_heights = self._frame_heights(q_reference)
+        base_positions = self._frame_positions(q_base)
+        base_tcp = base_positions[self._end_frame_id]
+        forward_axis = np.asarray(base_tcp[:2], dtype=np.float64)
+        forward_axis_norm = float(np.linalg.norm(forward_axis))
+        if forward_axis_norm < 1e-6:
+            self.logger.warn(
+                "B601 TCP is too close to the base axis for planar control; holding"
+            )
+            return q
+        forward_axis /= forward_axis_norm
+        target_forward = float(np.dot(base_tcp[:2], forward_axis)) + float(
+            forward_m
+        )
+        reference_heights = base_positions[:, 2]
         target_heights = (
             reference_heights[self._articulation_clearance_frame_ids]
             + self.semantic_vertical_height_profile * float(lift_m)
@@ -1738,6 +1869,7 @@ class B601PalmFollower:
         )
         q = np.clip(q, lower, upper)
 
+        forward_error = 0.0
         height_error = np.zeros(3, dtype=np.float64)
         for _ in range(self.semantic_vertical_solver_iterations):
             q_model = self._pad_q_for_model(self._model, q, self.ARM_DOF)
@@ -1752,8 +1884,15 @@ class B601PalmFollower:
                 ],
                 dtype=np.float64,
             )
+            current_tcp = np.asarray(
+                self._kinematics_data.oMf[self._end_frame_id].translation,
+                dtype=np.float64,
+            )
+            forward_error = target_forward - float(
+                np.dot(current_tcp[:2], forward_axis)
+            )
             height_error = target_heights - current_heights
-            if float(np.max(np.abs(height_error))) < 2e-4:
+            if max(abs(forward_error), float(np.max(np.abs(height_error)))) < 2e-4:
                 break
             height_rows = []
             end_jacobian = None
@@ -1769,23 +1908,39 @@ class B601PalmFollower:
                 if int(frame_id) == self._end_frame_id:
                     end_jacobian = jacobian[:, columns]
             if end_jacobian is None:
-                raise RuntimeError("B601 semantic vertical task is missing the TCP frame")
+                raise RuntimeError("B601 semantic planar task is missing the TCP frame")
+            forward_row = (
+                forward_axis[0] * end_jacobian[0, :]
+                + forward_axis[1] * end_jacobian[1, :]
+            )
+            position_task = np.vstack(
+                (forward_row, np.asarray(height_rows, dtype=np.float64))
+            )
+            weighted_position_task = (
+                self.semantic_planar_task_weights[:, None] * position_task
+            )
             task = np.vstack(
                 (
-                    np.asarray(height_rows, dtype=np.float64),
+                    weighted_position_task,
                     self.semantic_vertical_orientation_weight * end_jacobian[3:6, :],
                 )
             )
             desired = np.concatenate(
-                (height_error, np.zeros(3, dtype=np.float64))
+                (
+                    self.semantic_planar_task_weights
+                    * np.concatenate(([forward_error], height_error)),
+                    np.zeros(3, dtype=np.float64),
+                )
             )
-            regularized = task @ task.T + (
-                self.semantic_vertical_damping**2
-            ) * np.eye(task.shape[0])
             try:
-                delta = task.T @ np.linalg.solve(regularized, desired)
+                delta = weighted_damped_least_squares(
+                    task,
+                    desired,
+                    self.semantic_vertical_damping,
+                    self.semantic_planar_joint_mobility,
+                )
             except np.linalg.LinAlgError:
-                self.logger.warn("B601 semantic vertical Jacobian is singular; holding")
+                self.logger.warn("B601 semantic planar Jacobian is singular; holding")
                 return q_base.copy()
             # Element-wise clipping destroys the coordinated J2/J3/J4 ratio
             # and, in the near-straight table pose, can reverse TCP Z motion.
@@ -1800,22 +1955,34 @@ class B601PalmFollower:
                 break
             q = proposed
 
-        final_heights = self._frame_heights(q)[
-            self._articulation_clearance_frame_ids
-        ]
-        self.last_semantic_vertical_error_m = float(
-            np.max(np.abs(target_heights - final_heights))
+        final_positions = self._frame_positions(q)
+        final_forward = float(
+            np.dot(final_positions[self._end_frame_id, :2], forward_axis)
         )
+        final_height_error = target_heights - final_positions[
+            self._articulation_clearance_frame_ids, 2
+        ]
+        self.last_semantic_planar_error_m = np.asarray(
+            [
+                target_forward - final_forward,
+                float(np.max(np.abs(final_height_error))),
+            ],
+            dtype=np.float64,
+        )
+        self.last_semantic_vertical_error_m = self.last_semantic_planar_error_m[1]
         return q
 
-    def _frame_heights(self, q: np.ndarray) -> np.ndarray:
+    def _frame_positions(self, q: np.ndarray) -> np.ndarray:
         q_model = self._pad_q_for_model(self._model, q, self.ARM_DOF)
         self._pin.forwardKinematics(self._model, self._kinematics_data, q_model)
         self._pin.updateFramePlacements(self._model, self._kinematics_data)
         return np.asarray(
-            [float(placement.translation[2]) for placement in self._kinematics_data.oMf],
+            [placement.translation for placement in self._kinematics_data.oMf],
             dtype=np.float64,
         )
+
+    def _frame_heights(self, q: np.ndarray) -> np.ndarray:
+        return self._frame_positions(q)[:, 2]
 
     def _semantic_table_clearance_ok(
         self,
@@ -1865,23 +2032,41 @@ class B601PalmFollower:
         )
         return tcp_lift, chain_clearance
 
-    def _semantic_vertical_error_at_q(
+    def _semantic_planar_error_at_q(
         self,
         q: np.ndarray,
+        q_base: np.ndarray,
+        forward_m: float,
         lift_m: float,
-    ) -> float:
-        if self.semantic_reference_frame_heights is None:
-            return 0.0
+    ) -> np.ndarray:
+        base_positions = self._frame_positions(q_base)
+        actual_positions = self._frame_positions(q)
+        base_tcp = base_positions[self._end_frame_id]
+        forward_axis = np.asarray(base_tcp[:2], dtype=np.float64)
+        norm = float(np.linalg.norm(forward_axis))
+        if norm < 1e-6:
+            return np.zeros(2, dtype=np.float64)
+        forward_axis /= norm
+        target_forward = float(np.dot(base_tcp[:2], forward_axis)) + float(
+            forward_m
+        )
+        actual_forward = float(
+            np.dot(actual_positions[self._end_frame_id, :2], forward_axis)
+        )
         target_heights = (
-            self.semantic_reference_frame_heights[
-                self._articulation_clearance_frame_ids
-            ]
+            base_positions[self._articulation_clearance_frame_ids, 2]
             + self.semantic_vertical_height_profile * float(lift_m)
         )
-        actual_heights = self._frame_heights(q)[
-            self._articulation_clearance_frame_ids
+        actual_heights = actual_positions[
+            self._articulation_clearance_frame_ids, 2
         ]
-        return float(np.max(np.abs(target_heights - actual_heights)))
+        return np.asarray(
+            [
+                target_forward - actual_forward,
+                float(np.max(np.abs(target_heights - actual_heights))),
+            ],
+            dtype=np.float64,
+        )
 
     def update_from_palm_displacement(self, displacement: Sequence[float] | None):
         if not self.enabled or self.initial_pose is None or displacement is None:

@@ -3,7 +3,7 @@ import pytest
 
 from arm_control.semantic_motion import (
     build_operator_arm_motion,
-    semantic_joint_offsets,
+    semantic_direct_joint_offsets,
     wrap_angle_radians,
 )
 
@@ -40,12 +40,9 @@ def test_build_operator_arm_motion_fails_closed_without_control_hand():
     assert build_operator_arm_motion({}, {}, "right", None) is None
 
 
-def test_semantic_joint_mapping_uses_j1_j2_j3_j4_and_j6_only():
-    offsets = semantic_joint_offsets(
+def test_semantic_direct_joint_mapping_uses_only_j1_and_j6():
+    offsets = semantic_direct_joint_offsets(
         lateral_m=0.05,
-        forward_m=0.04,
-        elbow_delta_rad=0.20,
-        wrist_delta_rad=-0.10,
         roll_delta_rad=0.30,
         gains=[0.6, -0.5, 0.2, 0.15, 0.2],
         channel_enable=[1, 1, 1, 1, 1, 0],
@@ -54,15 +51,12 @@ def test_semantic_joint_mapping_uses_j1_j2_j3_j4_and_j6_only():
 
     np.testing.assert_allclose(
         offsets,
-        [0.03, -0.02, 0.04, -0.015, 0.0, 0.06],
+        [0.03, 0.0, 0.0, 0.0, 0.0, 0.06],
     )
 
 
 def test_semantic_joint_mapping_respects_channel_disable_and_limits():
-    offsets = semantic_joint_offsets(
-        1.0,
-        1.0,
-        1.0,
+    offsets = semantic_direct_joint_offsets(
         1.0,
         1.0,
         gains=[1.0] * 5,

@@ -14,7 +14,7 @@ from .rebot_b601 import (
 from .semantic_motion import (
     OperatorArmMotion,
     build_operator_arm_motion,
-    semantic_joint_offsets,
+    semantic_direct_joint_offsets,
     wrap_angle_radians,
 )
 
@@ -30,6 +30,6 @@ __all__ = [
     "validate_tabletop_startup",
     "OperatorArmMotion",
     "build_operator_arm_motion",
-    "semantic_joint_offsets",
+    "semantic_direct_joint_offsets",
     "wrap_angle_radians",
 ]
