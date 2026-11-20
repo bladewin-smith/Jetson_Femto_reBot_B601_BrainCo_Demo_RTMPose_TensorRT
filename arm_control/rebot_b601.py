@@ -88,6 +88,25 @@ def weighted_damped_least_squares(
     return mobility_matrix @ task.T @ np.linalg.solve(regularized, desired)
 
 
+def horizontal_radial_axis(
+    tcp_position_m: Sequence[float],
+) -> tuple[np.ndarray, float]:
+    """Return a copied unit XY radial axis and the original radial distance.
+
+    The explicit copy is safety-critical.  Pinocchio/NumPy position slices can
+    be views; normalizing such a view in place would overwrite the reference
+    TCP coordinates and create a fictitious forward error close to one metre.
+    """
+
+    position = _vector(tcp_position_m, 3, "tcp_position_m")
+    axis = position[:2].copy()
+    radius = float(np.linalg.norm(axis))
+    if radius < 1e-6:
+        raise ValueError("TCP is too close to the base axis for planar control")
+    axis /= radius
+    return axis, radius
+
+
 def send_mit_checked(
     motor_map: dict[str, Any],
     joint_names: Sequence[str],
@@ -1837,17 +1856,14 @@ class B601PalmFollower:
         q_reference = self.semantic_control_reference_q
         base_positions = self._frame_positions(q_base)
         base_tcp = base_positions[self._end_frame_id]
-        forward_axis = np.asarray(base_tcp[:2], dtype=np.float64)
-        forward_axis_norm = float(np.linalg.norm(forward_axis))
-        if forward_axis_norm < 1e-6:
+        try:
+            forward_axis, base_forward = horizontal_radial_axis(base_tcp)
+        except ValueError:
             self.logger.warn(
                 "B601 TCP is too close to the base axis for planar control; holding"
             )
             return q
-        forward_axis /= forward_axis_norm
-        target_forward = float(np.dot(base_tcp[:2], forward_axis)) + float(
-            forward_m
-        )
+        target_forward = base_forward + float(forward_m)
         reference_heights = base_positions[:, 2]
         target_heights = (
             reference_heights[self._articulation_clearance_frame_ids]
@@ -2042,14 +2058,11 @@ class B601PalmFollower:
         base_positions = self._frame_positions(q_base)
         actual_positions = self._frame_positions(q)
         base_tcp = base_positions[self._end_frame_id]
-        forward_axis = np.asarray(base_tcp[:2], dtype=np.float64)
-        norm = float(np.linalg.norm(forward_axis))
-        if norm < 1e-6:
+        try:
+            forward_axis, base_forward = horizontal_radial_axis(base_tcp)
+        except ValueError:
             return np.zeros(2, dtype=np.float64)
-        forward_axis /= norm
-        target_forward = float(np.dot(base_tcp[:2], forward_axis)) + float(
-            forward_m
-        )
+        target_forward = base_forward + float(forward_m)
         actual_forward = float(
             np.dot(actual_positions[self._end_frame_id, :2], forward_axis)
         )

@@ -5,6 +5,7 @@ from arm_control.rebot_b601 import (
     B601PalmFollower,
     StartupGuardError,
     apply_tabletop_motion_envelope,
+    horizontal_radial_axis,
     joint_tracking_bounds,
     joint_target_safety_violations,
     limit_mit_target_by_effort,
@@ -182,6 +183,17 @@ def test_weighted_planar_dls_biases_motion_toward_more_mobile_joint():
         [1.0, 1.0],
         atol=1e-8,
     )
+
+
+def test_horizontal_radial_axis_does_not_mutate_tcp_reference():
+    tcp = np.array([0.03, -0.26, 0.19])
+    original = tcp.copy()
+
+    axis, radius = horizontal_radial_axis(tcp)
+
+    np.testing.assert_allclose(tcp, original)
+    np.testing.assert_allclose(axis, original[:2] / np.linalg.norm(original[:2]))
+    assert radius == pytest.approx(np.linalg.norm(original[:2]))
 
 
 def test_pinocchio_frame_ids_are_converted_to_native_integers():
