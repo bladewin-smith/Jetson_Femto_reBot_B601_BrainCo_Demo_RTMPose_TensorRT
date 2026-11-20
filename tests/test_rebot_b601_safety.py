@@ -95,3 +95,44 @@ def test_joint_limit_margin_rejects_entering_guard_zone_from_interior():
 
     assert outside[1]
     assert outside[2]
+
+
+def test_joint_limit_margin_allows_return_to_validated_tabletop_reference():
+    lower = [-2.8, -3.14, -3.14, -1.87, -1.57, -3.14]
+    upper = [2.8, 0.0, 0.0, 1.57, 1.57, 3.14]
+    startup = [-1.5139, -0.0090, -0.0105, 0.0029, -0.0574, -0.3317]
+    current = [-1.5158, -0.0586, -0.0650, 0.0425, -0.0532, -0.3317]
+    target = [-1.5158, -0.0448, -0.0564, 0.0192, -0.0536, -0.3317]
+
+    outside, jump = joint_target_safety_violations(
+        target,
+        current,
+        lower,
+        upper,
+        0.05,
+        [0.10, 0.10, 0.10, 0.14, 0.14, 0.14],
+        startup,
+    )
+
+    assert not np.any(outside)
+    assert not np.any(jump)
+
+
+def test_joint_limit_margin_rejects_target_beyond_validated_tabletop_reference():
+    lower = [-2.8, -3.14, -3.14, -1.87, -1.57, -3.14]
+    upper = [2.8, 0.0, 0.0, 1.57, 1.57, 3.14]
+    startup = [-1.5139, -0.0090, -0.0105, 0.0029, -0.0574, -0.3317]
+    current = [-1.5158, -0.0586, -0.0650, 0.0425, -0.0532, -0.3317]
+    target = [-1.5158, -0.0050, -0.0564, 0.0192, -0.0536, -0.3317]
+
+    outside, _ = joint_target_safety_violations(
+        target,
+        current,
+        lower,
+        upper,
+        0.05,
+        [0.10, 0.10, 0.10, 0.14, 0.14, 0.14],
+        startup,
+    )
+
+    assert outside[1]

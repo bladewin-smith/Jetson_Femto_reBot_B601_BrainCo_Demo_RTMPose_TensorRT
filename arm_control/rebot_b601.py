@@ -117,16 +117,18 @@ def joint_target_safety_violations(
     upper_rad: Sequence[float],
     margin_rad: float,
     max_delta_rad: Sequence[float],
+    margin_reference_rad: Sequence[float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return hard/margin-limit and per-command step violation masks.
 
     The B601-DM table-supported pose intentionally places joints 2 and 3 near
     their URDF upper limit (zero radians).  A conventional symmetric margin
     would make that valid startup pose a trap: even a target moving farther
-    into the legal range would be rejected.  Inside a margin zone, therefore,
-    holding position or retreating toward the interior is allowed, while any
-    motion farther toward the hard stop is rejected.  The URDF hard limits are
-    never relaxed.
+    into the legal range would be rejected.  For a joint whose validated
+    startup reference is already inside a margin zone, that reference replaces
+    the normal guard boundary.  Tracking may therefore move inward and return
+    to the validated table pose, but may not move any closer to the hard stop.
+    The URDF hard limits are never relaxed.
     """
 
     target = np.asarray(target_rad, dtype=np.float64).reshape(-1)
@@ -134,31 +136,43 @@ def joint_target_safety_violations(
     lower = np.asarray(lower_rad, dtype=np.float64).reshape(-1)
     upper = np.asarray(upper_rad, dtype=np.float64).reshape(-1)
     max_delta = np.asarray(max_delta_rad, dtype=np.float64).reshape(-1)
+    margin_reference = (
+        current
+        if margin_reference_rad is None
+        else np.asarray(margin_reference_rad, dtype=np.float64).reshape(-1)
+    )
     if not (
         target.shape
         == current.shape
         == lower.shape
         == upper.shape
         == max_delta.shape
+        == margin_reference.shape
     ):
         raise ValueError("joint safety vectors must have matching shapes")
     margin = float(margin_rad)
     if not np.isfinite(margin) or margin < 0.0:
         raise ValueError("joint limit margin must be finite and non-negative")
 
-    epsilon = 1e-6
     hard_limit = np.logical_or(target < lower, target > upper)
-    lower_guard = lower + margin
-    upper_guard = upper - margin
-    unsafe_lower_margin = np.logical_and(
-        target < lower_guard,
-        np.logical_or(current >= lower_guard, target < current - epsilon),
+    nominal_lower_guard = lower + margin
+    nominal_upper_guard = upper - margin
+    lower_guard = np.where(
+        margin_reference < nominal_lower_guard,
+        margin_reference,
+        nominal_lower_guard,
     )
-    unsafe_upper_margin = np.logical_and(
-        target > upper_guard,
-        np.logical_or(current <= upper_guard, target > current + epsilon),
+    upper_guard = np.where(
+        margin_reference > nominal_upper_guard,
+        margin_reference,
+        nominal_upper_guard,
     )
-    outside = hard_limit | unsafe_lower_margin | unsafe_upper_margin
+    numerical_tolerance = 1e-6
+    outside_margin = np.logical_or(
+        target < lower_guard - numerical_tolerance,
+        target > upper_guard + numerical_tolerance,
+    )
+    outside = hard_limit | outside_margin
     jump = np.abs(target - current) > max_delta
     return outside, jump
 
@@ -423,6 +437,7 @@ class B601PalmFollower:
         self.target_q = None
         self.last_measured_q = None
         self.last_measured_dq = None
+        self.startup_joint_reference = None
         self.last_commanded_pose = None
         self.last_target_pose = None
         self.last_arm_offset = np.zeros(3, dtype=np.float64)
@@ -532,6 +547,16 @@ class B601PalmFollower:
                 self.tabletop_tolerance,
                 self.startup_max_velocity,
             )
+            outside_hard_limits = np.logical_or(
+                q < self._joint_lower, q > self._joint_upper
+            )
+            if np.any(outside_hard_limits):
+                raise StartupGuardError(
+                    "Refusing to enable B601-DM torque: validated table feedback is "
+                    "outside the URDF hard limits for joints "
+                    f"{(np.flatnonzero(outside_hard_limits) + 1).tolist()}"
+                )
+            self.startup_joint_reference = q.copy()
             self._set_reference_from_q(q)
             self.target_q = q.copy()
             self.last_measured_q = q.copy()
@@ -805,6 +830,7 @@ class B601PalmFollower:
             self._joint_upper,
             self.joint_limit_margin_rad,
             self.max_joint_target_delta,
+            self.startup_joint_reference,
         )
         if np.any(outside) or np.any(jump):
             self.logger.warn(
