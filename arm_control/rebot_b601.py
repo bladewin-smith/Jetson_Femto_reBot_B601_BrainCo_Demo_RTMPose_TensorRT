@@ -110,6 +110,59 @@ def minimum_jerk_blend(progress: float) -> float:
     return 10.0 * s**3 - 15.0 * s**4 + 6.0 * s**5
 
 
+def joint_target_safety_violations(
+    target_rad: Sequence[float],
+    current_rad: Sequence[float],
+    lower_rad: Sequence[float],
+    upper_rad: Sequence[float],
+    margin_rad: float,
+    max_delta_rad: Sequence[float],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return hard/margin-limit and per-command step violation masks.
+
+    The B601-DM table-supported pose intentionally places joints 2 and 3 near
+    their URDF upper limit (zero radians).  A conventional symmetric margin
+    would make that valid startup pose a trap: even a target moving farther
+    into the legal range would be rejected.  Inside a margin zone, therefore,
+    holding position or retreating toward the interior is allowed, while any
+    motion farther toward the hard stop is rejected.  The URDF hard limits are
+    never relaxed.
+    """
+
+    target = np.asarray(target_rad, dtype=np.float64).reshape(-1)
+    current = np.asarray(current_rad, dtype=np.float64).reshape(-1)
+    lower = np.asarray(lower_rad, dtype=np.float64).reshape(-1)
+    upper = np.asarray(upper_rad, dtype=np.float64).reshape(-1)
+    max_delta = np.asarray(max_delta_rad, dtype=np.float64).reshape(-1)
+    if not (
+        target.shape
+        == current.shape
+        == lower.shape
+        == upper.shape
+        == max_delta.shape
+    ):
+        raise ValueError("joint safety vectors must have matching shapes")
+    margin = float(margin_rad)
+    if not np.isfinite(margin) or margin < 0.0:
+        raise ValueError("joint limit margin must be finite and non-negative")
+
+    epsilon = 1e-6
+    hard_limit = np.logical_or(target < lower, target > upper)
+    lower_guard = lower + margin
+    upper_guard = upper - margin
+    unsafe_lower_margin = np.logical_and(
+        target < lower_guard,
+        np.logical_or(current >= lower_guard, target < current - epsilon),
+    )
+    unsafe_upper_margin = np.logical_and(
+        target > upper_guard,
+        np.logical_or(current <= upper_guard, target > current + epsilon),
+    )
+    outside = hard_limit | unsafe_lower_margin | unsafe_upper_margin
+    jump = np.abs(target - current) > max_delta
+    return outside, jump
+
+
 class B601PalmFollower:
     """B601-DM implementation of the palm-follower interface used by the UI."""
 
@@ -216,6 +269,11 @@ class B601PalmFollower:
         self.joint_limit_margin_rad = float(
             node.declare_parameter("b601_joint_limit_margin_rad", 0.05).value
         )
+        if (
+            not np.isfinite(self.joint_limit_margin_rad)
+            or self.joint_limit_margin_rad < 0.0
+        ):
+            raise ValueError("b601_joint_limit_margin_rad must be finite and non-negative")
         self.control_rate_hz = float(
             node.declare_parameter("b601_control_rate_hz", 500.0).value
         )
@@ -740,10 +798,14 @@ class B601PalmFollower:
         return arm_offset
 
     def _joint_target_is_safe(self, target: np.ndarray, current: np.ndarray) -> bool:
-        lower = self._joint_lower + self.joint_limit_margin_rad
-        upper = self._joint_upper - self.joint_limit_margin_rad
-        outside = np.logical_or(target < lower, target > upper)
-        jump = np.abs(target - current) > self.max_joint_target_delta
+        outside, jump = joint_target_safety_violations(
+            target,
+            current,
+            self._joint_lower,
+            self._joint_upper,
+            self.joint_limit_margin_rad,
+            self.max_joint_target_delta,
+        )
         if np.any(outside) or np.any(jump):
             self.logger.warn(
                 "Refusing B601 joint target: "
