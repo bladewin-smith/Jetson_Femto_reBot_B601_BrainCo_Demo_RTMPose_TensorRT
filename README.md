@@ -200,6 +200,15 @@ export TABLE_Q='[q1,q2,q3,q4,q5,q6]'
 bash scripts/run_b601_visible_lift.sh '[0.0,0.0,0.0,0.0,0.0,1.0]'
 ```
 
+若三份 TensorRT engine 不在同一目录，先分别导出已经在该 Jetson 上验证过的路径；
+启动脚本会优先使用它们并打印最终选择：
+
+```bash
+export DET_ENGINE='/absolute/path/to/rtmdet_nano.engine'
+export BODY_ENGINE='/absolute/path/to/rtmpose_body.engine'
+export HAND_ENGINE='/absolute/path/to/rtmpose_hand.engine'
+```
+
 该入口固定读取 `config/b601_visible_motion.yaml`，因此不要再用旧的 `run_stage_v2`
 验证这一档参数。下面保留完整展开形式，便于逐项检查或继续调参。
 

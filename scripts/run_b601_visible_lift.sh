@@ -12,9 +12,12 @@ if [[ -z "${TABLE_Q:-}" ]]; then
   exit 2
 fi
 
-DET_ENGINE="$ENGINE_DIR/rtmdet_nano.engine"
-BODY_ENGINE="$ENGINE_DIR/rtmpose_body.engine"
-HAND_ENGINE="$ENGINE_DIR/rtmpose_hand.engine"
+# Preserve individually selected, already validated engines. This matters on
+# Jetson systems where RTMDet and the two RTMPose engines were built with
+# different precision profiles or live in different directories.
+DET_ENGINE="${DET_ENGINE:-$ENGINE_DIR/rtmdet_nano.engine}"
+BODY_ENGINE="${BODY_ENGINE:-$ENGINE_DIR/rtmpose_body.engine}"
+HAND_ENGINE="${HAND_ENGINE:-$ENGINE_DIR/rtmpose_hand.engine}"
 for file in "$DET_ENGINE" "$BODY_ENGINE" "$HAND_ENGINE"; do
   if [[ ! -s "$file" ]]; then
     echo "Missing or empty TensorRT engine; refusing hardware startup: $file" >&2
@@ -36,6 +39,9 @@ export PYTHONPATH="$HOME/ws/pyorbbecsdk-2-main:$HOME/ws/brainco-hand-sdk-main/py
 
 echo "Visible B601 lift profile: 25 mm target, J3 kp=180, J3 effort limit=16 Nm"
 echo "Channels: $CHANNELS"
+echo "Detector engine: $DET_ENGINE"
+echo "Body-pose engine: $BODY_ENGINE"
+echo "Hand-pose engine: $HAND_ENGINE"
 echo "Keep the arm table-supported and the E-stop within immediate reach."
 
 exec python "$REPO/scripts/camera_arm_b601_control_pose_hands.py" --ros-args \
