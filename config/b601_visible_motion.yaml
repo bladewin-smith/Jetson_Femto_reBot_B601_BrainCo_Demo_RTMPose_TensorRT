@@ -36,6 +36,12 @@ hand_palm_b601_control_node:
     b601_stream_outer_velocity_scale: 1.35
     b601_stream_goal_velocity_filter_alpha: 0.45
     b601_stream_goal_velocity_stale_cycles: 2.0
+    b601_stream_goal_period_filter_alpha: 0.20
+    b601_stream_goal_velocity_max_hold_s: 0.20
+    # Resolved-rate velocity is primary; position error contributes only a
+    # bounded correction instead of making the stream race to every sample.
+    b601_stream_position_correction_gain_s: 5.0
+    b601_stream_position_correction_max_fraction: 0.35
     b601_semantic_max_tracking_error_rad: [0.012, 0.020, 0.055, 0.018, 0.008, 0.040]
     b601_semantic_stall_error_rad: [0.010, 0.015, 0.030, 0.015, 0.010, 0.012]
     b601_semantic_stall_min_progress_rad: 0.0015
@@ -58,6 +64,21 @@ hand_palm_b601_control_node:
     b601_semantic_motion_reverse_confirm_samples: 4
     b601_semantic_planar_command_max_acceleration_m_s2: [0.18, 0.16]
     b601_semantic_planar_command_deadband_m: [0.0015, 0.0015]
+    # Stop accumulating operator displacement when the physical arm has not
+    # yet caught up, while always permitting a command back toward feedback.
+    b601_semantic_planar_tracking_error_m: [0.025, 0.025]
+    b601_semantic_planar_backpressure_start_fraction: 0.55
+    b601_semantic_planar_backpressure_rates_s: [2.0, 4.0]
+    # The rate-limited table gate restricts only new outward motion, so a
+    # falling gate cannot manufacture an operator-opposing command. Continuous
+    # follower mobility replaces the old staged J3 progress switch.
+    b601_semantic_clearance_gate_rates_s: [1.5, 3.0]
+    b601_semantic_clearance_gate_deadband: 0.03
+    b601_semantic_planar_follower_min_mobility_scale: 0.30
+    # Resolved-rate J2/J3/J4 task feedback and coordinated acceleration limits.
+    b601_semantic_planar_task_error_gain_s: [2.0, 2.0]
+    b601_semantic_planar_task_correction_max_velocity_m_s: [0.025, 0.020]
+    b601_semantic_planar_joint_max_acceleration_rad_s2: [0.45, 0.60, 0.20]
     b601_semantic_j1_target_max_velocity_rad_s: 0.08
     b601_semantic_j1_target_max_acceleration_rad_s2: 0.35
     b601_semantic_j1_target_deadband_rad: 0.0015

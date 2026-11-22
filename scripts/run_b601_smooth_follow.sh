@@ -33,6 +33,8 @@ fi
 export PYTHONPATH="$HOME/ws/pyorbbecsdk-2-main:$HOME/ws/brainco-hand-sdk-main/python:$REPO:$REPO/scripts:$REPO/third_party/reBotArm_control_py:${PYTHONPATH:-}"
 
 echo "B601 continuous semantic follower"
+echo "Planar control: resolved-rate J2/J3/J4 + task anti-windup + continuous clearance gate"
+echo "MIT stream: velocity feed-forward + bounded position correction + adaptive frame hold"
 echo "Channels: $CHANNELS"
 echo "Detector: $DET_ENGINE"
 echo "Body pose: $BODY_ENGINE"
@@ -77,6 +79,15 @@ exec python "$REPO/scripts/camera_arm_b601_control_pose_hands.py" --ros-args \
   -p b601_semantic_planar_command_max_velocity_m_s:='[0.050,0.040]' \
   -p b601_semantic_planar_command_max_acceleration_m_s2:='[0.22,0.16]' \
   -p b601_semantic_planar_command_deadband_m:='[0.0012,0.0015]' \
+  -p b601_semantic_planar_tracking_error_m:='[0.025,0.025]' \
+  -p b601_semantic_planar_backpressure_start_fraction:=0.55 \
+  -p b601_semantic_planar_backpressure_rates_s:='[2.0,4.0]' \
+  -p b601_semantic_clearance_gate_rates_s:='[1.5,3.0]' \
+  -p b601_semantic_clearance_gate_deadband:=0.03 \
+  -p b601_semantic_planar_follower_min_mobility_scale:=0.30 \
+  -p b601_semantic_planar_task_error_gain_s:='[2.0,2.0]' \
+  -p b601_semantic_planar_task_correction_max_velocity_m_s:='[0.025,0.020]' \
+  -p b601_semantic_planar_joint_max_acceleration_rad_s2:='[0.45,0.60,0.20]' \
   -p b601_semantic_j1_target_max_velocity_rad_s:=0.10 \
   -p b601_semantic_j1_target_max_acceleration_rad_s2:=0.45 \
   -p b601_semantic_j1_target_deadband_rad:=0.0015 \
@@ -97,6 +108,10 @@ exec python "$REPO/scripts/camera_arm_b601_control_pose_hands.py" --ros-args \
   -p b601_stream_outer_velocity_scale:=1.35 \
   -p b601_stream_goal_velocity_filter_alpha:=0.45 \
   -p b601_stream_goal_velocity_stale_cycles:=2.0 \
+  -p b601_stream_goal_period_filter_alpha:=0.20 \
+  -p b601_stream_goal_velocity_max_hold_s:=0.20 \
+  -p b601_stream_position_correction_gain_s:=5.0 \
+  -p b601_stream_position_correction_max_fraction:=0.35 \
   -p control_hand_side:=right \
   -p control_hand_fallback_enabled:=false \
   -p hand_control_enabled:=false \

@@ -219,13 +219,14 @@ export HAND_ENGINE='/absolute/path/to/rtmpose_hand.engine'
 该入口固定读取 `config/b601_visible_motion.yaml`，因此不要再用旧的 `run_stage_v2`
 验证这一档参数。下面保留完整展开形式，便于逐项检查或继续调参。
 
-语义目标约以 20--25 Hz 更新，但电机目标会在 500 Hz MIT 循环中经过速度、加速度和
-jerk 受限的连续插值。插值器会把相邻语义目标估算出的速度前馈到下一帧，并自动把
-内层速度限制耦合到外层实际可达速度，避免内层提前到点、停车、再等待下一帧造成的
-阶梯感。掌心滤波会按运动速度自适应带宽并限制单帧跳变；J6 的最小可见角也改为
-minimum-jerk 软启动。反向确认只拦截真正的反向输入，同方向小位移不会再按死区
-分段；到达死区会吸附到请求值而不是保持旧目标。J2/J3/J4 的限幅使用共同进度，
-桌面边界则投影到最大安全运动比例，不再因一个越界候选而丢弃整帧控制状态。
+语义目标约以 20--25 Hz 更新。J2/J3/J4 使用雅可比 resolved-rate 解算，将掌心任务
+速度和当前任务误差直接转换为协调的关节速度，不再每帧产生一个远端 IK 姿态后逐步
+追赶。任务跟踪误差过大时，反积分饱和会暂停继续积累操作者位移，但始终允许机械臂
+向实际反馈方向恢复；桌面净空门控只限制继续向外运动，不会在净空下降时凭空制造
+反向目标，且 follower mobility 连续、带滞回并受变化率限制。500 Hz MIT 层以该关节速度为主要前馈，只叠加有限的位置误差修正，并继续执行
+速度、加速度和 jerk 限制。掌心滤波会按运动速度自适应带宽并限制单帧跳变；J6 的
+最小可见角使用 minimum-jerk 软启动。最终目标仍会经过关节范围、桌面投影、力矩和
+失速保护。
 
 ```bash
 REPO="$HOME/ws/Jetson_Femto_reBot_B601_BrainCo_Demo_RTMPose_TensorRT"
@@ -286,6 +287,10 @@ run_b601_semantic_test() {
     -p b601_stream_outer_velocity_scale:=1.35 \
     -p b601_stream_goal_velocity_filter_alpha:=0.45 \
     -p b601_stream_goal_velocity_stale_cycles:=2.0 \
+    -p b601_stream_goal_period_filter_alpha:=0.20 \
+    -p b601_stream_goal_velocity_max_hold_s:=0.20 \
+    -p b601_stream_position_correction_gain_s:=5.0 \
+    -p b601_stream_position_correction_max_fraction:=0.35 \
     -p b601_semantic_max_tracking_error_rad:='[0.012,0.020,0.055,0.018,0.008,0.040]' \
     -p b601_semantic_stall_error_rad:='[0.010,0.015,0.030,0.015,0.010,0.012]' \
     -p b601_semantic_stall_min_progress_rad:=0.0015 \
@@ -303,6 +308,15 @@ run_b601_semantic_test() {
     -p b601_semantic_planar_command_max_velocity_m_s:='[0.040,0.035]' \
     -p b601_semantic_planar_command_max_acceleration_m_s2:='[0.18,0.16]' \
     -p b601_semantic_planar_command_deadband_m:='[0.0015,0.0015]' \
+    -p b601_semantic_planar_tracking_error_m:='[0.025,0.025]' \
+    -p b601_semantic_planar_backpressure_start_fraction:=0.55 \
+    -p b601_semantic_planar_backpressure_rates_s:='[2.0,4.0]' \
+    -p b601_semantic_clearance_gate_rates_s:='[1.5,3.0]' \
+    -p b601_semantic_clearance_gate_deadband:=0.03 \
+    -p b601_semantic_planar_follower_min_mobility_scale:=0.30 \
+    -p b601_semantic_planar_task_error_gain_s:='[2.0,2.0]' \
+    -p b601_semantic_planar_task_correction_max_velocity_m_s:='[0.025,0.020]' \
+    -p b601_semantic_planar_joint_max_acceleration_rad_s2:='[0.45,0.60,0.20]' \
     -p b601_semantic_motion_reverse_deadband_m:='[0.006,0.006,0.005]' \
     -p b601_semantic_motion_reverse_confirm_samples:=4 \
     -p b601_semantic_j1_target_max_velocity_rad_s:=0.08 \

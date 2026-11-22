@@ -504,6 +504,157 @@ def slew_limit_vector(
     return prior + np.clip(target - prior, -maximum_step, maximum_step)
 
 
+def rate_limited_unit_interval(
+    requested: float,
+    previous: float,
+    rise_rate_s: float,
+    fall_rate_s: float,
+    dt_s: float,
+    deadband: float = 0.0,
+) -> float:
+    """Move a normalized state without allowing a noisy threshold to chatter."""
+
+    target = float(requested)
+    prior = float(previous)
+    rise = float(rise_rate_s)
+    fall = float(fall_rate_s)
+    dt = float(dt_s)
+    band = float(deadband)
+    if not all(np.isfinite(value) for value in (target, prior, rise, fall, dt, band)):
+        raise ValueError("normalized rate-limit inputs must be finite")
+    if rise <= 0.0 or fall <= 0.0 or dt <= 0.0 or band < 0.0:
+        raise ValueError(
+            "normalized rate limits/dt must be positive and deadband non-negative"
+        )
+    target = float(np.clip(target, 0.0, 1.0))
+    prior = float(np.clip(prior, 0.0, 1.0))
+    delta = target - prior
+    if abs(delta) <= band:
+        return prior
+    rate = rise if delta > 0.0 else fall
+    return float(
+        np.clip(prior + np.clip(delta, -rate * dt, rate * dt), 0.0, 1.0)
+    )
+
+
+def gate_outward_scalar_increment(
+    requested: float,
+    previous: float,
+    gate: float,
+) -> float:
+    """Gate only motion farther from zero; never manufacture a return command."""
+
+    target = float(requested)
+    prior = float(previous)
+    scale = float(gate)
+    if not all(np.isfinite(value) for value in (target, prior, scale)):
+        raise ValueError("outward gate inputs must be finite")
+    scale = float(np.clip(scale, 0.0, 1.0))
+    same_direction = target * prior >= 0.0
+    moving_outward = same_direction and abs(target) > abs(prior)
+    if not moving_outward:
+        return target
+    return float(prior + scale * (target - prior))
+
+
+def task_space_backpressure(
+    signed_error: Sequence[float],
+    requested_increment: Sequence[float],
+    max_tracking_error: Sequence[float],
+    start_fraction: float,
+) -> float:
+    """Reduce only task increments that add to an existing tracking backlog."""
+
+    error = np.asarray(signed_error, dtype=np.float64).reshape(-1)
+    increment = np.asarray(requested_increment, dtype=np.float64).reshape(-1)
+    limit = np.asarray(max_tracking_error, dtype=np.float64).reshape(-1)
+    start = float(start_fraction)
+    if not error.shape == increment.shape == limit.shape:
+        raise ValueError("task backpressure vectors must have matching shapes")
+    if not all(np.all(np.isfinite(value)) for value in (error, increment, limit)):
+        raise ValueError("task backpressure vectors must be finite")
+    if np.any(limit <= 0.0) or not np.isfinite(start) or not 0.0 <= start < 1.0:
+        raise ValueError("task backpressure limits/start fraction are invalid")
+
+    # Returning toward the achieved pose must never be blocked. Only command
+    # increments that add to an existing signed error consume headroom.
+    increasing = increment * error > 0.0
+    if not np.any(increasing):
+        return 1.0
+    ratio = np.abs(error[increasing]) / limit[increasing]
+    normalized = np.clip((ratio - start) / (1.0 - start), 0.0, 1.0)
+    factors = 1.0 - np.asarray(
+        [minimum_jerk_blend(float(value)) for value in normalized],
+        dtype=np.float64,
+    )
+    return float(np.min(factors)) if factors.size else 1.0
+
+
+def coordinated_acceleration_limited_velocity(
+    requested_velocity: Sequence[float],
+    previous_velocity: Sequence[float],
+    max_velocity: Sequence[float],
+    max_acceleration: Sequence[float],
+    dt_s: float,
+) -> np.ndarray:
+    """Limit a coordinated joint velocity without distorting its direction."""
+
+    requested = np.asarray(requested_velocity, dtype=np.float64).reshape(-1)
+    previous = np.asarray(previous_velocity, dtype=np.float64).reshape(-1)
+    velocity_limit = np.asarray(max_velocity, dtype=np.float64).reshape(-1)
+    acceleration_limit = np.asarray(max_acceleration, dtype=np.float64).reshape(-1)
+    dt = float(dt_s)
+    if not (
+        requested.shape
+        == previous.shape
+        == velocity_limit.shape
+        == acceleration_limit.shape
+    ):
+        raise ValueError("coordinated velocity vectors must have matching shapes")
+    if not all(
+        np.all(np.isfinite(value))
+        for value in (requested, previous, velocity_limit, acceleration_limit)
+    ):
+        raise ValueError("coordinated velocity vectors must be finite")
+    if (
+        np.any(velocity_limit <= 0.0)
+        or np.any(acceleration_limit <= 0.0)
+        or not np.isfinite(dt)
+        or dt <= 0.0
+    ):
+        raise ValueError("coordinated velocity limits and dt must be positive")
+
+    velocity_scale = 1.0
+    active = np.abs(requested) > 1e-12
+    if np.any(active):
+        velocity_scale = min(
+            1.0,
+            float(np.min(velocity_limit[active] / np.abs(requested[active]))),
+        )
+    bounded_requested = velocity_scale * requested
+    delta = bounded_requested - previous
+    acceleration_scale = 1.0
+    changing = np.abs(delta) > 1e-12
+    if np.any(changing):
+        acceleration_scale = min(
+            1.0,
+            float(
+                np.min(
+                    acceleration_limit[changing] * dt / np.abs(delta[changing])
+                )
+            ),
+        )
+    result = previous + acceleration_scale * delta
+    final_scale = 1.0
+    moving = np.abs(result) > 1e-12
+    if np.any(moving):
+        final_scale = min(
+            1.0,
+            float(np.min(velocity_limit[moving] / np.abs(result[moving]))),
+        )
+    return final_scale * result
+
+
 def acceleration_limited_vector_target(
     requested: Sequence[float],
     previous: Sequence[float],
@@ -716,6 +867,27 @@ def coupled_stream_velocity_limits(
     return np.minimum(configured, scale * semantic_rate)
 
 
+def adaptive_goal_velocity_hold_s(
+    command_interval_s: float,
+    observed_update_period_s: float,
+    stale_cycles: float,
+    maximum_hold_s: float,
+) -> float:
+    """Keep feed-forward alive across the measured vision-frame interval."""
+
+    interval = float(command_interval_s)
+    observed = float(observed_update_period_s)
+    cycles = float(stale_cycles)
+    maximum = float(maximum_hold_s)
+    if not all(np.isfinite(value) for value in (interval, observed, cycles, maximum)):
+        raise ValueError("goal-velocity hold settings must be finite")
+    if interval <= 0.0 or observed <= 0.0 or cycles < 1.0 or maximum <= 0.0:
+        raise ValueError("goal-velocity hold settings are invalid")
+    nominal_hold = cycles * interval
+    measured_hold = 1.5 * observed
+    return float(min(maximum, max(nominal_hold, measured_hold)))
+
+
 def filtered_goal_velocity(
     requested_position: Sequence[float],
     previous_position: Sequence[float],
@@ -793,6 +965,8 @@ def jerk_limited_joint_target(
     max_jerk: Sequence[float],
     dt_s: float,
     requested_velocity: Sequence[float] | None = None,
+    position_correction_gain_s: float | None = None,
+    position_correction_max_velocity: Sequence[float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Advance a continuous joint setpoint with bounded position/velocity tracking."""
 
@@ -828,13 +1002,35 @@ def jerk_limited_joint_target(
         raise ValueError("requested joint-stream velocity must match the goal")
     goal_velocity = np.clip(goal_velocity, -velocity_limit, velocity_limit)
     error = goal - position
-    # Feed-forward preserves motion across consecutive outer-loop samples;
-    # stopping-distance feedback still converges safely to the latest verified
-    # position when the outer target slows or becomes stale.
-    correction_speed = np.minimum(
-        velocity_limit,
-        np.sqrt(2.0 * acceleration_limit * np.abs(error)),
-    )
+    # Feed-forward preserves motion across consecutive outer-loop samples.
+    # Legacy callers retain stopping-distance feedback; the semantic path uses
+    # a much smaller proportional correction so it cannot race to each frame.
+    if position_correction_gain_s is None:
+        correction_speed = np.minimum(
+            velocity_limit,
+            np.sqrt(2.0 * acceleration_limit * np.abs(error)),
+        )
+    else:
+        correction_gain = float(position_correction_gain_s)
+        correction_limit = (
+            velocity_limit
+            if position_correction_max_velocity is None
+            else np.asarray(
+                position_correction_max_velocity, dtype=np.float64
+            ).reshape(-1)
+        )
+        if (
+            not np.isfinite(correction_gain)
+            or correction_gain <= 0.0
+            or correction_limit.shape != goal.shape
+            or not np.all(np.isfinite(correction_limit))
+            or np.any(correction_limit <= 0.0)
+        ):
+            raise ValueError("joint-stream position correction settings are invalid")
+        correction_speed = np.minimum(
+            np.minimum(correction_limit, velocity_limit),
+            correction_gain * np.abs(error),
+        )
     desired_velocity = np.clip(
         goal_velocity + np.sign(error) * correction_speed,
         -velocity_limit,
@@ -1256,6 +1452,26 @@ class B601PalmFollower:
                 "b601_stream_goal_velocity_stale_cycles", 2.0
             ).value
         )
+        self.stream_goal_period_filter_alpha = float(
+            node.declare_parameter(
+                "b601_stream_goal_period_filter_alpha", 0.20
+            ).value
+        )
+        self.stream_goal_velocity_max_hold_s = float(
+            node.declare_parameter(
+                "b601_stream_goal_velocity_max_hold_s", 0.20
+            ).value
+        )
+        self.stream_position_correction_gain_s = float(
+            node.declare_parameter(
+                "b601_stream_position_correction_gain_s", 5.0
+            ).value
+        )
+        self.stream_position_correction_max_fraction = float(
+            node.declare_parameter(
+                "b601_stream_position_correction_max_fraction", 0.35
+            ).value
+        )
         if (
             not np.isfinite(self.stream_outer_velocity_scale)
             or self.stream_outer_velocity_scale < 1.0
@@ -1263,10 +1479,18 @@ class B601PalmFollower:
             or not 0.0 < self.stream_goal_velocity_filter_alpha <= 1.0
             or not np.isfinite(self.stream_goal_velocity_stale_cycles)
             or self.stream_goal_velocity_stale_cycles < 1.0
+            or not np.isfinite(self.stream_goal_period_filter_alpha)
+            or not 0.0 < self.stream_goal_period_filter_alpha <= 1.0
+            or not np.isfinite(self.stream_goal_velocity_max_hold_s)
+            or self.stream_goal_velocity_max_hold_s <= 0.0
+            or not np.isfinite(self.stream_position_correction_gain_s)
+            or self.stream_position_correction_gain_s <= 0.0
+            or not np.isfinite(self.stream_position_correction_max_fraction)
+            or not 0.0 < self.stream_position_correction_max_fraction <= 1.0
         ):
             raise ValueError(
                 "B601 stream follow scale/stale cycles must be >= 1 and "
-                "goal-velocity alpha must be in (0, 1]"
+                "goal-velocity alpha/correction fraction must be in (0, 1]"
             )
 
         self.auto_home_on_start = bool(
@@ -1357,6 +1581,15 @@ class B601PalmFollower:
         self.command_interval_s = float(
             node.declare_parameter("arm_command_interval_s", 0.06).value
         )
+        if (
+            not np.isfinite(self.command_interval_s)
+            or self.command_interval_s <= 0.0
+            or self.stream_goal_velocity_max_hold_s < self.command_interval_s
+        ):
+            raise ValueError(
+                "arm_command_interval_s must be positive and cannot exceed "
+                "b601_stream_goal_velocity_max_hold_s"
+            )
         self.min_command_delta_m = float(
             node.declare_parameter("min_command_delta_m", 0.0015).value
         )
@@ -1799,6 +2032,82 @@ class B601PalmFollower:
             2,
             "b601_semantic_planar_command_deadband_m",
         )
+        self.semantic_planar_tracking_error = _positive_vector(
+            node.declare_parameter(
+                "b601_semantic_planar_tracking_error_m", [0.025, 0.025]
+            ).value,
+            2,
+            "b601_semantic_planar_tracking_error_m",
+        )
+        self.semantic_planar_backpressure_start_fraction = float(
+            node.declare_parameter(
+                "b601_semantic_planar_backpressure_start_fraction", 0.55
+            ).value
+        )
+        self.semantic_planar_backpressure_rates = _positive_vector(
+            node.declare_parameter(
+                "b601_semantic_planar_backpressure_rates_s", [2.0, 4.0]
+            ).value,
+            2,
+            "b601_semantic_planar_backpressure_rates_s",
+        )
+        self.semantic_clearance_gate_rates = _positive_vector(
+            node.declare_parameter(
+                "b601_semantic_clearance_gate_rates_s", [1.5, 3.0]
+            ).value,
+            2,
+            "b601_semantic_clearance_gate_rates_s",
+        )
+        self.semantic_clearance_gate_deadband = float(
+            node.declare_parameter(
+                "b601_semantic_clearance_gate_deadband", 0.03
+            ).value
+        )
+        self.semantic_planar_task_error_gain = _positive_vector(
+            node.declare_parameter(
+                "b601_semantic_planar_task_error_gain_s", [2.0, 2.0]
+            ).value,
+            2,
+            "b601_semantic_planar_task_error_gain_s",
+        )
+        self.semantic_planar_task_correction_max_velocity = _positive_vector(
+            node.declare_parameter(
+                "b601_semantic_planar_task_correction_max_velocity_m_s",
+                [0.025, 0.020],
+            ).value,
+            2,
+            "b601_semantic_planar_task_correction_max_velocity_m_s",
+        )
+        self.semantic_planar_joint_max_acceleration = _positive_vector(
+            node.declare_parameter(
+                "b601_semantic_planar_joint_max_acceleration_rad_s2",
+                [0.45, 0.60, 0.20],
+            ).value,
+            3,
+            "b601_semantic_planar_joint_max_acceleration_rad_s2",
+        )
+        self.semantic_planar_follower_min_mobility_scale = float(
+            node.declare_parameter(
+                "b601_semantic_planar_follower_min_mobility_scale", 0.30
+            ).value
+        )
+        if (
+            not np.isfinite(self.semantic_planar_backpressure_start_fraction)
+            or not 0.0
+            <= self.semantic_planar_backpressure_start_fraction
+            < 1.0
+            or not np.isfinite(self.semantic_clearance_gate_deadband)
+            or not 0.0 <= self.semantic_clearance_gate_deadband < 1.0
+            or not np.isfinite(
+                self.semantic_planar_follower_min_mobility_scale
+            )
+            or not 0.0
+            < self.semantic_planar_follower_min_mobility_scale
+            <= 1.0
+        ):
+            raise ValueError(
+                "B601 planar backpressure/gate/mobility fractions are invalid"
+            )
         self.semantic_motion_reverse_deadband = _positive_vector(
             node.declare_parameter(
                 "b601_semantic_motion_reverse_deadband_m",
@@ -1962,6 +2271,13 @@ class B601PalmFollower:
         self.stream_target_acceleration = np.zeros(self.ARM_DOF, dtype=np.float64)
         self.target_q_velocity = np.zeros(self.ARM_DOF, dtype=np.float64)
         self.target_q_update_time = 0.0
+        self.target_q_update_period_s = self.command_interval_s
+        self.last_goal_velocity_hold_s = adaptive_goal_velocity_hold_s(
+            self.command_interval_s,
+            self.command_interval_s,
+            self.stream_goal_velocity_stale_cycles,
+            self.stream_goal_velocity_max_hold_s,
+        )
         self.last_command_effort = np.zeros(self.ARM_DOF, dtype=np.float64)
         self.last_effort_limited = np.zeros(self.ARM_DOF, dtype=bool)
         self.last_motor_status = np.zeros(self.ARM_DOF, dtype=np.int64)
@@ -1992,6 +2308,11 @@ class B601PalmFollower:
         self.last_semantic_clearance_scale = 1.0
         self.semantic_planar_command_m = np.zeros(2, dtype=np.float64)
         self.semantic_planar_command_velocity_m_s = np.zeros(2, dtype=np.float64)
+        self.semantic_planar_joint_velocity_rad_s = np.zeros(3, dtype=np.float64)
+        self.semantic_planar_task_error_vector_m = np.zeros(4, dtype=np.float64)
+        self.semantic_planar_backpressure = 1.0
+        self.semantic_clearance_gate = 0.0
+        self.last_semantic_raw_clearance_gate = 0.0
         self.last_semantic_planar_command_time = 0.0
         self.semantic_motion_target_m = np.zeros(3, dtype=np.float64)
         self.semantic_motion_active_direction = np.zeros(3, dtype=np.int8)
@@ -2261,6 +2582,8 @@ class B601PalmFollower:
                         stream_velocity_limit = self.stream_max_velocity.copy()
                         stream_acceleration_limit = self.stream_max_acceleration.copy()
                         goal_velocity = np.zeros(self.ARM_DOF, dtype=np.float64)
+                        stream_correction_gain = None
+                        stream_correction_limit = None
                         if self.control_mode == "semantic_joint":
                             outer_velocity_limit = (
                                 self._semantic_outer_joint_velocity_limits()
@@ -2272,12 +2595,24 @@ class B601PalmFollower:
                                 outer_velocity_limit,
                                 self.stream_outer_velocity_scale,
                             )
+                            stream_correction_gain = (
+                                self.stream_position_correction_gain_s
+                            )
+                            stream_correction_limit = (
+                                self.stream_position_correction_max_fraction
+                                * stream_velocity_limit
+                            )
                             goal_age = time.monotonic() - self.target_q_update_time
+                            goal_hold_s = adaptive_goal_velocity_hold_s(
+                                self.command_interval_s,
+                                self.target_q_update_period_s,
+                                self.stream_goal_velocity_stale_cycles,
+                                self.stream_goal_velocity_max_hold_s,
+                            )
+                            self.last_goal_velocity_hold_s = goal_hold_s
                             if (
                                 self.target_q_update_time > 0.0
-                                and goal_age
-                                <= self.stream_goal_velocity_stale_cycles
-                                * self.command_interval_s
+                                and goal_age <= goal_hold_s
                             ):
                                 goal_velocity = np.clip(
                                     self.target_q_velocity,
@@ -2298,6 +2633,8 @@ class B601PalmFollower:
                             self.stream_max_jerk,
                             trajectory_dt,
                             requested_velocity=goal_velocity,
+                            position_correction_gain_s=stream_correction_gain,
+                            position_correction_max_velocity=stream_correction_limit,
                         )
                     self.stream_target_q = stream_q
                     self.stream_target_velocity = stream_velocity
@@ -2470,6 +2807,18 @@ class B601PalmFollower:
     def _reset_semantic_smoothing(self, now_s: float = 0.0) -> None:
         self.semantic_planar_command_m.fill(0.0)
         self.semantic_planar_command_velocity_m_s.fill(0.0)
+        self.semantic_planar_joint_velocity_rad_s.fill(0.0)
+        self.semantic_planar_task_error_vector_m.fill(0.0)
+        self.semantic_planar_backpressure = 1.0
+        self.semantic_clearance_gate = 0.0
+        self.last_semantic_raw_clearance_gate = 0.0
+        self.target_q_update_period_s = self.command_interval_s
+        self.last_goal_velocity_hold_s = adaptive_goal_velocity_hold_s(
+            self.command_interval_s,
+            self.command_interval_s,
+            self.stream_goal_velocity_stale_cycles,
+            self.stream_goal_velocity_max_hold_s,
+        )
         self.last_semantic_planar_command_time = float(now_s)
         self.semantic_motion_target_m.fill(0.0)
         self.semantic_motion_active_direction.fill(0)
@@ -2757,11 +3106,26 @@ class B601PalmFollower:
         # wrist twist remain safety-gated until the measured arm clears the
         # tabletop; their vision signals do not otherwise depend on the planar
         # J2/J3/J4 solver.
-        forward_gate = clearance_fraction**2 * (3.0 - 2.0 * clearance_fraction)
-        self.last_semantic_forward_gate = forward_gate
-        articulation_ready = (
-            clearance_fraction >= 1.0 - 1e-6
+        raw_forward_gate = clearance_fraction**2 * (
+            3.0 - 2.0 * clearance_fraction
         )
+        forward_gate = rate_limited_unit_interval(
+            raw_forward_gate,
+            self.semantic_clearance_gate,
+            self.semantic_clearance_gate_rates[0],
+            self.semantic_clearance_gate_rates[1],
+            target_dt,
+            self.semantic_clearance_gate_deadband,
+        )
+        # Hysteresis must never delay a near-table lockout. The rate limit is
+        # used only away from the final safety boundary; the modeled table
+        # projection below remains the independent fail-closed guard.
+        if clearance_fraction <= 0.10 and raw_forward_gate < forward_gate:
+            forward_gate = raw_forward_gate
+        self.last_semantic_raw_clearance_gate = raw_forward_gate
+        self.semantic_clearance_gate = forward_gate
+        self.last_semantic_forward_gate = forward_gate
+        articulation_ready = forward_gate >= 0.95
         # Arm J6 only after the links have reached near-full clearance, then
         # capture a fresh twist zero.  Lifting the palm from the table changes
         # the human arm plane considerably and must not be mistaken for a
@@ -2858,12 +3222,22 @@ class B601PalmFollower:
         else:
             direct_offsets[5] = 0.0
         self.semantic_j6_command_offset_rad = float(direct_offsets[5])
-        direct_offsets[0] *= forward_gate
         direct_offsets[5] *= float(self.semantic_j6_clearance_enabled)
         q_reference = self.semantic_control_reference_q
+        with self.target_lock:
+            previous_target = (
+                q_seed.copy()
+                if self.target_q is None
+                else self.target_q.copy()
+            )
+        direct_offsets[0] = gate_outward_scalar_increment(
+            direct_offsets[0],
+            previous_target[0] - q_reference[0],
+            forward_gate,
+        )
         q_base = q_reference + direct_offsets
         requested_forward_target = (
-            forward * forward_gate
+            forward
             if self.semantic_channel_enable[1] > 0.5
             else 0.0
         )
@@ -2881,71 +3255,92 @@ class B601PalmFollower:
                 )
             )
         )
-        planar_command, planar_velocity = acceleration_limited_vector_target(
-            [requested_forward_target, requested_lift_target],
-            self.semantic_planar_command_m,
-            self.semantic_planar_command_velocity_m_s,
-            self.semantic_planar_command_max_velocity,
-            self.semantic_planar_command_max_acceleration,
-            self.semantic_planar_command_deadband,
+        candidate_planar_command, _candidate_planar_velocity = (
+            acceleration_limited_vector_target(
+                [requested_forward_target, requested_lift_target],
+                self.semantic_planar_command_m,
+                self.semantic_planar_command_velocity_m_s,
+                self.semantic_planar_command_max_velocity,
+                self.semantic_planar_command_max_acceleration,
+                self.semantic_planar_command_deadband,
+                planar_dt,
+            )
+        )
+        candidate_planar_command[0] = gate_outward_scalar_increment(
+            candidate_planar_command[0],
+            self.semantic_planar_command_m[0],
+            forward_gate,
+        )
+        planar_increment = candidate_planar_command - self.semantic_planar_command_m
+        task_increment = np.concatenate(
+            (
+                [planar_increment[0]],
+                self.semantic_vertical_height_profile * planar_increment[1],
+            )
+        )
+        task_tracking_limit = np.asarray(
+            [
+                self.semantic_planar_tracking_error[0],
+                *([self.semantic_planar_tracking_error[1]] * 3),
+            ],
+            dtype=np.float64,
+        )
+        raw_backpressure = task_space_backpressure(
+            self.semantic_planar_task_error_vector_m,
+            task_increment,
+            task_tracking_limit,
+            self.semantic_planar_backpressure_start_fraction,
+        )
+        planar_backpressure = rate_limited_unit_interval(
+            raw_backpressure,
+            self.semantic_planar_backpressure,
+            self.semantic_planar_backpressure_rates[0],
+            self.semantic_planar_backpressure_rates[1],
             planar_dt,
         )
+        planar_command = (
+            self.semantic_planar_command_m
+            + planar_backpressure * planar_increment
+        )
+        planar_velocity = (
+            planar_command - self.semantic_planar_command_m
+        ) / planar_dt
         forward_target = float(planar_command[0])
         lift_target = float(planar_command[1])
-        if abs(forward_target) > 0.0 or lift_target > 0.0:
-            q_desired = self._apply_semantic_planar(
-                q_base,
-                forward_target,
-                lift_target,
-            )
-        else:
-            q_desired = q_base
-            self.last_semantic_vertical_error_m = 0.0
-            self.last_semantic_planar_error_m.fill(0.0)
-
-        lower, upper = joint_tracking_bounds(
-            self._joint_lower,
-            self._joint_upper,
-            self.joint_limit_margin_rad,
-            self.startup_joint_reference,
-        )
-        q_desired = np.clip(
+        (
             q_desired,
-            q_reference - self.semantic_max_joint_offset,
-            q_reference + self.semantic_max_joint_offset,
+            requested_planar_joint_velocity,
+            next_planar_task_error,
+        ) = self._resolve_semantic_planar_rate(
+            q_base,
+            q_seed,
+            previous_target,
+            forward_target,
+            lift_target,
+            planar_velocity,
+            forward_gate,
+            planar_dt,
         )
-        q_desired = np.clip(q_desired, lower, upper)
-        with self.target_lock:
-            previous_target = (
-                q_seed.copy()
-                if self.target_q is None
-                else self.target_q.copy()
-            )
+        resolved_max_step = self.semantic_max_step.copy()
+        planar_indices = np.asarray([1, 2, 3], dtype=np.int64)
+        resolved_max_step[planar_indices] = (
+            self._semantic_outer_joint_velocity_limits()[planar_indices]
+            * planar_dt
+        )
         q_target = ramp_joint_target_with_tracking_window(
             q_desired,
             q_seed,
             previous_target,
-            self.semantic_max_step,
+            resolved_max_step,
             self.semantic_max_tracking_error,
             coordinated_indices=(1, 2, 3),
         )
-        if not articulation_ready and lift_target > 0.0:
-            (
-                q_target,
-                self.last_semantic_vertical_primary_progress,
-                self.last_semantic_vertical_follower_limit,
-            ) = synchronize_vertical_follower_progress(
-                q_reference,
-                q_desired,
-                q_seed,
-                q_target,
-                self.semantic_vertical_primary_joint,
-                self.semantic_vertical_follower_indices,
-                self.semantic_vertical_follower_progress_lead,
-            )
-        else:
-            self.last_semantic_vertical_primary_progress = 1.0
-            self.last_semantic_vertical_follower_limit = 1.0
+        self.last_semantic_vertical_primary_progress = clearance_fraction
+        self.last_semantic_vertical_follower_limit = (
+            self.semantic_planar_follower_min_mobility_scale
+            + (1.0 - self.semantic_planar_follower_min_mobility_scale)
+            * forward_gate
+        )
         j1_target, j1_velocity = acceleration_limited_scalar_target(
             float(q_target[0]),
             float(previous_target[0]),
@@ -2956,36 +3351,6 @@ class B601PalmFollower:
             target_dt,
         )
         q_target[0] = j1_target
-        j4_target, j4_velocity = acceleration_limited_scalar_target(
-            float(q_target[3]),
-            float(previous_target[3]),
-            self.semantic_j4_target_velocity,
-            self.semantic_j4_target_max_velocity,
-            self.semantic_j4_target_max_acceleration,
-            self.semantic_j4_target_deadband,
-            target_dt,
-        )
-        # J4 is part of the same planar IK solution as J2/J3.  If its
-        # anti-jitter limiter slows this update, scale the full group by the
-        # same progress so the end effector does not move in a distorted or
-        # temporarily opposite direction.
-        planar_indices = np.asarray([1, 2, 3], dtype=np.int64)
-        planar_step = q_target[planar_indices] - previous_target[planar_indices]
-        requested_j4_step = float(planar_step[2])
-        if abs(requested_j4_step) > 1e-12:
-            coordinated_progress = float(
-                np.clip(
-                    (j4_target - previous_target[3]) / requested_j4_step,
-                    0.0,
-                    1.0,
-                )
-            )
-            q_target[planar_indices] = (
-                previous_target[planar_indices]
-                + coordinated_progress * planar_step
-            )
-        else:
-            q_target[3] = j4_target
         j6_target, j6_velocity = acceleration_limited_scalar_target(
             float(q_target[5]),
             float(previous_target[5]),
@@ -3002,10 +3367,18 @@ class B601PalmFollower:
         )
         self.last_semantic_clearance_scale = clearance_scale
         if clearance_scale < 1.0:
+            planar_command = (
+                self.semantic_planar_command_m
+                + clearance_scale
+                * (planar_command - self.semantic_planar_command_m)
+            )
             planar_velocity = planar_velocity * clearance_scale
             j1_velocity *= clearance_scale
-            j4_velocity *= clearance_scale
             j6_velocity *= clearance_scale
+        accepted_planar_joint_velocity = (
+            q_target[planar_indices] - previous_target[planar_indices]
+        ) / planar_dt
+        j4_velocity = float(accepted_planar_joint_velocity[2])
         if clearance_scale < 1.0 and now - self.last_semantic_log_time >= 1.0:
             self.logger.warn(
                 "Clamped B601 semantic target at the validated table-height "
@@ -3025,6 +3398,8 @@ class B601PalmFollower:
             with self.target_lock:
                 self.target_q_velocity.fill(0.0)
                 self.target_q_update_time = 0.0
+            self.semantic_planar_joint_velocity_rad_s.fill(0.0)
+            self.semantic_planar_command_velocity_m_s.fill(0.0)
             return self.last_arm_offset
         if not self._joint_target_is_safe(q_target, q_seed):
             self.last_semantic_planar_command_time = now
@@ -3032,6 +3407,7 @@ class B601PalmFollower:
             self.semantic_j1_target_velocity = 0.0
             self.semantic_j4_target_velocity = 0.0
             self.semantic_j6_target_velocity = 0.0
+            self.semantic_planar_joint_velocity_rad_s.fill(0.0)
             with self.target_lock:
                 self.target_q_velocity.fill(0.0)
                 self.target_q_update_time = 0.0
@@ -3039,7 +3415,29 @@ class B601PalmFollower:
 
         outer_velocity_limit = self._semantic_outer_joint_velocity_limits()
         with self.target_lock:
-            self.target_q_velocity = filtered_goal_velocity(
+            if self.target_q_update_time > 0.0:
+                observed_period = now - self.target_q_update_time
+                if (
+                    np.isfinite(observed_period)
+                    and 0.5 * self.command_interval_s
+                    <= observed_period
+                    <= 2.0 * self.stream_goal_velocity_max_hold_s
+                ):
+                    alpha = self.stream_goal_period_filter_alpha
+                    bounded_period = min(
+                        observed_period,
+                        self.stream_goal_velocity_max_hold_s / 1.5,
+                    )
+                    if bounded_period > self.target_q_update_period_s:
+                        # Adapt immediately when vision is slower so velocity
+                        # feed-forward does not expire between the next frames.
+                        self.target_q_update_period_s = bounded_period
+                    else:
+                        self.target_q_update_period_s = (
+                            alpha * bounded_period
+                            + (1.0 - alpha) * self.target_q_update_period_s
+                        )
+            next_goal_velocity = filtered_goal_velocity(
                 q_target,
                 previous_target,
                 self.target_q_velocity,
@@ -3048,10 +3446,17 @@ class B601PalmFollower:
                 target_dt,
                 coordinated_indices=(1, 2, 3),
             )
+            next_goal_velocity[planar_indices] = accepted_planar_joint_velocity
+            self.target_q_velocity = next_goal_velocity
             self.target_q = q_target.copy()
             self.target_q_update_time = now
         self.semantic_planar_command_m = planar_command
         self.semantic_planar_command_velocity_m_s = planar_velocity
+        self.semantic_planar_joint_velocity_rad_s = (
+            accepted_planar_joint_velocity.copy()
+        )
+        self.semantic_planar_task_error_vector_m = next_planar_task_error.copy()
+        self.semantic_planar_backpressure = planar_backpressure
         self.last_semantic_planar_command_time = now
         self.semantic_motion_target_m = stable_motion_target
         self.semantic_motion_active_direction = next_motion_active_direction
@@ -3081,8 +3486,12 @@ class B601PalmFollower:
                 f"raw_motion={raw_motion_target.round(4).tolist()}m, "
                 f"lateral={lateral:+.4f}m, "
                 f"forward={forward:+.4f}m, planar_forward={forward_target:+.4f}m, "
-                f"lift={lift_target:+.4f}m, forward_gate={forward_gate:.2f}, "
+                f"lift={lift_target:+.4f}m, "
+                f"forward_gate={forward_gate:.2f}/{raw_forward_gate:.2f}, "
+                f"backpressure={planar_backpressure:.2f}/{raw_backpressure:.2f}, "
                 f"planar_velocity={planar_velocity.round(4).tolist()}m/s, "
+                f"resolved_qdot={accepted_planar_joint_velocity.round(4).tolist()}rad/s, "
+                f"requested_qdot={requested_planar_joint_velocity.round(4).tolist()}rad/s, "
                 f"reverse_pending={next_motion_candidate_direction.tolist()}/"
                 f"{next_motion_candidate_count.tolist()}, "
                 f"tcp_lift={tcp_lift:+.4f}m, "
@@ -3091,13 +3500,15 @@ class B601PalmFollower:
                 f"height={self.last_semantic_planar_error_m[1]:+.4f}]m, "
                 f"actual_error=[forward={actual_planar_error[0]:+.4f}, "
                 f"height={actual_planar_error[1]:+.4f}]m, "
-                f"J3_progress={self.last_semantic_vertical_primary_progress:.2f}, "
-                f"follower_limit={self.last_semantic_vertical_follower_limit:.2f}, "
+                f"clearance_fraction={self.last_semantic_vertical_primary_progress:.2f}, "
+                f"follower_mobility={self.last_semantic_vertical_follower_limit:.2f}, "
                 f"clearance_scale={self.last_semantic_clearance_scale:.3f}, "
                 f"J1_target_velocity={self.semantic_j1_target_velocity:+.4f}rad/s, "
                 f"J4_target_velocity={self.semantic_j4_target_velocity:+.4f}rad/s, "
                 f"J6_target_velocity={self.semantic_j6_target_velocity:+.4f}rad/s, "
                 f"goal_velocity={self.target_q_velocity.round(4).tolist()}rad/s, "
+                f"goal_period={self.target_q_update_period_s:.3f}s, "
+                f"goal_hold={self.last_goal_velocity_hold_s:.3f}s, "
                 f"stream_velocity={self.stream_target_velocity.round(4).tolist()}rad/s, "
                 f"articulation={'ready' if articulation_ready else 'locked'}, "
                 f"J6_clearance={'armed' if self.semantic_j6_clearance_enabled else 'locked'}, "
@@ -3124,6 +3535,198 @@ class B601PalmFollower:
             )
             self.last_semantic_log_time = now
         return self.last_arm_offset
+
+    def _resolve_semantic_planar_rate(
+        self,
+        q_base: np.ndarray,
+        q_measured: np.ndarray,
+        previous_target: np.ndarray,
+        forward_m: float,
+        lift_m: float,
+        planar_velocity_m_s: np.ndarray,
+        clearance_gate: float,
+        dt_s: float,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Resolve a continuous J2/J3/J4 velocity from the planar task.
+
+        The old absolute IK path produced a distant ``q_desired`` and then
+        chased it through a per-frame ramp.  Here the task error and task
+        feed-forward velocity are resolved at measured feedback, acceleration
+        limited as one coordinated joint vector, and integrated only for this
+        outer-loop interval.
+        """
+
+        q_base = np.asarray(q_base, dtype=np.float64).copy()
+        q_measured = np.asarray(q_measured, dtype=np.float64).copy()
+        previous_target = np.asarray(previous_target, dtype=np.float64).copy()
+        task_velocity = np.asarray(planar_velocity_m_s, dtype=np.float64).reshape(2)
+        dt = float(dt_s)
+        columns = np.flatnonzero(self.semantic_vertical_joint_mask > 0.5)
+        q_request = previous_target.copy()
+        direct_columns = np.setdiff1d(
+            np.arange(self.ARM_DOF, dtype=np.int64), columns
+        )
+        q_request[direct_columns] = q_base[direct_columns]
+
+        base_positions = self._frame_positions(q_base)
+        base_tcp = base_positions[self._end_frame_id]
+        try:
+            forward_axis, base_forward = horizontal_radial_axis(base_tcp)
+        except ValueError:
+            self.logger.warn(
+                "B601 TCP is too close to the base axis for resolved-rate control; holding"
+            )
+            return q_request, np.zeros(columns.size), np.zeros(4)
+
+        q_model = self._pad_q_for_model(self._model, q_measured, self.ARM_DOF)
+        self._pin.forwardKinematics(self._model, self._kinematics_data, q_model)
+        self._pin.updateFramePlacements(self._model, self._kinematics_data)
+        current_tcp = np.asarray(
+            self._kinematics_data.oMf[self._end_frame_id].translation,
+            dtype=np.float64,
+        )
+        current_heights = np.asarray(
+            [
+                float(self._kinematics_data.oMf[frame_id].translation[2])
+                for frame_id in self._articulation_clearance_frame_ids
+            ],
+            dtype=np.float64,
+        )
+        target_forward = base_forward + float(forward_m)
+        target_heights = (
+            base_positions[self._articulation_clearance_frame_ids, 2]
+            + self.semantic_vertical_height_profile * float(lift_m)
+        )
+        task_error = np.concatenate(
+            (
+                [
+                    target_forward
+                    - float(np.dot(current_tcp[:2], forward_axis))
+                ],
+                target_heights - current_heights,
+            )
+        )
+
+        height_rows = []
+        end_jacobian = None
+        for frame_id in self._articulation_clearance_frame_ids:
+            jacobian = self._pin.computeFrameJacobian(
+                self._model,
+                self._kinematics_data,
+                q_model,
+                int(frame_id),
+                self._pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
+            )
+            height_rows.append(jacobian[2, columns])
+            if int(frame_id) == self._end_frame_id:
+                end_jacobian = jacobian[:, columns]
+        if end_jacobian is None:
+            raise RuntimeError("B601 resolved-rate task is missing the TCP frame")
+        forward_row = (
+            forward_axis[0] * end_jacobian[0, :]
+            + forward_axis[1] * end_jacobian[1, :]
+        )
+        position_task = np.vstack(
+            (forward_row, np.asarray(height_rows, dtype=np.float64))
+        )
+        weighted_position_task = (
+            self.semantic_planar_task_weights[:, None] * position_task
+        )
+        task = np.vstack(
+            (
+                weighted_position_task,
+                self.semantic_vertical_orientation_weight
+                * end_jacobian[3:6, :],
+            )
+        )
+
+        error_gain = np.asarray(
+            [
+                self.semantic_planar_task_error_gain[0],
+                *([self.semantic_planar_task_error_gain[1]] * 3),
+            ],
+            dtype=np.float64,
+        )
+        correction_limit = np.asarray(
+            [
+                self.semantic_planar_task_correction_max_velocity[0],
+                *(
+                    [self.semantic_planar_task_correction_max_velocity[1]]
+                    * 3
+                ),
+            ],
+            dtype=np.float64,
+        )
+        correction_velocity = np.clip(
+            error_gain * task_error,
+            -correction_limit,
+            correction_limit,
+        )
+        feedforward_velocity = np.concatenate(
+            (
+                [task_velocity[0]],
+                self.semantic_vertical_height_profile * task_velocity[1],
+            )
+        )
+        desired_task_velocity = feedforward_velocity + correction_velocity
+        desired = np.concatenate(
+            (
+                self.semantic_planar_task_weights * desired_task_velocity,
+                np.zeros(3, dtype=np.float64),
+            )
+        )
+
+        mobility = self.semantic_planar_joint_mobility.copy()
+        follower_scale = (
+            self.semantic_planar_follower_min_mobility_scale
+            + (1.0 - self.semantic_planar_follower_min_mobility_scale)
+            * float(np.clip(clearance_gate, 0.0, 1.0))
+        )
+        for local_index, joint_index in enumerate(columns):
+            if int(joint_index) != self.semantic_vertical_primary_joint:
+                mobility[local_index] *= follower_scale
+        try:
+            requested_joint_velocity = weighted_damped_least_squares(
+                task,
+                desired,
+                self.semantic_vertical_damping,
+                mobility,
+            )
+        except np.linalg.LinAlgError:
+            self.logger.warn("B601 resolved-rate planar Jacobian is singular; braking")
+            requested_joint_velocity = np.zeros(columns.size, dtype=np.float64)
+
+        joint_velocity_limit = self._semantic_outer_joint_velocity_limits()[columns]
+        joint_velocity = coordinated_acceleration_limited_velocity(
+            requested_joint_velocity,
+            self.semantic_planar_joint_velocity_rad_s,
+            joint_velocity_limit,
+            self.semantic_planar_joint_max_acceleration,
+            dt,
+        )
+        q_request[columns] = previous_target[columns] + joint_velocity * dt
+        tracking_lower, tracking_upper = joint_tracking_bounds(
+            self._joint_lower,
+            self._joint_upper,
+            self.joint_limit_margin_rad,
+            self.startup_joint_reference,
+        )
+        lower = np.maximum(
+            self.semantic_control_reference_q - self.semantic_max_joint_offset,
+            tracking_lower,
+        )
+        upper = np.minimum(
+            self.semantic_control_reference_q + self.semantic_max_joint_offset,
+            tracking_upper,
+        )
+        q_request = np.clip(q_request, lower, upper)
+        joint_velocity = (q_request[columns] - previous_target[columns]) / dt
+        self.last_semantic_planar_error_m = np.asarray(
+            [float(task_error[0]), float(np.max(np.abs(task_error[1:])))],
+            dtype=np.float64,
+        )
+        self.last_semantic_vertical_error_m = self.last_semantic_planar_error_m[1]
+        return q_request, joint_velocity, task_error
 
     def _apply_semantic_planar(
         self,

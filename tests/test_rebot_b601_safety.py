@@ -6,12 +6,15 @@ from arm_control.rebot_b601 import (
     StartupGuardError,
     acceleration_limited_scalar_target,
     acceleration_limited_vector_target,
+    adaptive_goal_velocity_hold_s,
     apply_tabletop_motion_envelope,
     coupled_stream_velocity_limits,
     confirm_vector_reversals,
     confirm_directional_wrist_twist,
+    coordinated_acceleration_limited_velocity,
     filtered_goal_velocity,
     filtered_wrapped_angle_delta,
+    gate_outward_scalar_increment,
     horizontal_radial_axis,
     jerk_limited_joint_target,
     joint_tracking_bounds,
@@ -19,11 +22,13 @@ from arm_control.rebot_b601 import (
     limit_mit_target_by_effort,
     minimum_jerk_blend,
     ramp_joint_target_with_tracking_window,
+    rate_limited_unit_interval,
     resolve_native_frame_ids,
     scale_vector_to_max_abs,
     send_mit_checked,
     slew_limit_vector,
     synchronize_vertical_follower_progress,
+    task_space_backpressure,
     validate_tabletop_startup,
     weighted_damped_least_squares,
 )
@@ -398,6 +403,18 @@ def test_stream_velocity_caps_follow_the_outer_semantic_rate():
     )
 
 
+def test_goal_velocity_hold_adapts_to_slow_vision_without_exceeding_cap():
+    assert adaptive_goal_velocity_hold_s(0.04, 0.04, 2.0, 0.20) == pytest.approx(
+        0.08
+    )
+    assert adaptive_goal_velocity_hold_s(0.04, 0.10, 2.0, 0.20) == pytest.approx(
+        0.15
+    )
+    assert adaptive_goal_velocity_hold_s(0.04, 0.30, 2.0, 0.20) == pytest.approx(
+        0.20
+    )
+
+
 def test_goal_velocity_preserves_planar_group_shape_and_resets_on_reversal():
     previous = np.zeros(6)
     requested = np.asarray([0.0, 0.0044, -0.0056, 0.0024, 0.0, 0.0])
@@ -471,6 +488,126 @@ def test_high_rate_stream_preloads_velocity_without_overshooting_latest_goal():
         requested_velocity=[0.0],
     )
     assert cold_position[0] < warm_position[0] <= 0.002
+
+
+def test_clearance_gate_has_hysteresis_and_asymmetric_rate_limits():
+    rising = rate_limited_unit_interval(
+        requested=1.0,
+        previous=0.0,
+        rise_rate_s=1.5,
+        fall_rate_s=3.0,
+        dt_s=0.04,
+        deadband=0.03,
+    )
+    held = rate_limited_unit_interval(
+        requested=rising + 0.02,
+        previous=rising,
+        rise_rate_s=1.5,
+        fall_rate_s=3.0,
+        dt_s=0.04,
+        deadband=0.03,
+    )
+    falling = rate_limited_unit_interval(
+        requested=0.0,
+        previous=0.60,
+        rise_rate_s=1.5,
+        fall_rate_s=3.0,
+        dt_s=0.04,
+        deadband=0.03,
+    )
+
+    assert rising == pytest.approx(0.06)
+    assert held == pytest.approx(rising)
+    assert falling == pytest.approx(0.48)
+
+
+def test_clearance_gate_never_creates_motion_opposite_to_operator_target():
+    assert gate_outward_scalar_increment(0.050, 0.020, 0.25) == pytest.approx(
+        0.0275
+    )
+    # A falling clearance gate does not shrink an already accepted command.
+    assert gate_outward_scalar_increment(0.050, 0.050, 0.0) == pytest.approx(
+        0.050
+    )
+    # Returning toward zero and reversing direction are never blocked.
+    assert gate_outward_scalar_increment(0.010, 0.050, 0.0) == pytest.approx(
+        0.010
+    )
+    assert gate_outward_scalar_increment(-0.010, 0.050, 0.0) == pytest.approx(
+        -0.010
+    )
+
+
+def test_task_backpressure_blocks_backlog_growth_but_allows_recovery():
+    mid = task_space_backpressure(
+        signed_error=[0.015, 0.0],
+        requested_increment=[0.002, 0.0],
+        max_tracking_error=[0.020, 0.020],
+        start_fraction=0.50,
+    )
+    blocked = task_space_backpressure(
+        signed_error=[0.025, 0.0],
+        requested_increment=[0.002, 0.0],
+        max_tracking_error=[0.020, 0.020],
+        start_fraction=0.50,
+    )
+    recovery = task_space_backpressure(
+        signed_error=[0.025, 0.0],
+        requested_increment=[-0.002, 0.0],
+        max_tracking_error=[0.020, 0.020],
+        start_fraction=0.50,
+    )
+
+    assert mid == pytest.approx(0.5)
+    assert blocked == pytest.approx(0.0)
+    assert recovery == pytest.approx(1.0)
+
+
+def test_coordinated_velocity_limiter_preserves_joint_ratio():
+    first = coordinated_acceleration_limited_velocity(
+        requested_velocity=[0.10, 0.20, -0.10],
+        previous_velocity=[0.0, 0.0, 0.0],
+        max_velocity=[0.10, 0.20, 0.10],
+        max_acceleration=[0.50, 1.00, 0.50],
+        dt_s=0.10,
+    )
+    second = coordinated_acceleration_limited_velocity(
+        requested_velocity=[0.10, 0.20, -0.10],
+        previous_velocity=first,
+        max_velocity=[0.10, 0.20, 0.10],
+        max_acceleration=[0.50, 1.00, 0.50],
+        dt_s=0.10,
+    )
+
+    np.testing.assert_allclose(first, [0.05, 0.10, -0.05])
+    np.testing.assert_allclose(second, [0.10, 0.20, -0.10])
+
+
+def test_stream_position_correction_substantially_limits_chasing_speed():
+    position = np.zeros(1)
+    velocity = np.zeros(1)
+    acceleration = np.zeros(1)
+    observed_velocity = []
+    for _ in range(500):
+        position, velocity, acceleration = jerk_limited_joint_target(
+            requested=[0.10],
+            previous=position,
+            previous_velocity=velocity,
+            previous_acceleration=acceleration,
+            max_velocity=[0.20],
+            max_acceleration=[1.0],
+            max_jerk=[20.0],
+            dt_s=0.002,
+            requested_velocity=[0.0],
+            position_correction_gain_s=5.0,
+            position_correction_max_velocity=[0.04],
+        )
+        observed_velocity.append(abs(float(velocity[0])))
+
+    # Jerk-limited braking can briefly carry internal velocity past the 0.04
+    # correction request, but it must remain far below the 0.20 hard cap.
+    assert max(observed_velocity) < 0.07
+    assert 0.0 < position[0] < 0.10
 
 
 def test_wrist_twist_filter_wraps_boundary_and_rejects_one_frame_spike():
