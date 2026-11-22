@@ -219,6 +219,11 @@ export HAND_ENGINE='/absolute/path/to/rtmpose_hand.engine'
 该入口固定读取 `config/b601_visible_motion.yaml`，因此不要再用旧的 `run_stage_v2`
 验证这一档参数。下面保留完整展开形式，便于逐项检查或继续调参。
 
+语义目标约以 20 Hz 更新，但电机目标会在 500 Hz MIT 循环中经过速度、加速度和
+jerk 受限的连续插值。反向确认只拦截真正的反向输入，同方向小位移不会再按死区
+分段；到达死区会吸附到请求值而不是保持旧目标。J2/J3/J4 的限幅使用共同进度，
+桌面边界则投影到最大安全运动比例，不再因一个越界候选而丢弃整帧控制状态。
+
 ```bash
 REPO="$HOME/ws/Jetson_Femto_reBot_B601_BrainCo_Demo_RTMPose_TensorRT"
 ENGINE_DIR="$HOME/ws/Jetson_Femto_Realman_Brainco_Demo_RTMPose_TensorRT/models/tensorrt"
@@ -268,6 +273,9 @@ run_b601_semantic_test() {
     -p b601_joint_kp:='[120.0,120.0,180.0,30.0,35.0,30.0]' \
     -p b601_joint_kd:='[8.0,8.0,8.0,4.0,2.0,2.0]' \
     -p b601_joint_effort_limit_nm:='[8.0,10.0,16.0,6.0,4.0,4.0]' \
+    -p b601_stream_max_velocity_rad_s:='[0.25,0.30,0.35,0.15,0.10,0.25]' \
+    -p b601_stream_max_acceleration_rad_s2:='[2.0,2.5,3.0,1.2,0.8,2.0]' \
+    -p b601_stream_max_jerk_rad_s3:='[80.0,100.0,120.0,50.0,30.0,80.0]' \
     -p b601_semantic_max_tracking_error_rad:='[0.012,0.020,0.055,0.018,0.008,0.040]' \
     -p b601_semantic_stall_error_rad:='[0.010,0.015,0.030,0.015,0.010,0.012]' \
     -p b601_semantic_stall_min_progress_rad:=0.0015 \

@@ -11,6 +11,7 @@ from arm_control.rebot_b601 import (
     confirm_directional_wrist_twist,
     filtered_wrapped_angle_delta,
     horizontal_radial_axis,
+    jerk_limited_joint_target,
     joint_tracking_bounds,
     joint_target_safety_violations,
     limit_mit_target_by_effort,
@@ -175,6 +176,23 @@ def test_coordinated_joint_step_scaling_preserves_direction():
     np.testing.assert_allclose(scaled / raw, np.full(3, 0.012 / 0.044))
 
 
+def test_semantic_joint_ramp_preserves_coordinated_planar_direction():
+    target = ramp_joint_target_with_tracking_window(
+        desired_rad=[0.0, 0.20, -0.40, 0.10, 0.0, 0.0],
+        measured_rad=[0.0] * 6,
+        previous_target_rad=[0.0] * 6,
+        max_step_rad=[0.01, 0.02, 0.03, 0.01, 0.01, 0.01],
+        max_tracking_error_rad=[0.50] * 6,
+        coordinated_indices=(1, 2, 3),
+    )
+
+    np.testing.assert_allclose(target[1:4], [0.015, -0.03, 0.0075])
+    np.testing.assert_allclose(
+        target[1:4] / np.array([0.20, -0.40, 0.10]),
+        np.full(3, 0.075),
+    )
+
+
 def test_planar_command_slew_limit_rejects_single_frame_jump():
     limited = slew_limit_vector(
         requested=[0.035, 0.025],
@@ -230,9 +248,10 @@ def test_motion_reversal_requires_consecutive_samples_and_ignores_jitter():
     np.testing.assert_allclose(stable, [-0.05, 0.03, 0.04])
     np.testing.assert_array_equal(active, [-1, 1, 1])
 
-    # One large contradictory depth frame and one small lateral wobble are held.
+    # Same-direction changes smaller than the reversal deadband remain
+    # continuous; the deadband applies only to a direction flip.
     stable, active, candidate, count = confirm_vector_reversals(
-        [0.02, -0.04, 0.037],
+        [-0.052, 0.032, 0.042],
         stable,
         active,
         candidate,
@@ -240,13 +259,26 @@ def test_motion_reversal_requires_consecutive_samples_and_ignores_jitter():
         [0.006, 0.006, 0.005],
         4,
     )
-    np.testing.assert_allclose(stable, [-0.05, 0.03, 0.04])
+    np.testing.assert_allclose(stable, [-0.052, 0.032, 0.042])
+    np.testing.assert_array_equal(candidate, [0, 0, 0])
+
+    # One large contradictory depth frame and one small lateral wobble are held.
+    stable, active, candidate, count = confirm_vector_reversals(
+        [0.02, -0.04, 0.038],
+        stable,
+        active,
+        candidate,
+        count,
+        [0.006, 0.006, 0.005],
+        4,
+    )
+    np.testing.assert_allclose(stable, [-0.052, 0.032, 0.042])
     np.testing.assert_array_equal(candidate, [1, -1, 0])
     np.testing.assert_array_equal(count, [1, 1, 0])
 
     for _ in range(3):
         stable, active, candidate, count = confirm_vector_reversals(
-            [0.02, -0.04, 0.037],
+            [0.02, -0.04, 0.038],
             stable,
             active,
             candidate,
@@ -254,7 +286,7 @@ def test_motion_reversal_requires_consecutive_samples_and_ignores_jitter():
             [0.006, 0.006, 0.005],
             4,
         )
-    np.testing.assert_allclose(stable, [0.02, -0.04, 0.04])
+    np.testing.assert_allclose(stable, [0.02, -0.04, 0.042])
     np.testing.assert_array_equal(active, [1, -1, 1])
 
 
@@ -289,7 +321,7 @@ def test_j4_target_limiter_bounds_velocity_acceleration_and_deadband():
     )
     assert reversed_velocity == pytest.approx(velocity - 0.006)
 
-    held, stopped = acceleration_limited_scalar_target(
+    arrived, stopped = acceleration_limited_scalar_target(
         requested=target + 0.001,
         previous=target,
         previous_velocity=velocity,
@@ -298,8 +330,55 @@ def test_j4_target_limiter_bounds_velocity_acceleration_and_deadband():
         deadband=0.0015,
         dt_s=0.06,
     )
-    assert held == pytest.approx(target)
+    assert arrived == pytest.approx(target + 0.001)
     assert stopped == pytest.approx(0.0)
+
+
+def test_high_rate_joint_stream_is_continuous_and_bounded():
+    position = np.zeros(2)
+    velocity = np.zeros(2)
+    acceleration = np.zeros(2)
+    positions = []
+    accelerations = []
+    dt = 0.002
+    for _ in range(800):
+        position, velocity, acceleration = jerk_limited_joint_target(
+            requested=[0.10, -0.06],
+            previous=position,
+            previous_velocity=velocity,
+            previous_acceleration=acceleration,
+            max_velocity=[0.20, 0.15],
+            max_acceleration=[1.0, 0.8],
+            max_jerk=[20.0, 16.0],
+            dt_s=dt,
+        )
+        positions.append(position.copy())
+        accelerations.append(acceleration.copy())
+
+    positions = np.asarray(positions)
+    accelerations = np.asarray(accelerations)
+    assert np.all(np.diff(positions[:, 0]) >= -1e-12)
+    assert np.all(np.diff(positions[:, 1]) <= 1e-12)
+    assert np.max(np.abs(np.diff(accelerations, axis=0) / dt), axis=0)[0] <= 20.0001
+    assert np.max(np.abs(np.diff(accelerations, axis=0) / dt), axis=0)[1] <= 16.0001
+    np.testing.assert_allclose(position, [0.10, -0.06], atol=1e-6)
+
+
+def test_high_rate_joint_stream_holds_position_while_braking_after_reversal():
+    position, velocity, acceleration = jerk_limited_joint_target(
+        requested=[-0.10],
+        previous=[0.02],
+        previous_velocity=[0.10],
+        previous_acceleration=[0.0],
+        max_velocity=[0.20],
+        max_acceleration=[1.0],
+        max_jerk=[20.0],
+        dt_s=0.002,
+    )
+
+    assert position[0] == pytest.approx(0.02)
+    assert velocity[0] > 0.0
+    assert acceleration[0] < 0.0
 
 
 def test_wrist_twist_filter_wraps_boundary_and_rejects_one_frame_spike():
@@ -535,6 +614,22 @@ def test_table_clearance_allows_monotonic_recovery_from_small_tracking_dip():
         np.array([-0.0015, 0.0]),
         np.array([-0.0020, 0.0]),
     )
+
+
+def test_table_clearance_projection_keeps_largest_safe_motion_fraction():
+    follower = object.__new__(B601PalmFollower)
+    follower._semantic_table_clearance_ok = (
+        lambda current, target: float(np.asarray(target)[0]) <= 0.40
+    )
+
+    projected, fraction = B601PalmFollower._project_semantic_target_to_table_clearance(
+        follower,
+        np.array([0.0, 0.0]),
+        np.array([1.0, 0.5]),
+    )
+
+    assert 0.399 < fraction <= 0.40
+    np.testing.assert_allclose(projected, fraction * np.array([1.0, 0.5]))
 
 
 def test_mit_target_is_clipped_by_total_effort_not_only_feedforward():

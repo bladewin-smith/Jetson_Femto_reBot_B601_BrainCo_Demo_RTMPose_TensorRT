@@ -386,8 +386,15 @@ def ramp_joint_target_with_tracking_window(
     previous_target_rad: Sequence[float],
     max_step_rad: Sequence[float],
     max_tracking_error_rad: Sequence[float],
+    coordinated_indices: Sequence[int] = (),
 ) -> np.ndarray:
-    """Ramp from the prior target while bounding target lead over feedback."""
+    """Ramp from the prior target while bounding target lead over feedback.
+
+    Joints listed in ``coordinated_indices`` share one scale factor for both
+    the target-lead and per-update step limits.  This preserves a multi-joint
+    IK direction instead of independently clipping its components and
+    distorting the end-effector path.
+    """
 
     desired = np.asarray(desired_rad, dtype=np.float64).reshape(-1)
     measured = np.asarray(measured_rad, dtype=np.float64).reshape(-1)
@@ -413,11 +420,66 @@ def ramp_joint_target_with_tracking_window(
         raise ValueError("semantic joint-ramp limits must be positive")
 
     ramped = previous + np.clip(desired - previous, -max_step, max_step)
-    return measured + np.clip(
+    result = measured + np.clip(
         ramped - measured,
         -max_tracking_error,
         max_tracking_error,
     )
+    group = np.asarray(list(coordinated_indices), dtype=np.int64).reshape(-1)
+    if group.size == 0:
+        return result
+    if np.unique(group).size != group.size or np.any(group < 0) or np.any(
+        group >= desired.size
+    ):
+        raise ValueError("coordinated joint indices must be unique and in range")
+
+    desired_lead = desired[group] - measured[group]
+    lead_scale = 1.0
+    nonzero_lead = np.abs(desired_lead) > 1e-12
+    if np.any(nonzero_lead):
+        lead_scale = min(
+            1.0,
+            float(
+                np.min(
+                    max_tracking_error[group][nonzero_lead]
+                    / np.abs(desired_lead[nonzero_lead])
+                )
+            ),
+        )
+    tracked = measured[group] + lead_scale * desired_lead
+    requested_step = tracked - previous[group]
+    step_scale = 1.0
+    nonzero_step = np.abs(requested_step) > 1e-12
+    if np.any(nonzero_step):
+        step_scale = min(
+            1.0,
+            float(
+                np.min(
+                    max_step[group][nonzero_step]
+                    / np.abs(requested_step[nonzero_step])
+                )
+            ),
+        )
+    result[group] = previous[group] + step_scale * requested_step
+
+    # If feedback moved away from the prior target, the step bound alone can
+    # leave the new target outside its tracking window.  Pull the whole group
+    # back toward feedback with one scale rather than clipping joints alone.
+    final_lead = result[group] - measured[group]
+    final_scale = 1.0
+    nonzero_final = np.abs(final_lead) > 1e-12
+    if np.any(nonzero_final):
+        final_scale = min(
+            1.0,
+            float(
+                np.min(
+                    max_tracking_error[group][nonzero_final]
+                    / np.abs(final_lead[nonzero_final])
+                )
+            ),
+        )
+    result[group] = measured[group] + final_scale * final_lead
+    return result
 
 
 def slew_limit_vector(
@@ -524,14 +586,21 @@ def confirm_vector_reversals(
 
     for index in range(target.size):
         delta = float(target[index] - stable[index])
-        direction = 0 if abs(delta) <= deadband[index] else (1 if delta > 0.0 else -1)
-        if direction == 0:
+        if abs(delta) <= 1e-12:
             candidate[index] = 0
             count[index] = 0
             continue
+        direction = 1 if delta > 0.0 else -1
         if active[index] == 0 or direction == active[index]:
+            # The reversal deadband is not a general motion deadband.  Once an
+            # axis is moving, every same-direction update must pass through or
+            # a slowly moving hand becomes a sequence of deadband-sized steps.
             stable[index] = target[index]
             active[index] = direction
+            candidate[index] = 0
+            count[index] = 0
+            continue
+        if abs(delta) <= deadband[index]:
             candidate[index] = 0
             count[index] = 0
             continue
@@ -557,7 +626,13 @@ def acceleration_limited_scalar_target(
     deadband: float,
     dt_s: float,
 ) -> tuple[float, float]:
-    """Return a deadbanded velocity/acceleration-limited scalar target."""
+    """Return a velocity/acceleration-limited scalar target.
+
+    The deadband is an arrival tolerance, not a hold zone.  Snapping the outer
+    target to the requested value on arrival prevents small errors from
+    accumulating until they are released as a visible step.  The 500 Hz joint
+    stream interpolator below still makes the motor setpoint continuous.
+    """
 
     values = np.asarray(
         [
@@ -580,7 +655,7 @@ def acceleration_limited_scalar_target(
 
     error = float(requested - previous)
     if abs(error) <= deadband:
-        return float(previous), 0.0
+        return float(requested), 0.0
     requested_velocity = float(
         np.clip(error / dt_s, -max_velocity, max_velocity)
     )
@@ -599,6 +674,93 @@ def acceleration_limited_scalar_target(
     if step * error > 0.0 and abs(step) >= abs(error):
         return float(requested), 0.0
     return float(previous + step), velocity
+
+
+def jerk_limited_joint_target(
+    requested: Sequence[float],
+    previous: Sequence[float],
+    previous_velocity: Sequence[float],
+    previous_acceleration: Sequence[float],
+    max_velocity: Sequence[float],
+    max_acceleration: Sequence[float],
+    max_jerk: Sequence[float],
+    dt_s: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Advance a continuous joint setpoint with velocity, acceleration and jerk bounds."""
+
+    vectors = [
+        np.asarray(value, dtype=np.float64).reshape(-1)
+        for value in (
+            requested,
+            previous,
+            previous_velocity,
+            previous_acceleration,
+            max_velocity,
+            max_acceleration,
+            max_jerk,
+        )
+    ]
+    if not all(value.shape == vectors[0].shape for value in vectors[1:]):
+        raise ValueError("joint-stream vectors must have matching shapes")
+    if not all(np.all(np.isfinite(value)) for value in vectors):
+        raise ValueError("joint-stream vectors must contain finite values")
+    dt = float(dt_s)
+    if not np.isfinite(dt) or dt <= 0.0:
+        raise ValueError("joint-stream dt must be positive and finite")
+    if any(np.any(value <= 0.0) for value in vectors[4:]):
+        raise ValueError("joint-stream velocity, acceleration and jerk limits must be positive")
+
+    goal, position, velocity, acceleration, velocity_limit, acceleration_limit, jerk_limit = vectors
+    error = goal - position
+    # A stopping-distance velocity target avoids racing into a nearby goal.
+    desired_speed = np.minimum(
+        velocity_limit,
+        np.sqrt(2.0 * acceleration_limit * np.abs(error)),
+    )
+    desired_velocity = np.sign(error) * desired_speed
+    desired_acceleration = np.clip(
+        (desired_velocity - velocity) / dt,
+        -acceleration_limit,
+        acceleration_limit,
+    )
+    acceleration_step = np.clip(
+        desired_acceleration - acceleration,
+        -jerk_limit * dt,
+        jerk_limit * dt,
+    )
+    next_acceleration = np.clip(
+        acceleration + acceleration_step,
+        -acceleration_limit,
+        acceleration_limit,
+    )
+    next_velocity = np.clip(
+        velocity + next_acceleration * dt,
+        -velocity_limit,
+        velocity_limit,
+    )
+    step = 0.5 * (velocity + next_velocity) * dt
+    next_position = position + step
+
+    # A setpoint generator has no physical inertia to honour.  During a goal
+    # reversal, decelerate its internal velocity without deliberately sending
+    # a position farther away from the new goal.
+    moving_away = step * error < 0.0
+    next_position[moving_away] = position[moving_away]
+    at_goal = np.abs(error) <= 1e-10
+    next_position[at_goal] = goal[at_goal]
+    arrived = np.logical_and(step * error > 0.0, np.abs(step) >= np.abs(error))
+    next_position[arrived] = goal[arrived]
+    stationary = np.logical_and.reduce(
+        (
+            at_goal,
+            np.abs(velocity) <= 1e-8,
+            np.abs(acceleration) <= 1e-6,
+        )
+    )
+    next_position[stationary] = goal[stationary]
+    next_velocity[stationary] = 0.0
+    next_acceleration[stationary] = 0.0
+    return next_position, next_velocity, next_acceleration
 
 
 def filtered_wrapped_angle_delta(
@@ -928,6 +1090,35 @@ class B601PalmFollower:
             raise ValueError("b601_joint_limit_margin_rad must be finite and non-negative")
         self.control_rate_hz = float(
             node.declare_parameter("b601_control_rate_hz", 500.0).value
+        )
+        if not np.isfinite(self.control_rate_hz) or self.control_rate_hz <= 0.0:
+            raise ValueError("b601_control_rate_hz must be positive and finite")
+        # These high-rate limits shape the setpoint sent on every MotorBridge
+        # cycle.  Semantic J1/J4/J6 limits below remain authoritative when they
+        # are lower, preserving existing launch-command tuning.
+        self.stream_max_velocity = _positive_vector(
+            node.declare_parameter(
+                "b601_stream_max_velocity_rad_s",
+                [0.25, 0.30, 0.35, 0.15, 0.10, 0.25],
+            ).value,
+            self.ARM_DOF,
+            "b601_stream_max_velocity_rad_s",
+        )
+        self.stream_max_acceleration = _positive_vector(
+            node.declare_parameter(
+                "b601_stream_max_acceleration_rad_s2",
+                [2.0, 2.5, 3.0, 1.2, 0.8, 2.0],
+            ).value,
+            self.ARM_DOF,
+            "b601_stream_max_acceleration_rad_s2",
+        )
+        self.stream_max_jerk = _positive_vector(
+            node.declare_parameter(
+                "b601_stream_max_jerk_rad_s3",
+                [80.0, 100.0, 120.0, 50.0, 30.0, 80.0],
+            ).value,
+            self.ARM_DOF,
+            "b601_stream_max_jerk_rad_s3",
         )
 
         self.auto_home_on_start = bool(
@@ -1588,6 +1779,9 @@ class B601PalmFollower:
         self.last_measured_tau = np.zeros(self.ARM_DOF, dtype=np.float64)
         self.last_gravity_tau = np.zeros(self.ARM_DOF, dtype=np.float64)
         self.last_sent_target_q = np.zeros(self.ARM_DOF, dtype=np.float64)
+        self.stream_target_q = None
+        self.stream_target_velocity = np.zeros(self.ARM_DOF, dtype=np.float64)
+        self.stream_target_acceleration = np.zeros(self.ARM_DOF, dtype=np.float64)
         self.last_command_effort = np.zeros(self.ARM_DOF, dtype=np.float64)
         self.last_effort_limited = np.zeros(self.ARM_DOF, dtype=bool)
         self.last_motor_status = np.zeros(self.ARM_DOF, dtype=np.int64)
@@ -1614,6 +1808,7 @@ class B601PalmFollower:
         self.last_semantic_vertical_error_m = 0.0
         self.last_semantic_planar_error_m = np.zeros(2, dtype=np.float64)
         self.last_semantic_forward_gate = 0.0
+        self.last_semantic_clearance_scale = 1.0
         self.semantic_planar_command_m = np.zeros(2, dtype=np.float64)
         self.semantic_planar_command_velocity_m_s = np.zeros(2, dtype=np.float64)
         self.last_semantic_planar_command_time = 0.0
@@ -1760,6 +1955,9 @@ class B601PalmFollower:
             self._set_reference_from_q(q)
             self.table_frame_heights = self._frame_heights(q)
             self.target_q = q.copy()
+            self.stream_target_q = q.copy()
+            self.stream_target_velocity.fill(0.0)
+            self.stream_target_acceleration.fill(0.0)
             self.last_measured_q = q.copy()
             self.last_measured_dq = dq.copy()
 
@@ -1811,7 +2009,6 @@ class B601PalmFollower:
         )
 
     def _control_loop(self, robot: Any, dt: float) -> None:
-        del dt
         try:
             with self.sdk_lock:
                 q = np.asarray(robot.arm.get_positions(), dtype=np.float64)[: self.ARM_DOF]
@@ -1848,8 +2045,46 @@ class B601PalmFollower:
                     [float(getattr(state, "torq", 0.0)) for state in states],
                     dtype=np.float64,
                 )
+                nominal_dt = 1.0 / self.control_rate_hz
+                trajectory_dt = (
+                    nominal_dt
+                    if not np.isfinite(dt) or float(dt) <= 0.0
+                    else float(np.clip(float(dt), 0.25 * nominal_dt, 2.0 * nominal_dt))
+                )
                 with self.target_lock:
-                    target_q = q.copy() if self.target_q is None else self.target_q.copy()
+                    goal_q = q.copy() if self.target_q is None else self.target_q.copy()
+                    if self.stream_target_q is None:
+                        self.stream_target_q = q.copy()
+                        self.stream_target_velocity.fill(0.0)
+                        self.stream_target_acceleration.fill(0.0)
+                    if self.home_motion_active:
+                        # Table-home already supplies a verified minimum-jerk
+                        # path.  Do not stack a second trajectory on it or its
+                        # final verification can time out behind the command.
+                        stream_q = goal_q
+                        stream_velocity = np.zeros(self.ARM_DOF, dtype=np.float64)
+                        stream_acceleration = np.zeros(self.ARM_DOF, dtype=np.float64)
+                    else:
+                        stream_velocity_limit = self.stream_max_velocity.copy()
+                        stream_acceleration_limit = self.stream_max_acceleration.copy()
+                        (
+                            stream_q,
+                            stream_velocity,
+                            stream_acceleration,
+                        ) = jerk_limited_joint_target(
+                            goal_q,
+                            self.stream_target_q,
+                            self.stream_target_velocity,
+                            self.stream_target_acceleration,
+                            stream_velocity_limit,
+                            stream_acceleration_limit,
+                            self.stream_max_jerk,
+                            trajectory_dt,
+                        )
+                    self.stream_target_q = stream_q
+                    self.stream_target_velocity = stream_velocity
+                    self.stream_target_acceleration = stream_acceleration
+                    target_q = stream_q.copy()
                 tau = self._gravity_torque(q)
                 sent_target_q, command_effort, effort_limited = limit_mit_target_by_effort(
                     q,
@@ -1944,6 +2179,9 @@ class B601PalmFollower:
         )
         with self.target_lock:
             self.target_q = np.asarray(q, dtype=np.float64).copy()
+            self.stream_target_q = np.asarray(q, dtype=np.float64).copy()
+            self.stream_target_velocity.fill(0.0)
+            self.stream_target_acceleration.fill(0.0)
         self.logger.error(
             "B601 actuation watchdog stopped this tracking cycle; holding the "
             f"measured pose. {self.semantic_actuation_fault}. Press 's' only after "
@@ -2038,6 +2276,9 @@ class B601PalmFollower:
             return False
         with self.target_lock:
             self.target_q = q.copy()
+            self.stream_target_q = q.copy()
+            self.stream_target_velocity.fill(0.0)
+            self.stream_target_acceleration.fill(0.0)
         self._set_reference_from_q(q)
         self.semantic_control_reference_q = q.copy()
         self.semantic_reference_frame_heights = self._frame_heights(q)
@@ -2071,6 +2312,9 @@ class B601PalmFollower:
         if q is not None:
             with self.target_lock:
                 self.target_q = q.copy()
+                self.stream_target_q = q.copy()
+                self.stream_target_velocity.fill(0.0)
+                self.stream_target_acceleration.fill(0.0)
         self.last_target_pose = None
         self.last_submit_time = 0.0
         self.semantic_control_side = None
@@ -2196,6 +2440,9 @@ class B601PalmFollower:
         ):
             with self.target_lock:
                 self.target_q = q_seed.copy()
+                self.stream_target_q = q_seed.copy()
+                self.stream_target_velocity.fill(0.0)
+                self.stream_target_acceleration.fill(0.0)
             self._reset_semantic_smoothing(now)
             self._reset_filters()
             if now - self.last_semantic_log_time >= 1.0:
@@ -2427,6 +2674,7 @@ class B601PalmFollower:
             previous_target,
             self.semantic_max_step,
             self.semantic_max_tracking_error,
+            coordinated_indices=(1, 2, 3),
         )
         if not articulation_ready and lift_target > 0.0:
             (
@@ -2469,7 +2717,27 @@ class B601PalmFollower:
             self.semantic_j4_target_deadband,
             target_dt,
         )
-        q_target[3] = j4_target
+        # J4 is part of the same planar IK solution as J2/J3.  If its
+        # anti-jitter limiter slows this update, scale the full group by the
+        # same progress so the end effector does not move in a distorted or
+        # temporarily opposite direction.
+        planar_indices = np.asarray([1, 2, 3], dtype=np.int64)
+        planar_step = q_target[planar_indices] - previous_target[planar_indices]
+        requested_j4_step = float(planar_step[2])
+        if abs(requested_j4_step) > 1e-12:
+            coordinated_progress = float(
+                np.clip(
+                    (j4_target - previous_target[3]) / requested_j4_step,
+                    0.0,
+                    1.0,
+                )
+            )
+            q_target[planar_indices] = (
+                previous_target[planar_indices]
+                + coordinated_progress * planar_step
+            )
+        else:
+            q_target[3] = j4_target
         j6_target, j6_velocity = acceleration_limited_scalar_target(
             float(q_target[5]),
             float(previous_target[5]),
@@ -2480,12 +2748,26 @@ class B601PalmFollower:
             target_dt,
         )
         q_target[5] = j6_target
+        q_target, clearance_scale = self._project_semantic_target_to_table_clearance(
+            q_seed,
+            q_target,
+        )
+        self.last_semantic_clearance_scale = clearance_scale
+        if clearance_scale < 1.0:
+            planar_velocity = planar_velocity * clearance_scale
+            j1_velocity *= clearance_scale
+            j4_velocity *= clearance_scale
+            j6_velocity *= clearance_scale
+        if clearance_scale < 1.0 and now - self.last_semantic_log_time >= 1.0:
+            self.logger.warn(
+                "Clamped B601 semantic target at the validated table-height "
+                f"boundary (safe_progress={clearance_scale:.3f})"
+            )
+            self.last_semantic_log_time = now
         if not self._semantic_table_clearance_ok(q_seed, q_target):
-            self.last_semantic_planar_command_time = now
-            self.semantic_planar_command_velocity_m_s.fill(0.0)
-            self.semantic_j1_target_velocity = 0.0
-            self.semantic_j4_target_velocity = 0.0
-            self.semantic_j6_target_velocity = 0.0
+            # This is a fail-closed guard for model/numerical errors.  Normal
+            # boundary handling is performed by the projection above and does
+            # not discard the complete semantic update.
             if now - self.last_semantic_log_time >= 1.0:
                 self.logger.warn(
                     "Refusing B601 semantic target: a modeled frame would move "
@@ -2546,9 +2828,11 @@ class B601PalmFollower:
                 f"height={actual_planar_error[1]:+.4f}]m, "
                 f"J3_progress={self.last_semantic_vertical_primary_progress:.2f}, "
                 f"follower_limit={self.last_semantic_vertical_follower_limit:.2f}, "
+                f"clearance_scale={self.last_semantic_clearance_scale:.3f}, "
                 f"J1_target_velocity={self.semantic_j1_target_velocity:+.4f}rad/s, "
                 f"J4_target_velocity={self.semantic_j4_target_velocity:+.4f}rad/s, "
                 f"J6_target_velocity={self.semantic_j6_target_velocity:+.4f}rad/s, "
+                f"stream_velocity={self.stream_target_velocity.round(4).tolist()}rad/s, "
                 f"articulation={'ready' if articulation_ready else 'locked'}, "
                 f"J6_clearance={'armed' if self.semantic_j6_clearance_enabled else 'locked'}, "
                 f"wrist_twist={wrist_twist_text}, "
@@ -2738,6 +3022,45 @@ class B601PalmFollower:
 
     def _frame_heights(self, q: np.ndarray) -> np.ndarray:
         return self._frame_positions(q)[:, 2]
+
+    def _project_semantic_target_to_table_clearance(
+        self,
+        current_q: np.ndarray,
+        requested_q: np.ndarray,
+    ) -> tuple[np.ndarray, float]:
+        """Project a semantic update onto the existing table-safe path.
+
+        Rejecting an entire visual update at the table boundary leaves all
+        smoothing state stale and can trap subsequent recovery commands.  A
+        short bisection instead retains the largest verified fraction of the
+        requested joint motion.  It uses exactly the same clearance predicate
+        as the fail-closed guard; no table tolerance is relaxed.
+        """
+
+        current = np.asarray(current_q, dtype=np.float64).reshape(-1)
+        requested = np.asarray(requested_q, dtype=np.float64).reshape(-1)
+        if current.shape != requested.shape or not all(
+            np.all(np.isfinite(value)) for value in (current, requested)
+        ):
+            raise ValueError("semantic clearance projection requires matching finite joints")
+        if self._semantic_table_clearance_ok(current, requested):
+            return requested.copy(), 1.0
+
+        lower = 0.0
+        upper = 1.0
+        delta = requested - current
+        for _ in range(12):
+            fraction = 0.5 * (lower + upper)
+            candidate = current + fraction * delta
+            if self._semantic_table_clearance_ok(current, candidate):
+                lower = fraction
+            else:
+                upper = fraction
+        projected = current + lower * delta
+        # Numerical noise in the final FK call must still fail closed.
+        if not self._semantic_table_clearance_ok(current, projected):
+            return current.copy(), 0.0
+        return projected, lower
 
     def _semantic_table_clearance_ok(
         self,
