@@ -5,6 +5,7 @@ from arm_control.rebot_b601 import (
     B601PalmFollower,
     StartupGuardError,
     acceleration_limited_scalar_target,
+    acceleration_limited_scalar_target_with_tracking_window,
     acceleration_limited_vector_target,
     adaptive_goal_velocity_hold_s,
     apply_tabletop_motion_envelope,
@@ -16,6 +17,7 @@ from arm_control.rebot_b601 import (
     filtered_wrapped_angle_delta,
     gate_outward_scalar_increment,
     horizontal_radial_axis,
+    independent_planar_task_backpressure,
     jerk_limited_joint_target,
     joint_tracking_bounds,
     joint_target_safety_violations,
@@ -29,6 +31,7 @@ from arm_control.rebot_b601 import (
     slew_limit_vector,
     synchronize_vertical_follower_progress,
     task_space_backpressure,
+    validate_wrapped_angle_observation,
     validate_tabletop_startup,
     weighted_damped_least_squares,
 )
@@ -341,6 +344,40 @@ def test_j4_target_limiter_bounds_velocity_acceleration_and_deadband():
     assert stopped == pytest.approx(0.0)
 
 
+def test_direct_joint_target_accelerates_before_tracking_window_is_applied():
+    first_target, first_velocity = (
+        acceleration_limited_scalar_target_with_tracking_window(
+            requested=0.50,
+            measured=0.0,
+            previous=0.0,
+            previous_velocity=0.0,
+            max_velocity=0.10,
+            max_acceleration=0.20,
+            deadband=0.001,
+            max_tracking_error=0.05,
+            dt_s=0.10,
+        )
+    )
+    second_target, second_velocity = (
+        acceleration_limited_scalar_target_with_tracking_window(
+            requested=0.50,
+            measured=0.0,
+            previous=first_target,
+            previous_velocity=first_velocity,
+            max_velocity=0.10,
+            max_acceleration=0.20,
+            deadband=0.001,
+            max_tracking_error=0.05,
+            dt_s=0.10,
+        )
+    )
+
+    assert first_velocity == pytest.approx(0.02)
+    assert second_velocity == pytest.approx(0.04)
+    assert first_target == pytest.approx(0.002)
+    assert second_target == pytest.approx(0.006)
+
+
 def test_high_rate_joint_stream_is_continuous_and_bounded():
     position = np.zeros(2)
     velocity = np.zeros(2)
@@ -371,7 +408,7 @@ def test_high_rate_joint_stream_is_continuous_and_bounded():
     np.testing.assert_allclose(position, [0.10, -0.06], atol=1e-6)
 
 
-def test_high_rate_joint_stream_holds_position_while_braking_after_reversal():
+def test_high_rate_joint_stream_holds_position_and_clears_reversal_momentum():
     position, velocity, acceleration = jerk_limited_joint_target(
         requested=[-0.10],
         previous=[0.02],
@@ -384,8 +421,8 @@ def test_high_rate_joint_stream_holds_position_while_braking_after_reversal():
     )
 
     assert position[0] == pytest.approx(0.02)
-    assert velocity[0] > 0.0
-    assert acceleration[0] < 0.0
+    assert velocity[0] == pytest.approx(0.0)
+    assert acceleration[0] == pytest.approx(0.0)
 
 
 def test_stream_velocity_caps_follow_the_outer_semantic_rate():
@@ -563,6 +600,26 @@ def test_task_backpressure_blocks_backlog_growth_but_allows_recovery():
     assert recovery == pytest.approx(1.0)
 
 
+def test_planar_backpressure_does_not_cross_couple_forward_and_lift():
+    forward_blocked = independent_planar_task_backpressure(
+        signed_task_error=[0.025, 0.0, 0.0, 0.0],
+        requested_planar_increment=[0.002, 0.003],
+        vertical_height_profile=[0.5, 0.8, 1.0],
+        max_tracking_error=[0.020, 0.020, 0.020, 0.020],
+        start_fraction=0.50,
+    )
+    vertical_blocked = independent_planar_task_backpressure(
+        signed_task_error=[0.0, 0.025, 0.025, 0.025],
+        requested_planar_increment=[0.002, 0.003],
+        vertical_height_profile=[0.5, 0.8, 1.0],
+        max_tracking_error=[0.020, 0.020, 0.020, 0.020],
+        start_fraction=0.50,
+    )
+
+    np.testing.assert_allclose(forward_blocked, [0.0, 1.0])
+    np.testing.assert_allclose(vertical_blocked, [1.0, 0.0])
+
+
 def test_coordinated_velocity_limiter_preserves_joint_ratio():
     first = coordinated_acceleration_limited_velocity(
         requested_velocity=[0.10, 0.20, -0.10],
@@ -610,6 +667,26 @@ def test_stream_position_correction_substantially_limits_chasing_speed():
     assert 0.0 < position[0] < 0.10
 
 
+def test_stream_reversal_clears_stale_internal_momentum_without_position_step():
+    position, velocity, acceleration = jerk_limited_joint_target(
+        requested=[-0.10],
+        previous=[0.0],
+        previous_velocity=[0.08],
+        previous_acceleration=[0.20],
+        max_velocity=[0.20],
+        max_acceleration=[1.0],
+        max_jerk=[20.0],
+        dt_s=0.01,
+        requested_velocity=[-0.05],
+        position_correction_gain_s=5.0,
+        position_correction_max_velocity=[0.04],
+    )
+
+    np.testing.assert_allclose(position, [0.0])
+    np.testing.assert_allclose(velocity, [0.0])
+    np.testing.assert_allclose(acceleration, [0.0])
+
+
 def test_wrist_twist_filter_wraps_boundary_and_rejects_one_frame_spike():
     boundary_delta = filtered_wrapped_angle_delta(
         value=np.deg2rad(-179.0),
@@ -630,6 +707,28 @@ def test_wrist_twist_filter_wraps_boundary_and_rejects_one_frame_spike():
 
     assert np.rad2deg(boundary_delta) == pytest.approx(2.0)
     assert np.rad2deg(spike_delta) == pytest.approx(6.0)
+
+
+def test_raw_wrist_observation_gate_wraps_boundary_and_rejects_depth_flip():
+    boundary_ok, boundary_innovation = validate_wrapped_angle_observation(
+        value=np.deg2rad(-179.0),
+        previous_value=np.deg2rad(179.0),
+        dt_s=0.10,
+        max_rate_rad_s=np.deg2rad(180.0),
+        max_jump_rad=np.deg2rad(25.0),
+    )
+    spike_ok, spike_innovation = validate_wrapped_angle_observation(
+        value=np.deg2rad(-122.0),
+        previous_value=np.deg2rad(20.0),
+        dt_s=0.133,
+        max_rate_rad_s=np.deg2rad(180.0),
+        max_jump_rad=np.deg2rad(25.0),
+    )
+
+    assert boundary_ok
+    assert np.rad2deg(boundary_innovation) == pytest.approx(2.0)
+    assert not spike_ok
+    assert abs(np.rad2deg(spike_innovation)) > 100.0
 
 
 def test_wrist_twist_direction_requires_confirmation_and_holds_through_spike():

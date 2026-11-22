@@ -221,12 +221,17 @@ export HAND_ENGINE='/absolute/path/to/rtmpose_hand.engine'
 
 语义目标约以 20--25 Hz 更新。J2/J3/J4 使用雅可比 resolved-rate 解算，将掌心任务
 速度和当前任务误差直接转换为协调的关节速度，不再每帧产生一个远端 IK 姿态后逐步
-追赶。任务跟踪误差过大时，反积分饱和会暂停继续积累操作者位移，但始终允许机械臂
-向实际反馈方向恢复；桌面净空门控只限制继续向外运动，不会在净空下降时凭空制造
-反向目标，且 follower mobility 连续、带滞回并受变化率限制。500 Hz MIT 层以该关节速度为主要前馈，只叠加有限的位置误差修正，并继续执行
-速度、加速度和 jerk 限制。掌心滤波会按运动速度自适应带宽并限制单帧跳变；J6 的
-最小可见角使用 minimum-jerk 软启动。最终目标仍会经过关节范围、桌面投影、力矩和
-失速保护。
+追赶。前后与上下通道分别执行反积分饱和；其中一个方向发生反馈积压时，不再冻结另
+一个仍可安全运动的方向。桌面净空门控只限制继续向外运动，不会在净空下降时凭空制
+造反向目标，且 follower mobility 连续、带滞回并受变化率限制。500 Hz MIT 层以该
+关节速度为主要前馈，只叠加有限的位置误差修正，并继续执行速度、加速度和 jerk 限
+制。目标反向时会清除上一方向残留的内部速度，避免先停住、再突然追赶或短暂反向。
+
+掌心滤波会按运动速度自适应带宽并限制单帧跳变。J6 在圆周滤波之前增加原始角速度和
+单帧角跳变拒绝；掌心快速平移、掌面深度失效或桌面净空不足时，会保持最后一个已接
+受的 J6 目标并重新采集腕部零位，不会把异常帧继续积分成旋腕指令。J1/J6 的完整目标
+只经过一次速度/加速度整形，再施加反馈跟踪窗口，使对应限速参数真正生效。最终目标
+仍会经过关节范围、桌面投影、力矩和失速保护。
 
 ```bash
 REPO="$HOME/ws/Jetson_Femto_reBot_B601_BrainCo_Demo_RTMPose_TensorRT"
@@ -268,15 +273,19 @@ run_b601_semantic_test() {
     -p palm_filter_fast_alpha:=0.72 \
     -p palm_filter_speed_scale_m_s:=0.30 \
     -p palm_filter_max_innovation_m:='[0.030,0.030,0.030]' \
-    -p b601_wrist_twist_filter_alpha:=0.12 \
-    -p b601_wrist_twist_max_innovation_deg:=12.0 \
-    -p b601_wrist_twist_activate_deg:=12.0 \
-    -p b601_wrist_twist_release_deg:=6.0 \
-    -p b601_wrist_twist_confirm_samples:=4 \
-    -p b601_wrist_twist_reverse_confirm_samples:=7 \
-    -p b601_wrist_twist_min_joint_offset_rad:=0.140 \
-    -p b601_wrist_twist_soft_start_s:=0.25 \
-    -p b601_semantic_max_joint_offset_rad:='[0.035,0.080,0.100,0.070,0.008,0.300]' \
+    -p b601_wrist_twist_filter_alpha:=0.10 \
+    -p b601_wrist_twist_max_innovation_deg:=8.0 \
+    -p b601_wrist_twist_max_raw_rate_deg_s:=180.0 \
+    -p b601_wrist_twist_max_raw_jump_deg:=25.0 \
+    -p b601_wrist_twist_translation_gate_m_s:=0.050 \
+    -p b601_wrist_twist_stationary_confirm_samples:=3 \
+    -p b601_wrist_twist_activate_deg:=15.0 \
+    -p b601_wrist_twist_release_deg:=7.0 \
+    -p b601_wrist_twist_confirm_samples:=5 \
+    -p b601_wrist_twist_reverse_confirm_samples:=9 \
+    -p b601_wrist_twist_min_joint_offset_rad:=0.080 \
+    -p b601_wrist_twist_soft_start_s:=0.60 \
+    -p b601_semantic_max_joint_offset_rad:='[0.035,0.080,0.100,0.070,0.008,0.250]' \
     -p b601_semantic_max_step_rad:='[0.0025,0.0025,0.0030,0.0020,0.0010,0.0060]' \
     -p b601_joint_kp:='[120.0,120.0,180.0,30.0,35.0,30.0]' \
     -p b601_joint_kd:='[8.0,8.0,8.0,4.0,2.0,2.0]' \
@@ -284,13 +293,13 @@ run_b601_semantic_test() {
     -p b601_stream_max_velocity_rad_s:='[0.25,0.30,0.35,0.15,0.10,0.25]' \
     -p b601_stream_max_acceleration_rad_s2:='[2.0,2.5,3.0,1.2,0.8,2.0]' \
     -p b601_stream_max_jerk_rad_s3:='[80.0,100.0,120.0,50.0,30.0,80.0]' \
-    -p b601_stream_outer_velocity_scale:=1.35 \
+    -p b601_stream_outer_velocity_scale:=1.40 \
     -p b601_stream_goal_velocity_filter_alpha:=0.45 \
     -p b601_stream_goal_velocity_stale_cycles:=2.0 \
     -p b601_stream_goal_period_filter_alpha:=0.20 \
     -p b601_stream_goal_velocity_max_hold_s:=0.20 \
     -p b601_stream_position_correction_gain_s:=5.0 \
-    -p b601_stream_position_correction_max_fraction:=0.35 \
+    -p b601_stream_position_correction_max_fraction:=0.38 \
     -p b601_semantic_max_tracking_error_rad:='[0.012,0.020,0.055,0.018,0.008,0.040]' \
     -p b601_semantic_stall_error_rad:='[0.010,0.015,0.030,0.015,0.010,0.012]' \
     -p b601_semantic_stall_min_progress_rad:=0.0015 \
@@ -325,8 +334,8 @@ run_b601_semantic_test() {
     -p b601_semantic_j4_target_max_velocity_rad_s:=0.025 \
     -p b601_semantic_j4_target_max_acceleration_rad_s2:=0.10 \
     -p b601_semantic_j4_target_deadband_rad:=0.0015 \
-    -p b601_semantic_j6_target_max_velocity_rad_s:=0.10 \
-    -p b601_semantic_j6_target_max_acceleration_rad_s2:=0.50 \
+    -p b601_semantic_j6_target_max_velocity_rad_s:=0.05 \
+    -p b601_semantic_j6_target_max_acceleration_rad_s2:=0.15 \
     -p b601_semantic_j6_target_deadband_rad:=0.0015 \
     -p b601_semantic_vertical_solver_step_rad:=0.015 \
     -p b601_semantic_vertical_solver_iterations:=12 \
@@ -345,8 +354,9 @@ run_b601_semantic_test() {
 `chain_clearance` 应达到约 `0.001m`，并出现 `articulation=ready`；
 `actual_error` 中的 `height` 应逐步降到约 `0.005m` 以下。机械臂抬升过程中
 `forward_gate` 会从 0 平滑增加到 1；掌心前后和 J1 逐步达到完整幅度。J6 则等待
-`J6_clearance=armed`，此时会自动在抬升后的姿态重新置零；看到该字段后保持掌心位置，
-再开始旋腕。
+`J6_clearance=armed` 和 `J6_observation=ready`，此时会自动在抬升后的姿态重新置零；
+看到这两个字段后保持掌心位置，再开始慢速旋腕。若出现 `outlier_hold`、
+`translation_hold` 或 `invalid_hold`，J6 应保持当前位置，待 `J6_stable=3/3` 后重新置零。
 `q_target` 会从上一次目标连续爬坡，并由 `target_lead` 显示它相对实测关节角积累的
 有限位置误差。`q_sent` 是经过总力矩限制后真正发送的目标；`tau_g` 是重力前馈，
 `tau_measured` 是电机反馈力矩，`effort_cmd` 是包含位置、阻尼与重力项的指令估算，
@@ -382,14 +392,16 @@ J6 不再使用食指 MCP 5 到小指 MCP 17 的二维连线角度。新算法�
 [MediaPipe Hands](https://github.com/google-ai-edge/mediapipe/blob/master/docs/solutions/hands.md)
 公开的 21 点三维手部表示一致，但继续复用现有
 [MMPose RTMPose 手部模型](https://github.com/open-mmlab/mmpose/blob/main/demo/docs/en/2d_hand_demo.md)
-和 TensorRT 引擎，不增加第二套推理运行时。单帧角度创新限制、圆周低通滤波、
-四帧同方向确认以及 J6 独立速度/加速度限制会抑制深度尖峰。确认后的 J6 至少产生
-`0.140rad`（约 8°）的可见目标，最大限制为 `0.300rad`（约 17°）；孤立反向帧会
-保持原方向，不会立即反转。任一必需点没有可靠深度，或手臂几乎完全
-伸直导致肩—肘—腕平面退化时，日志显示 `wrist_twist=invalid`，控制器保持上一 J6
-目标而不是猜测。测试时肘部保持约 60–120° 弯曲，张开手掌，肩、肘、腕和掌心均
-留在画面与深度量程内。`J6_delta` 是滤波后的腕部角度，`J6_confirmed` 是消抖确认值，
-`J6_offset` 是关节目标偏移，`J6_measured_offset` 是电机反馈的真实偏移。
+和 TensorRT 引擎，不增加第二套推理运行时。原始角速度/角跳变拒绝、圆周低通滤波、
+五帧同方向确认、九帧反向确认以及 J6 独立速度/加速度限制会抑制深度尖峰。确认后的
+J6 至少产生 `0.080rad`（约 4.6°）的可见目标，最大限制为 `0.250rad`（约 14.3°）；
+孤立反向帧会保持原方向，不会立即反转。任一必需点没有可靠深度、掌心快速平移，或
+手臂几乎完全伸直导致肩—肘—腕平面退化时，控制器保持最后一个已接受的 J6 目标并
+等待稳定观测重新置零，而不是猜测。测试时肘部保持约 60–120° 弯曲，张开手掌，肩、
+肘、腕和掌心均留在画面与深度量程内。`J6_raw_innovation` 是原始单帧角度变化，
+`J6_translation_speed` 是掌心平移门控量，`J6_delta` 是滤波后的腕部角度，
+`J6_confirmed` 是消抖确认值，`J6_offset` 是关节目标偏移，`J6_measured_offset` 是电机
+反馈的真实偏移。
 
 如果 J1 或 J6 方向与现场期望相反，只翻转 `b601_semantic_joint_gains` 中第 1 或第 5 项；
 前后方向由末端径向几何定义，不应通过翻转某个 J2/J3/J4 增益来修改。若出现持续振荡、

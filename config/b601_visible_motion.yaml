@@ -11,15 +11,21 @@ hand_palm_b601_control_node:
     palm_filter_max_innovation_m: [0.030, 0.030, 0.030]
     b601_semantic_joint_gains: [0.65, -0.60, 0.18, 0.15, 0.45]
     b601_semantic_angle_deadband_deg: [5.0, 5.0, 3.0]
-    b601_wrist_twist_filter_alpha: 0.12
-    b601_wrist_twist_max_innovation_deg: 12.0
-    b601_wrist_twist_activate_deg: 12.0
-    b601_wrist_twist_release_deg: 6.0
-    b601_wrist_twist_confirm_samples: 4
-    b601_wrist_twist_reverse_confirm_samples: 7
-    b601_wrist_twist_min_joint_offset_rad: 0.140
-    b601_wrist_twist_soft_start_s: 0.25
-    b601_semantic_max_joint_offset_rad: [0.035, 0.080, 0.100, 0.070, 0.008, 0.300]
+    # Wrist intent is accepted only while the palm is translationally stable.
+    # Raw depth-angle flips are rejected, not clipped and accumulated.
+    b601_wrist_twist_filter_alpha: 0.10
+    b601_wrist_twist_max_innovation_deg: 8.0
+    b601_wrist_twist_max_raw_rate_deg_s: 180.0
+    b601_wrist_twist_max_raw_jump_deg: 25.0
+    b601_wrist_twist_translation_gate_m_s: 0.050
+    b601_wrist_twist_stationary_confirm_samples: 3
+    b601_wrist_twist_activate_deg: 15.0
+    b601_wrist_twist_release_deg: 7.0
+    b601_wrist_twist_confirm_samples: 5
+    b601_wrist_twist_reverse_confirm_samples: 9
+    b601_wrist_twist_min_joint_offset_rad: 0.080
+    b601_wrist_twist_soft_start_s: 0.60
+    b601_semantic_max_joint_offset_rad: [0.035, 0.080, 0.100, 0.070, 0.008, 0.250]
     b601_semantic_max_step_rad: [0.0025, 0.0025, 0.0030, 0.0020, 0.0010, 0.0060]
     b601_joint_kp: [120.0, 120.0, 180.0, 30.0, 35.0, 30.0]
     b601_joint_kd: [8.0, 8.0, 8.0, 4.0, 2.0, 2.0]
@@ -85,8 +91,8 @@ hand_palm_b601_control_node:
     b601_semantic_j4_target_max_velocity_rad_s: 0.025
     b601_semantic_j4_target_max_acceleration_rad_s2: 0.10
     b601_semantic_j4_target_deadband_rad: 0.0015
-    b601_semantic_j6_target_max_velocity_rad_s: 0.10
-    b601_semantic_j6_target_max_acceleration_rad_s2: 0.50
+    b601_semantic_j6_target_max_velocity_rad_s: 0.05
+    b601_semantic_j6_target_max_acceleration_rad_s2: 0.15
     b601_semantic_j6_target_deadband_rad: 0.0015
     b601_semantic_vertical_solver_step_rad: 0.015
     b601_semantic_vertical_solver_iterations: 12
