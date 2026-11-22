@@ -219,8 +219,11 @@ export HAND_ENGINE='/absolute/path/to/rtmpose_hand.engine'
 该入口固定读取 `config/b601_visible_motion.yaml`，因此不要再用旧的 `run_stage_v2`
 验证这一档参数。下面保留完整展开形式，便于逐项检查或继续调参。
 
-语义目标约以 20 Hz 更新，但电机目标会在 500 Hz MIT 循环中经过速度、加速度和
-jerk 受限的连续插值。反向确认只拦截真正的反向输入，同方向小位移不会再按死区
+语义目标约以 20--25 Hz 更新，但电机目标会在 500 Hz MIT 循环中经过速度、加速度和
+jerk 受限的连续插值。插值器会把相邻语义目标估算出的速度前馈到下一帧，并自动把
+内层速度限制耦合到外层实际可达速度，避免内层提前到点、停车、再等待下一帧造成的
+阶梯感。掌心滤波会按运动速度自适应带宽并限制单帧跳变；J6 的最小可见角也改为
+minimum-jerk 软启动。反向确认只拦截真正的反向输入，同方向小位移不会再按死区
 分段；到达死区会吸附到请求值而不是保持旧目标。J2/J3/J4 的限幅使用共同进度，
 桌面边界则投影到最大安全运动比例，不再因一个越界候选而丢弃整帧控制状态。
 
@@ -261,6 +264,9 @@ run_b601_semantic_test() {
     -p b601_semantic_joint_gains:='[0.65,-0.60,0.18,0.15,0.45]' \
     -p b601_semantic_angle_deadband_deg:='[5.0,5.0,3.0]' \
     -p palm_filter_alpha:=0.30 \
+    -p palm_filter_fast_alpha:=0.72 \
+    -p palm_filter_speed_scale_m_s:=0.30 \
+    -p palm_filter_max_innovation_m:='[0.030,0.030,0.030]' \
     -p b601_wrist_twist_filter_alpha:=0.12 \
     -p b601_wrist_twist_max_innovation_deg:=12.0 \
     -p b601_wrist_twist_activate_deg:=12.0 \
@@ -268,6 +274,7 @@ run_b601_semantic_test() {
     -p b601_wrist_twist_confirm_samples:=4 \
     -p b601_wrist_twist_reverse_confirm_samples:=7 \
     -p b601_wrist_twist_min_joint_offset_rad:=0.140 \
+    -p b601_wrist_twist_soft_start_s:=0.25 \
     -p b601_semantic_max_joint_offset_rad:='[0.035,0.080,0.100,0.070,0.008,0.300]' \
     -p b601_semantic_max_step_rad:='[0.0025,0.0025,0.0030,0.0020,0.0010,0.0060]' \
     -p b601_joint_kp:='[120.0,120.0,180.0,30.0,35.0,30.0]' \
@@ -276,6 +283,9 @@ run_b601_semantic_test() {
     -p b601_stream_max_velocity_rad_s:='[0.25,0.30,0.35,0.15,0.10,0.25]' \
     -p b601_stream_max_acceleration_rad_s2:='[2.0,2.5,3.0,1.2,0.8,2.0]' \
     -p b601_stream_max_jerk_rad_s3:='[80.0,100.0,120.0,50.0,30.0,80.0]' \
+    -p b601_stream_outer_velocity_scale:=1.35 \
+    -p b601_stream_goal_velocity_filter_alpha:=0.45 \
+    -p b601_stream_goal_velocity_stale_cycles:=2.0 \
     -p b601_semantic_max_tracking_error_rad:='[0.012,0.020,0.055,0.018,0.008,0.040]' \
     -p b601_semantic_stall_error_rad:='[0.010,0.015,0.030,0.015,0.010,0.012]' \
     -p b601_semantic_stall_min_progress_rad:=0.0015 \

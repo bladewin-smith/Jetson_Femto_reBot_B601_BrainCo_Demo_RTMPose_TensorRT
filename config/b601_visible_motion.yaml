@@ -3,6 +3,12 @@ hand_palm_b601_control_node:
     b601_control_mode: semantic_joint
     # Camera-space palm centroid smoothing before semantic mapping.
     palm_filter_alpha: 0.30
+    # Adaptive bandwidth keeps a stationary palm quiet while reducing latency
+    # during deliberate motion.  Per-frame innovation clipping rejects pose
+    # estimator jumps before they can reverse a joint command.
+    palm_filter_fast_alpha: 0.72
+    palm_filter_speed_scale_m_s: 0.30
+    palm_filter_max_innovation_m: [0.030, 0.030, 0.030]
     b601_semantic_joint_gains: [0.65, -0.60, 0.18, 0.15, 0.45]
     b601_semantic_angle_deadband_deg: [5.0, 5.0, 3.0]
     b601_wrist_twist_filter_alpha: 0.12
@@ -12,6 +18,7 @@ hand_palm_b601_control_node:
     b601_wrist_twist_confirm_samples: 4
     b601_wrist_twist_reverse_confirm_samples: 7
     b601_wrist_twist_min_joint_offset_rad: 0.140
+    b601_wrist_twist_soft_start_s: 0.25
     b601_semantic_max_joint_offset_rad: [0.035, 0.080, 0.100, 0.070, 0.008, 0.300]
     b601_semantic_max_step_rad: [0.0025, 0.0025, 0.0030, 0.0020, 0.0010, 0.0060]
     b601_joint_kp: [120.0, 120.0, 180.0, 30.0, 35.0, 30.0]
@@ -23,6 +30,12 @@ hand_palm_b601_control_node:
     b601_stream_max_velocity_rad_s: [0.25, 0.30, 0.35, 0.15, 0.10, 0.25]
     b601_stream_max_acceleration_rad_s2: [2.0, 2.5, 3.0, 1.2, 0.8, 2.0]
     b601_stream_max_jerk_rad_s3: [80.0, 100.0, 120.0, 50.0, 30.0, 80.0]
+    # Automatically couple the 500 Hz stream speed to the 25 Hz semantic
+    # target rate, then feed the estimated target velocity into the stream.
+    # This avoids arriving early and stopping at every camera update.
+    b601_stream_outer_velocity_scale: 1.35
+    b601_stream_goal_velocity_filter_alpha: 0.45
+    b601_stream_goal_velocity_stale_cycles: 2.0
     b601_semantic_max_tracking_error_rad: [0.012, 0.020, 0.055, 0.018, 0.008, 0.040]
     b601_semantic_stall_error_rad: [0.010, 0.015, 0.030, 0.015, 0.010, 0.012]
     b601_semantic_stall_min_progress_rad: 0.0015

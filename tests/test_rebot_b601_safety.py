@@ -7,8 +7,10 @@ from arm_control.rebot_b601 import (
     acceleration_limited_scalar_target,
     acceleration_limited_vector_target,
     apply_tabletop_motion_envelope,
+    coupled_stream_velocity_limits,
     confirm_vector_reversals,
     confirm_directional_wrist_twist,
+    filtered_goal_velocity,
     filtered_wrapped_angle_delta,
     horizontal_radial_axis,
     jerk_limited_joint_target,
@@ -379,6 +381,96 @@ def test_high_rate_joint_stream_holds_position_while_braking_after_reversal():
     assert position[0] == pytest.approx(0.02)
     assert velocity[0] > 0.0
     assert acceleration[0] < 0.0
+
+
+def test_stream_velocity_caps_follow_the_outer_semantic_rate():
+    effective = coupled_stream_velocity_limits(
+        configured_limit=[0.25, 0.30, 0.35, 0.15, 0.10, 0.25],
+        semantic_max_step=[0.0036, 0.0044, 0.0056, 0.0024, 0.0008, 0.0064],
+        command_interval_s=0.04,
+        outer_velocity_limit=[0.10, 10.0, 10.0, 0.045, 10.0, 0.10],
+        follow_scale=1.35,
+    )
+
+    np.testing.assert_allclose(
+        effective,
+        [0.1215, 0.1485, 0.1890, 0.06075, 0.0270, 0.1350],
+    )
+
+
+def test_goal_velocity_preserves_planar_group_shape_and_resets_on_reversal():
+    previous = np.zeros(6)
+    requested = np.asarray([0.0, 0.0044, -0.0056, 0.0024, 0.0, 0.0])
+    limits = np.asarray([0.10, 0.11, 0.14, 0.045, 0.02, 0.10])
+    velocity = filtered_goal_velocity(
+        requested,
+        previous,
+        np.zeros(6),
+        limits,
+        filter_alpha=1.0,
+        dt_s=0.04,
+        coordinated_indices=(1, 2, 3),
+    )
+
+    np.testing.assert_allclose(velocity[1:4], [0.0825, -0.105, 0.045])
+    reversed_velocity = filtered_goal_velocity(
+        -requested,
+        previous,
+        velocity,
+        limits,
+        filter_alpha=0.5,
+        dt_s=0.04,
+        coordinated_indices=(1, 2, 3),
+    )
+    np.testing.assert_array_equal(np.sign(reversed_velocity[1:4]), [-1.0, 1.0, -1.0])
+    np.testing.assert_allclose(
+        np.abs(reversed_velocity[1:4]),
+        0.5 * np.abs(velocity[1:4]),
+    )
+
+
+def test_high_rate_stream_preloads_velocity_without_overshooting_latest_goal():
+    position = np.zeros(1)
+    velocity = np.zeros(1)
+    acceleration = np.zeros(1)
+    for _ in range(50):
+        position, velocity, acceleration = jerk_limited_joint_target(
+            requested=[0.0],
+            previous=position,
+            previous_velocity=velocity,
+            previous_acceleration=acceleration,
+            max_velocity=[0.20],
+            max_acceleration=[1.0],
+            max_jerk=[20.0],
+            dt_s=0.002,
+            requested_velocity=[0.10],
+        )
+
+    assert position[0] == pytest.approx(0.0)
+    assert velocity[0] > 0.0
+    warm_position, _, _ = jerk_limited_joint_target(
+        requested=[0.002],
+        previous=position,
+        previous_velocity=velocity,
+        previous_acceleration=acceleration,
+        max_velocity=[0.20],
+        max_acceleration=[1.0],
+        max_jerk=[20.0],
+        dt_s=0.002,
+        requested_velocity=[0.10],
+    )
+    cold_position, _, _ = jerk_limited_joint_target(
+        requested=[0.002],
+        previous=[0.0],
+        previous_velocity=[0.0],
+        previous_acceleration=[0.0],
+        max_velocity=[0.20],
+        max_acceleration=[1.0],
+        max_jerk=[20.0],
+        dt_s=0.002,
+        requested_velocity=[0.0],
+    )
+    assert cold_position[0] < warm_position[0] <= 0.002
 
 
 def test_wrist_twist_filter_wraps_boundary_and_rejects_one_frame_spike():

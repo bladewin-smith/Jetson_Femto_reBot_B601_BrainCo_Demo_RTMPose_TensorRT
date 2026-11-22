@@ -676,6 +676,113 @@ def acceleration_limited_scalar_target(
     return float(previous + step), velocity
 
 
+def coupled_stream_velocity_limits(
+    configured_limit: Sequence[float],
+    semantic_max_step: Sequence[float],
+    command_interval_s: float,
+    outer_velocity_limit: Sequence[float],
+    follow_scale: float,
+) -> np.ndarray:
+    """Match the high-rate stream to the semantic goal's achievable velocity.
+
+    A stream that is several times faster than the outer goal reaches every
+    20--25 Hz sample early and brakes to rest, recreating visible stop-and-go
+    motion.  The configured stream values remain hard caps; the returned
+    limits add only a small following margin over the actual outer rate.
+    """
+
+    configured = np.asarray(configured_limit, dtype=np.float64).reshape(-1)
+    max_step = np.asarray(semantic_max_step, dtype=np.float64).reshape(-1)
+    outer_limit = np.asarray(outer_velocity_limit, dtype=np.float64).reshape(-1)
+    if not configured.shape == max_step.shape == outer_limit.shape:
+        raise ValueError("coupled stream-limit vectors must have matching shapes")
+    if not all(
+        np.all(np.isfinite(value)) for value in (configured, max_step, outer_limit)
+    ):
+        raise ValueError("coupled stream-limit vectors must be finite")
+    interval = float(command_interval_s)
+    scale = float(follow_scale)
+    if (
+        np.any(configured <= 0.0)
+        or np.any(max_step <= 0.0)
+        or np.any(outer_limit <= 0.0)
+        or not np.isfinite(interval)
+        or interval <= 0.0
+        or not np.isfinite(scale)
+        or scale < 1.0
+    ):
+        raise ValueError("coupled stream limits, interval and follow scale are invalid")
+    semantic_rate = np.minimum(max_step / interval, outer_limit)
+    return np.minimum(configured, scale * semantic_rate)
+
+
+def filtered_goal_velocity(
+    requested_position: Sequence[float],
+    previous_position: Sequence[float],
+    previous_velocity: Sequence[float],
+    max_velocity: Sequence[float],
+    filter_alpha: float,
+    dt_s: float,
+    coordinated_indices: Sequence[int] = (),
+) -> np.ndarray:
+    """Estimate a bounded joint-goal velocity from consecutive outer targets."""
+
+    requested = np.asarray(requested_position, dtype=np.float64).reshape(-1)
+    previous = np.asarray(previous_position, dtype=np.float64).reshape(-1)
+    prior_velocity = np.asarray(previous_velocity, dtype=np.float64).reshape(-1)
+    velocity_limit = np.asarray(max_velocity, dtype=np.float64).reshape(-1)
+    if not requested.shape == previous.shape == prior_velocity.shape == velocity_limit.shape:
+        raise ValueError("goal-velocity vectors must have matching shapes")
+    if not all(
+        np.all(np.isfinite(value))
+        for value in (requested, previous, prior_velocity, velocity_limit)
+    ):
+        raise ValueError("goal-velocity vectors must be finite")
+    alpha = float(filter_alpha)
+    dt = float(dt_s)
+    if (
+        np.any(velocity_limit <= 0.0)
+        or not np.isfinite(alpha)
+        or not 0.0 < alpha <= 1.0
+        or not np.isfinite(dt)
+        or dt <= 0.0
+    ):
+        raise ValueError("goal-velocity limits, alpha and dt are invalid")
+
+    raw_velocity = (requested - previous) / dt
+    limited_velocity = np.clip(raw_velocity, -velocity_limit, velocity_limit)
+    group = np.asarray(list(coordinated_indices), dtype=np.int64).reshape(-1)
+    if group.size:
+        if np.unique(group).size != group.size or np.any(group < 0) or np.any(
+            group >= requested.size
+        ):
+            raise ValueError("coordinated goal-velocity indices are invalid")
+        group_raw = raw_velocity[group]
+        nonzero = np.abs(group_raw) > 1e-12
+        group_scale = 1.0
+        if np.any(nonzero):
+            group_scale = min(
+                1.0,
+                float(
+                    np.min(
+                        velocity_limit[group][nonzero]
+                        / np.abs(group_raw[nonzero])
+                    )
+                ),
+            )
+        limited_velocity[group] = group_scale * group_raw
+
+    # Do not carry queued velocity through a genuine target reversal.  For the
+    # planar group, a negative dot product means the joint-space path reversed.
+    reset = raw_velocity * prior_velocity < 0.0
+    if group.size and float(np.dot(raw_velocity[group], prior_velocity[group])) < 0.0:
+        reset[group] = True
+    filtered_from = prior_velocity.copy()
+    filtered_from[reset] = 0.0
+    result = alpha * limited_velocity + (1.0 - alpha) * filtered_from
+    return np.clip(result, -velocity_limit, velocity_limit)
+
+
 def jerk_limited_joint_target(
     requested: Sequence[float],
     previous: Sequence[float],
@@ -685,8 +792,9 @@ def jerk_limited_joint_target(
     max_acceleration: Sequence[float],
     max_jerk: Sequence[float],
     dt_s: float,
+    requested_velocity: Sequence[float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Advance a continuous joint setpoint with velocity, acceleration and jerk bounds."""
+    """Advance a continuous joint setpoint with bounded position/velocity tracking."""
 
     vectors = [
         np.asarray(value, dtype=np.float64).reshape(-1)
@@ -711,13 +819,27 @@ def jerk_limited_joint_target(
         raise ValueError("joint-stream velocity, acceleration and jerk limits must be positive")
 
     goal, position, velocity, acceleration, velocity_limit, acceleration_limit, jerk_limit = vectors
+    goal_velocity = (
+        np.zeros_like(goal)
+        if requested_velocity is None
+        else np.asarray(requested_velocity, dtype=np.float64).reshape(-1)
+    )
+    if goal_velocity.shape != goal.shape or not np.all(np.isfinite(goal_velocity)):
+        raise ValueError("requested joint-stream velocity must match the goal")
+    goal_velocity = np.clip(goal_velocity, -velocity_limit, velocity_limit)
     error = goal - position
-    # A stopping-distance velocity target avoids racing into a nearby goal.
-    desired_speed = np.minimum(
+    # Feed-forward preserves motion across consecutive outer-loop samples;
+    # stopping-distance feedback still converges safely to the latest verified
+    # position when the outer target slows or becomes stale.
+    correction_speed = np.minimum(
         velocity_limit,
         np.sqrt(2.0 * acceleration_limit * np.abs(error)),
     )
-    desired_velocity = np.sign(error) * desired_speed
+    desired_velocity = np.clip(
+        goal_velocity + np.sign(error) * correction_speed,
+        -velocity_limit,
+        velocity_limit,
+    )
     desired_acceleration = np.clip(
         (desired_velocity - velocity) / dt,
         -acceleration_limit,
@@ -753,6 +875,7 @@ def jerk_limited_joint_target(
     stationary = np.logical_and.reduce(
         (
             at_goal,
+            np.abs(goal_velocity) <= 1e-8,
             np.abs(velocity) <= 1e-8,
             np.abs(acceleration) <= 1e-6,
         )
@@ -1120,6 +1243,31 @@ class B601PalmFollower:
             self.ARM_DOF,
             "b601_stream_max_jerk_rad_s3",
         )
+        self.stream_outer_velocity_scale = float(
+            node.declare_parameter("b601_stream_outer_velocity_scale", 1.35).value
+        )
+        self.stream_goal_velocity_filter_alpha = float(
+            node.declare_parameter(
+                "b601_stream_goal_velocity_filter_alpha", 0.45
+            ).value
+        )
+        self.stream_goal_velocity_stale_cycles = float(
+            node.declare_parameter(
+                "b601_stream_goal_velocity_stale_cycles", 2.0
+            ).value
+        )
+        if (
+            not np.isfinite(self.stream_outer_velocity_scale)
+            or self.stream_outer_velocity_scale < 1.0
+            or not np.isfinite(self.stream_goal_velocity_filter_alpha)
+            or not 0.0 < self.stream_goal_velocity_filter_alpha <= 1.0
+            or not np.isfinite(self.stream_goal_velocity_stale_cycles)
+            or self.stream_goal_velocity_stale_cycles < 1.0
+        ):
+            raise ValueError(
+                "B601 stream follow scale/stale cycles must be >= 1 and "
+                "goal-velocity alpha must be in (0, 1]"
+            )
 
         self.auto_home_on_start = bool(
             node.declare_parameter("auto_home_on_start", False).value
@@ -1246,6 +1394,31 @@ class B601PalmFollower:
         self.palm_filter_velocity_deadband_m_s = float(
             node.declare_parameter("palm_filter_velocity_deadband_m_s", 0.025).value
         )
+        self.palm_filter_fast_alpha = float(
+            node.declare_parameter("palm_filter_fast_alpha", 0.72).value
+        )
+        self.palm_filter_speed_scale_m_s = float(
+            node.declare_parameter("palm_filter_speed_scale_m_s", 0.30).value
+        )
+        self.palm_filter_max_innovation_m = _positive_vector(
+            node.declare_parameter(
+                "palm_filter_max_innovation_m", [0.030, 0.030, 0.030]
+            ).value,
+            3,
+            "palm_filter_max_innovation_m",
+        )
+        if (
+            not np.isfinite(self.palm_filter_alpha)
+            or not 0.0 < self.palm_filter_alpha <= 1.0
+            or not np.isfinite(self.palm_filter_fast_alpha)
+            or not self.palm_filter_alpha <= self.palm_filter_fast_alpha <= 1.0
+            or not np.isfinite(self.palm_filter_speed_scale_m_s)
+            or self.palm_filter_speed_scale_m_s <= 0.0
+        ):
+            raise ValueError(
+                "palm filter alpha must be in (0, 1], fast alpha cannot be "
+                "smaller, and speed scale must be positive"
+            )
         self.camera_to_arm_matrix = _vector(
             node.declare_parameter(
                 "camera_to_arm_matrix",
@@ -1348,6 +1521,9 @@ class B601PalmFollower:
                 "b601_wrist_twist_reverse_confirm_samples", 7
             ).value
         )
+        self.wrist_twist_soft_start_s = float(
+            node.declare_parameter("b601_wrist_twist_soft_start_s", 0.25).value
+        )
         if (
             not np.isfinite(self.wrist_twist_filter_alpha)
             or not 0.0 < self.wrist_twist_filter_alpha <= 1.0
@@ -1360,6 +1536,8 @@ class B601PalmFollower:
             or self.wrist_twist_confirm_samples < 1
             or self.wrist_twist_reverse_confirm_samples
             < self.wrist_twist_confirm_samples
+            or not np.isfinite(self.wrist_twist_soft_start_s)
+            or self.wrist_twist_soft_start_s <= 0.0
         ):
             raise ValueError(
                 "B601 wrist-twist filter alpha must be in (0, 1] and "
@@ -1782,6 +1960,8 @@ class B601PalmFollower:
         self.stream_target_q = None
         self.stream_target_velocity = np.zeros(self.ARM_DOF, dtype=np.float64)
         self.stream_target_acceleration = np.zeros(self.ARM_DOF, dtype=np.float64)
+        self.target_q_velocity = np.zeros(self.ARM_DOF, dtype=np.float64)
+        self.target_q_update_time = 0.0
         self.last_command_effort = np.zeros(self.ARM_DOF, dtype=np.float64)
         self.last_effort_limited = np.zeros(self.ARM_DOF, dtype=bool)
         self.last_motor_status = np.zeros(self.ARM_DOF, dtype=np.int64)
@@ -1804,6 +1984,7 @@ class B601PalmFollower:
         self.semantic_j6_candidate_direction = 0
         self.semantic_j6_candidate_count = 0
         self.semantic_j6_command_offset_rad = 0.0
+        self.semantic_j6_activation_progress = 0.0
         self.last_semantic_log_time = 0.0
         self.last_semantic_vertical_error_m = 0.0
         self.last_semantic_planar_error_m = np.zeros(2, dtype=np.float64)
@@ -1958,6 +2139,8 @@ class B601PalmFollower:
             self.stream_target_q = q.copy()
             self.stream_target_velocity.fill(0.0)
             self.stream_target_acceleration.fill(0.0)
+            self.target_q_velocity.fill(0.0)
+            self.target_q_update_time = 0.0
             self.last_measured_q = q.copy()
             self.last_measured_dq = dq.copy()
 
@@ -2007,6 +2190,16 @@ class B601PalmFollower:
             "torque was not enabled. Check /dev/ttyACM*, IDs 0x01..0x06, feedback "
             "IDs 0x11..0x16, 921600 baud, and the 24 V supply."
         )
+
+    def _semantic_outer_joint_velocity_limits(self) -> np.ndarray:
+        """Return the maximum rate at which semantic goals can actually move."""
+
+        limit = self.semantic_max_step / max(self.command_interval_s, 1e-3)
+        limit = np.asarray(limit, dtype=np.float64)
+        limit[0] = min(limit[0], self.semantic_j1_target_max_velocity)
+        limit[3] = min(limit[3], self.semantic_j4_target_max_velocity)
+        limit[5] = min(limit[5], self.semantic_j6_target_max_velocity)
+        return limit
 
     def _control_loop(self, robot: Any, dt: float) -> None:
         try:
@@ -2067,6 +2260,30 @@ class B601PalmFollower:
                     else:
                         stream_velocity_limit = self.stream_max_velocity.copy()
                         stream_acceleration_limit = self.stream_max_acceleration.copy()
+                        goal_velocity = np.zeros(self.ARM_DOF, dtype=np.float64)
+                        if self.control_mode == "semantic_joint":
+                            outer_velocity_limit = (
+                                self._semantic_outer_joint_velocity_limits()
+                            )
+                            stream_velocity_limit = coupled_stream_velocity_limits(
+                                stream_velocity_limit,
+                                self.semantic_max_step,
+                                self.command_interval_s,
+                                outer_velocity_limit,
+                                self.stream_outer_velocity_scale,
+                            )
+                            goal_age = time.monotonic() - self.target_q_update_time
+                            if (
+                                self.target_q_update_time > 0.0
+                                and goal_age
+                                <= self.stream_goal_velocity_stale_cycles
+                                * self.command_interval_s
+                            ):
+                                goal_velocity = np.clip(
+                                    self.target_q_velocity,
+                                    -stream_velocity_limit,
+                                    stream_velocity_limit,
+                                )
                         (
                             stream_q,
                             stream_velocity,
@@ -2080,6 +2297,7 @@ class B601PalmFollower:
                             stream_acceleration_limit,
                             self.stream_max_jerk,
                             trajectory_dt,
+                            requested_velocity=goal_velocity,
                         )
                     self.stream_target_q = stream_q
                     self.stream_target_velocity = stream_velocity
@@ -2182,6 +2400,8 @@ class B601PalmFollower:
             self.stream_target_q = np.asarray(q, dtype=np.float64).copy()
             self.stream_target_velocity.fill(0.0)
             self.stream_target_acceleration.fill(0.0)
+            self.target_q_velocity.fill(0.0)
+            self.target_q_update_time = 0.0
         self.logger.error(
             "B601 actuation watchdog stopped this tracking cycle; holding the "
             f"measured pose. {self.semantic_actuation_fault}. Press 's' only after "
@@ -2245,6 +2465,7 @@ class B601PalmFollower:
         self.semantic_j6_candidate_direction = 0
         self.semantic_j6_candidate_count = 0
         self.semantic_j6_command_offset_rad = 0.0
+        self.semantic_j6_activation_progress = 0.0
 
     def _reset_semantic_smoothing(self, now_s: float = 0.0) -> None:
         self.semantic_planar_command_m.fill(0.0)
@@ -2279,6 +2500,8 @@ class B601PalmFollower:
             self.stream_target_q = q.copy()
             self.stream_target_velocity.fill(0.0)
             self.stream_target_acceleration.fill(0.0)
+            self.target_q_velocity.fill(0.0)
+            self.target_q_update_time = 0.0
         self._set_reference_from_q(q)
         self.semantic_control_reference_q = q.copy()
         self.semantic_reference_frame_heights = self._frame_heights(q)
@@ -2315,6 +2538,8 @@ class B601PalmFollower:
                 self.stream_target_q = q.copy()
                 self.stream_target_velocity.fill(0.0)
                 self.stream_target_acceleration.fill(0.0)
+                self.target_q_velocity.fill(0.0)
+                self.target_q_update_time = 0.0
         self.last_target_pose = None
         self.last_submit_time = 0.0
         self.semantic_control_side = None
@@ -2365,6 +2590,10 @@ class B601PalmFollower:
             "wrist_twist": observation.palm_roll_rad,
         }
         self.semantic_signal_deltas.update(wrist_twist=0.0)
+        with self.target_lock:
+            self.target_q = q_reference.copy()
+            self.target_q_velocity.fill(0.0)
+            self.target_q_update_time = 0.0
         self._reset_semantic_smoothing(time.monotonic())
         self._reset_filters()
         self.logger.info(
@@ -2427,6 +2656,11 @@ class B601PalmFollower:
         now = time.monotonic()
         if now - self.last_submit_time < self.command_interval_s:
             return self.last_arm_offset
+        target_dt = (
+            self.command_interval_s
+            if self.last_submit_time <= 0.0
+            else float(np.clip(now - self.last_submit_time, 0.001, 0.2))
+        )
 
         camera_offset = _vector(
             observation.palm_displacement_m,
@@ -2443,6 +2677,8 @@ class B601PalmFollower:
                 self.stream_target_q = q_seed.copy()
                 self.stream_target_velocity.fill(0.0)
                 self.stream_target_acceleration.fill(0.0)
+                self.target_q_velocity.fill(0.0)
+                self.target_q_update_time = 0.0
             self._reset_semantic_smoothing(now)
             self._reset_filters()
             if now - self.last_semantic_log_time >= 1.0:
@@ -2546,6 +2782,7 @@ class B601PalmFollower:
             self.semantic_j6_held_delta_rad = 0.0
             self.semantic_j6_candidate_direction = 0
             self.semantic_j6_candidate_count = 0
+            self.semantic_j6_activation_progress = 0.0
         elif self.semantic_j6_clearance_enabled and clearance_fraction <= 0.50:
             self._reset_wrist_twist_confirmation()
 
@@ -2554,6 +2791,7 @@ class B601PalmFollower:
             observation.palm_roll_rad,
             self.semantic_angle_deadband_rad[2],
         )
+        previous_j6_direction = self.semantic_j6_active_direction
         if self.semantic_j6_clearance_enabled:
             (
                 self.semantic_j6_active_direction,
@@ -2574,6 +2812,20 @@ class B601PalmFollower:
         else:
             roll_delta = 0.0
 
+        if self.semantic_j6_active_direction == 0:
+            self.semantic_j6_activation_progress = 0.0
+        elif self.semantic_j6_active_direction != previous_j6_direction:
+            self.semantic_j6_activation_progress = min(
+                1.0,
+                target_dt / self.wrist_twist_soft_start_s,
+            )
+        else:
+            self.semantic_j6_activation_progress = min(
+                1.0,
+                self.semantic_j6_activation_progress
+                + target_dt / self.wrist_twist_soft_start_s,
+            )
+
         direct_offsets = semantic_direct_joint_offsets(
             lateral,
             self.semantic_j6_held_delta_rad,
@@ -2586,7 +2838,7 @@ class B601PalmFollower:
             and self.semantic_j6_active_direction != 0
             and abs(float(direct_offsets[5])) > 1e-9
         ):
-            direct_offsets[5] = float(
+            full_j6_offset = float(
                 np.copysign(
                     max(
                         abs(float(direct_offsets[5])),
@@ -2597,7 +2849,8 @@ class B601PalmFollower:
             )
             direct_offsets[5] = float(
                 np.clip(
-                    direct_offsets[5],
+                    minimum_jerk_blend(self.semantic_j6_activation_progress)
+                    * full_j6_offset,
                     -self.semantic_max_joint_offset[5],
                     self.semantic_max_joint_offset[5],
                 )
@@ -2693,11 +2946,6 @@ class B601PalmFollower:
         else:
             self.last_semantic_vertical_primary_progress = 1.0
             self.last_semantic_vertical_follower_limit = 1.0
-        target_dt = (
-            self.command_interval_s
-            if self.last_submit_time <= 0.0
-            else float(np.clip(now - self.last_submit_time, 0.001, 0.2))
-        )
         j1_target, j1_velocity = acceleration_limited_scalar_target(
             float(q_target[0]),
             float(previous_target[0]),
@@ -2774,6 +3022,9 @@ class B601PalmFollower:
                     "below its validated table-pose height"
                 )
                 self.last_semantic_log_time = now
+            with self.target_lock:
+                self.target_q_velocity.fill(0.0)
+                self.target_q_update_time = 0.0
             return self.last_arm_offset
         if not self._joint_target_is_safe(q_target, q_seed):
             self.last_semantic_planar_command_time = now
@@ -2781,10 +3032,24 @@ class B601PalmFollower:
             self.semantic_j1_target_velocity = 0.0
             self.semantic_j4_target_velocity = 0.0
             self.semantic_j6_target_velocity = 0.0
+            with self.target_lock:
+                self.target_q_velocity.fill(0.0)
+                self.target_q_update_time = 0.0
             return self.last_arm_offset
 
+        outer_velocity_limit = self._semantic_outer_joint_velocity_limits()
         with self.target_lock:
-            self.target_q = q_target
+            self.target_q_velocity = filtered_goal_velocity(
+                q_target,
+                previous_target,
+                self.target_q_velocity,
+                outer_velocity_limit,
+                self.stream_goal_velocity_filter_alpha,
+                target_dt,
+                coordinated_indices=(1, 2, 3),
+            )
+            self.target_q = q_target.copy()
+            self.target_q_update_time = now
         self.semantic_planar_command_m = planar_command
         self.semantic_planar_command_velocity_m_s = planar_velocity
         self.last_semantic_planar_command_time = now
@@ -2832,6 +3097,7 @@ class B601PalmFollower:
                 f"J1_target_velocity={self.semantic_j1_target_velocity:+.4f}rad/s, "
                 f"J4_target_velocity={self.semantic_j4_target_velocity:+.4f}rad/s, "
                 f"J6_target_velocity={self.semantic_j6_target_velocity:+.4f}rad/s, "
+                f"goal_velocity={self.target_q_velocity.round(4).tolist()}rad/s, "
                 f"stream_velocity={self.stream_target_velocity.round(4).tolist()}rad/s, "
                 f"articulation={'ready' if articulation_ready else 'locked'}, "
                 f"J6_clearance={'armed' if self.semantic_j6_clearance_enabled else 'locked'}, "
@@ -2839,6 +3105,7 @@ class B601PalmFollower:
                 f"J6_delta={np.rad2deg(roll_delta):+.1f}deg, "
                 f"J6_confirmed={np.rad2deg(self.semantic_j6_held_delta_rad):+.1f}deg, "
                 f"J6_direction={self.semantic_j6_active_direction:+d}, "
+                f"J6_activation={self.semantic_j6_activation_progress:.2f}, "
                 f"J6_pending={self.semantic_j6_candidate_count}/"
                 f"{self.wrist_twist_confirm_samples}:"
                 f"{self.wrist_twist_reverse_confirm_samples}, "
@@ -3490,6 +3757,14 @@ class B601PalmFollower:
             self.palm_filtered_offset = np.zeros(3) if self.palm_motion_locked else raw.copy()
             return self.palm_filtered_offset.copy()
         dt = max(0.001, min(now - self.last_palm_filter_time, 0.2))
+        # Bound one-frame vision innovations before they enter either the
+        # motion detector or the low-pass filter.  This removes RTMPose jumps
+        # without adding latency to ordinary continuous hand motion.
+        raw = self.last_palm_raw_offset + np.clip(
+            raw - self.last_palm_raw_offset,
+            -self.palm_filter_max_innovation_m,
+            self.palm_filter_max_innovation_m,
+        )
         speed = np.linalg.norm(raw - self.last_palm_raw_offset) / dt
         self.last_palm_raw_offset = raw.copy()
         self.last_palm_filter_time = now
@@ -3502,7 +3777,18 @@ class B601PalmFollower:
             else:
                 self.palm_filtered_offset[:] = 0.0
                 return self.palm_filtered_offset.copy()
-        alpha = float(np.clip(self.palm_filter_alpha, 0.0, 1.0))
+        # One-Euro-style adaptive smoothing: stay quiet around a stationary
+        # palm, but raise the bandwidth as soon as deliberate motion appears.
+        speed_fraction = speed / (speed + self.palm_filter_speed_scale_m_s)
+        fast_alpha = max(self.palm_filter_alpha, self.palm_filter_fast_alpha)
+        alpha = float(
+            np.clip(
+                self.palm_filter_alpha
+                + (fast_alpha - self.palm_filter_alpha) * speed_fraction,
+                0.0,
+                1.0,
+            )
+        )
         self.palm_filtered_offset = alpha * raw + (1.0 - alpha) * self.palm_filtered_offset
         return self.palm_filtered_offset.copy()
 
