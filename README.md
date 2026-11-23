@@ -197,9 +197,9 @@ J4 另外使用两级抑振：任务空间的前后/上下目标先按最大速�
 必须先完成上面的桌面姿态标定。下面的第一阶段已经提高到肉眼可见但仍受约束的
 验证范围：目标 TCP 抬升约 `25 mm`，J2/J3/J4 最大偏移约 `4.6°/5.7°/4.0°`，
 同时把六轴 MIT 总指令力矩分别限制为 `8/10/16/6/4/4 Nm`。灵巧手保持关闭。
-TensorRT engine 必须在当前目标 Jetson 上构建；不要跨 GPU、JetPack 或 TensorRT
-版本复制 engine。三份最新日志中的语义目标周期中位数约为 `0.133s`（约 `7.5Hz`），
-且 TensorRT 明确报告跨设备 plan 警告，因此先从 ONNX 重建本机 engine：
+TensorRT 日志确认只有旧 `rtmpose_hand.engine` 在当前板卡上触发跨设备 plan 警告；
+既有 detector 与 body engine 能稳定输出约 `0.83--0.90` 的人物置信度。默认只重建
+hand engine，避免未经视觉验证的新 detector 取代已知正常的检测器：
 
 ```bash
 cd "$HOME/ws/Jetson_Femto_reBot_B601_BrainCo_Demo_RTMPose_TensorRT"
@@ -207,10 +207,11 @@ export SOURCE_ONNX_DIR="$HOME/ws/Jetson_Femto_Realman_Brainco_Demo_RTMPose_Tenso
 bash scripts/build_b601_local_tensorrt.sh
 ```
 
-输出位于 `models/tensorrt_local`，并记录 `build_info.txt`。后续平滑跟随脚本会自动
-优先选择这组三个本机 engine，并打印 `Engine profile: target-local`；若仍显示
-`legacy-fallback`，脚本会拒绝真机启动。仅排查旧环境时可临时设置
-`B601_ALLOW_LEGACY_ENGINES=1`，但不要用该覆盖进行完整跟随测试。
+输出位于 `models/tensorrt_local`，并记录 `build_info.txt`。后续平滑跟随脚本自动选择
+“已验证 detector + 已验证 body + 本机 hand”，并打印
+`Engine profile: verified-hybrid`。只有专门诊断三份本机 engine 时才设置
+`B601_USE_ALL_LOCAL_ENGINES=1`；最新实测中的本机 detector 无法识别人，不能用于真机
+跟随。若需要强制重建全部模型，可显式设置 `B601_ENGINE_SET=all`。
 
 为避免旧 shell 函数继续覆盖成 12 mm 小幅参数，仓库同时提供可直接运行的明显运动
 验证入口。`TABLE_Q` 必须使用本机最新读取的桌面姿态：

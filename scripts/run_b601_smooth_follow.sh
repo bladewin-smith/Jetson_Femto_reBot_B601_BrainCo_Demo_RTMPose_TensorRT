@@ -6,6 +6,9 @@ REPO="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 SOURCE_MODEL_DIR="${SOURCE_MODEL_DIR:-$HOME/ws/Jetson_Femto_Realman_Brainco_Demo_RTMPose_TensorRT/models}"
 LOCAL_ENGINE_DIR="${B601_LOCAL_ENGINE_DIR:-$REPO/models/tensorrt_local}"
 CHANNELS="${1:-[1.0,1.0,0.0,0.0,1.0,1.0]}"
+VERIFIED_DET_ENGINE="$SOURCE_MODEL_DIR/tensorrt_orin_nano_20261102_170600/rtmdet_nano.engine"
+VERIFIED_BODY_ENGINE="$SOURCE_MODEL_DIR/tensorrt_pose_fp32/rtmpose_body.engine"
+LOCAL_HAND_ENGINE="$LOCAL_ENGINE_DIR/rtmpose_hand.engine"
 
 if [[ -z "${TABLE_Q:-}" ]]; then
   echo "TABLE_Q is required and must be this arm's freshly measured table pose." >&2
@@ -13,10 +16,11 @@ if [[ -z "${TABLE_Q:-}" ]]; then
   exit 2
 fi
 
-# Prefer engines built in this repository on the current Jetson.  TensorRT
-# plans are not portable between GPU/JetPack/TensorRT combinations; the old
-# mixed RealMan paths remain only as a migration fallback. Explicit paths
-# always take precedence.
+# The hardware logs prove that the existing detector/body plans recognize the
+# operator on this board without a compatibility warning.  Only the old hand
+# plan produced TensorRT's cross-device warning, so replace that component with
+# the target-local hand plan.  The newly rebuilt detector is kept opt-in until
+# its numerical output has been validated on a real camera frame.
 CUSTOM_ENGINE_COUNT=0
 if [[ -n "${DET_ENGINE:-}" ]]; then ((CUSTOM_ENGINE_COUNT += 1)); fi
 if [[ -n "${BODY_ENGINE:-}" ]]; then ((CUSTOM_ENGINE_COUNT += 1)); fi
@@ -25,31 +29,27 @@ if (( CUSTOM_ENGINE_COUNT != 0 && CUSTOM_ENGINE_COUNT != 3 )); then
   echo "Set DET_ENGINE, BODY_ENGINE and HAND_ENGINE together, or unset all three." >&2
   exit 2
 fi
-if [[ -s "$LOCAL_ENGINE_DIR/rtmdet_nano.engine" \
-   && -s "$LOCAL_ENGINE_DIR/rtmpose_body.engine" \
-   && -s "$LOCAL_ENGINE_DIR/rtmpose_hand.engine" ]]; then
-  DEFAULT_DET_ENGINE="$LOCAL_ENGINE_DIR/rtmdet_nano.engine"
-  DEFAULT_BODY_ENGINE="$LOCAL_ENGINE_DIR/rtmpose_body.engine"
-  DEFAULT_HAND_ENGINE="$LOCAL_ENGINE_DIR/rtmpose_hand.engine"
-  ENGINE_PROFILE="target-local"
-else
-  DEFAULT_DET_ENGINE="$SOURCE_MODEL_DIR/tensorrt_orin_nano_20261102_170600/rtmdet_nano.engine"
-  DEFAULT_BODY_ENGINE="$SOURCE_MODEL_DIR/tensorrt_pose_fp32/rtmpose_body.engine"
-  DEFAULT_HAND_ENGINE="$SOURCE_MODEL_DIR/tensorrt/rtmpose_hand.engine"
-  ENGINE_PROFILE="legacy-fallback"
-fi
-DET_ENGINE="${DET_ENGINE:-$DEFAULT_DET_ENGINE}"
-BODY_ENGINE="${BODY_ENGINE:-$DEFAULT_BODY_ENGINE}"
-HAND_ENGINE="${HAND_ENGINE:-$DEFAULT_HAND_ENGINE}"
 if (( CUSTOM_ENGINE_COUNT == 3 )); then
   ENGINE_PROFILE="custom"
-fi
-if [[ "$ENGINE_PROFILE" == "legacy-fallback" \
-   && "${B601_ALLOW_LEGACY_ENGINES:-0}" != "1" ]]; then
-  echo "Refusing legacy mixed TensorRT plans because they can add latency and" >&2
-  echo "produce the cross-device compatibility warning seen in the test logs." >&2
-  echo "Build target-local plans with: bash scripts/build_b601_local_tensorrt.sh" >&2
-  echo "Temporary diagnostic override: export B601_ALLOW_LEGACY_ENGINES=1" >&2
+elif [[ "${B601_USE_ALL_LOCAL_ENGINES:-0}" == "1" \
+     && -s "$LOCAL_ENGINE_DIR/rtmdet_nano.engine" \
+     && -s "$LOCAL_ENGINE_DIR/rtmpose_body.engine" \
+     && -s "$LOCAL_ENGINE_DIR/rtmpose_hand.engine" ]]; then
+  DET_ENGINE="$LOCAL_ENGINE_DIR/rtmdet_nano.engine"
+  BODY_ENGINE="$LOCAL_ENGINE_DIR/rtmpose_body.engine"
+  HAND_ENGINE="$LOCAL_ENGINE_DIR/rtmpose_hand.engine"
+  ENGINE_PROFILE="all-local-experimental"
+elif [[ -s "$VERIFIED_DET_ENGINE" \
+     && -s "$VERIFIED_BODY_ENGINE" \
+     && -s "$LOCAL_HAND_ENGINE" ]]; then
+  DET_ENGINE="$VERIFIED_DET_ENGINE"
+  BODY_ENGINE="$VERIFIED_BODY_ENGINE"
+  HAND_ENGINE="$LOCAL_HAND_ENGINE"
+  ENGINE_PROFILE="verified-hybrid"
+else
+  echo "No validated B601 TensorRT engine profile is available." >&2
+  echo "Expected the verified detector/body plans plus a target-local hand plan." >&2
+  echo "Build the hand plan with: bash scripts/build_b601_local_tensorrt.sh" >&2
   exit 2
 fi
 for file in "$DET_ENGINE" "$BODY_ENGINE" "$HAND_ENGINE"; do
@@ -58,8 +58,9 @@ for file in "$DET_ENGINE" "$BODY_ENGINE" "$HAND_ENGINE"; do
     exit 2
   fi
 done
-if [[ "$ENGINE_PROFILE" == "legacy-fallback" ]]; then
-  echo "WARNING: legacy TensorRT diagnostic override is active." >&2
+if [[ "$ENGINE_PROFILE" == "all-local-experimental" ]]; then
+  echo "WARNING: the all-local detector is experimental and failed the latest" >&2
+  echo "         live person-detection test." >&2
 fi
 
 if [[ -f /opt/ros/humble/setup.bash ]]; then

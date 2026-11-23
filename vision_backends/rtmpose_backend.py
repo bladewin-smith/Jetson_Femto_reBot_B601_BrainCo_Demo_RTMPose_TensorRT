@@ -335,6 +335,7 @@ class RTMPoseLandmarkDetector:
         self._cached_hand_points: dict[str, tuple[int, int]] = {}
         self._hand_keypoint_cache: dict[str, tuple[tuple[int, int], int]] = {}
         self._hand_keypoint_filter: dict[str, np.ndarray] = {}
+        self._last_empty_detector_log_time = -math.inf
 
     def detect_persons(self, image_bgr: np.ndarray) -> list[PersonDetection]:
         bboxes, labels = self.runtime.detect(np.ascontiguousarray(image_bgr))
@@ -348,6 +349,31 @@ class RTMPoseLandmarkDetector:
             x0, y0, x1, y1 = self._clamp_bbox(bbox[:4], image_bgr.shape[1], image_bgr.shape[0])
             if x1 - x0 >= 8 and y1 - y0 >= 8:
                 detections.append(PersonDetection((x0, y0, x1, y1), score))
+        if not detections and self.logger is not None:
+            now = time.monotonic()
+            if now - self._last_empty_detector_log_time >= 2.0:
+                diagnostics = getattr(
+                    self.runtime, "last_detector_diagnostics", {}
+                )
+                if diagnostics:
+                    max_score = float(diagnostics.get("max_score", float("nan")))
+                    message = (
+                        "RTMDet produced no accepted person: "
+                        f"raw={int(diagnostics.get('raw', 0))}, "
+                        f"finite={int(diagnostics.get('finite', 0))}, "
+                        f"max_score={max_score:.6f}, "
+                        f"above_decode={int(diagnostics.get('above_decode', 0))}, "
+                        f"after_nms={int(diagnostics.get('kept', 0))}, "
+                        f"person_threshold={self.person_score_threshold:.3f}"
+                    )
+                    log_method = (
+                        getattr(self.logger, "warning", None)
+                        or getattr(self.logger, "warn", None)
+                        or getattr(self.logger, "info", None)
+                    )
+                    if log_method is not None:
+                        log_method(message)
+                self._last_empty_detector_log_time = now
         return sorted(detections, key=lambda item: item.score, reverse=True)
 
     def collect(

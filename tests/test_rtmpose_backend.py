@@ -20,6 +20,13 @@ class FakeRuntime:
         self.pose_calls = []
         self.hand_scores = np.full(21, 0.9, np.float32)
         self.hand_shift = np.zeros(2, np.float32)
+        self.last_detector_diagnostics = {
+            "raw": 2,
+            "finite": 2,
+            "max_score": 0.9,
+            "above_decode": 2,
+            "kept": 2,
+        }
 
     def detect(self, _image):
         return (

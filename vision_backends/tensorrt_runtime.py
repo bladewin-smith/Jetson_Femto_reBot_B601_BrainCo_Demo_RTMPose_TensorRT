@@ -361,6 +361,7 @@ class TensorRTRuntime:
         self.detector_nms_iou_threshold = float(detector_nms_iou_threshold)
         self.detector_max_detections = max(1, int(detector_max_detections))
         self.pose_bbox_padding = max(1.0, float(pose_bbox_padding))
+        self.last_detector_diagnostics: dict[str, float | int] = {}
 
     def detect(self, image_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         _, _, input_height, input_width = self.detector.input_shape_nchw()
@@ -369,7 +370,17 @@ class TensorRTRuntime:
         )
         outputs = self.detector.infer(tensor)
         boxes, scores, labels = self._decode_detector_outputs(outputs)
+        finite_scores = scores[np.isfinite(scores)]
         valid = np.isfinite(scores) & (scores >= self.detector_score_threshold)
+        self.last_detector_diagnostics = {
+            "raw": int(scores.size),
+            "finite": int(finite_scores.size),
+            "max_score": (
+                float(np.max(finite_scores)) if finite_scores.size else float("nan")
+            ),
+            "above_decode": int(np.count_nonzero(valid)),
+            "kept": 0,
+        }
         boxes, scores, labels = boxes[valid], scores[valid], labels[valid]
         if boxes.size == 0:
             return np.empty((0, 5), np.float32), np.empty((0,), np.int64)
@@ -386,6 +397,7 @@ class TensorRTRuntime:
             keep_parts.extend(indices[kept].tolist())
         keep = np.asarray(keep_parts, dtype=np.int64)
         keep = keep[np.argsort(scores[keep])[::-1]][: self.detector_max_detections]
+        self.last_detector_diagnostics["kept"] = int(keep.size)
         boxes = boxes[keep] / max(resize_ratio, 1e-8)
         image_height, image_width = image_bgr.shape[:2]
         boxes[:, 0::2] = np.clip(boxes[:, 0::2], 0.0, float(image_width))

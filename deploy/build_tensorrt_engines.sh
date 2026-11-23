@@ -24,6 +24,14 @@ else
 fi
 
 mkdir -p "$ENGINE_DIR"
+TRT_BUILDER_OPT_LEVEL="${TRT_BUILDER_OPT_LEVEL:-3}"
+TRT_AVG_TIMING="${TRT_AVG_TIMING:-8}"
+
+if [[ ! "$TRT_BUILDER_OPT_LEVEL" =~ ^[0-5]$ \
+   || ! "$TRT_AVG_TIMING" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Invalid TRT_BUILDER_OPT_LEVEL or TRT_AVG_TIMING." >&2
+  exit 2
+fi
 
 build_engine() {
   local model_name="$1"
@@ -39,7 +47,8 @@ build_engine() {
     --saveEngine="$engine_path" \
     --fp16 \
     --memPoolSize=workspace:1024 \
-    --builderOptimizationLevel=3 \
+    --builderOptimizationLevel="$TRT_BUILDER_OPT_LEVEL" \
+    --avgTiming="$TRT_AVG_TIMING" \
     --skipInference
   [[ -s "$engine_path" ]] || {
     echo "TensorRT did not create $engine_path" >&2
@@ -47,8 +56,19 @@ build_engine() {
   }
 }
 
-build_engine rtmdet_nano
-build_engine rtmpose_body
-build_engine rtmpose_hand
+if [[ $# -ge 3 ]]; then
+  MODELS=("${@:3}")
+else
+  MODELS=(rtmdet_nano rtmpose_body rtmpose_hand)
+fi
+for model_name in "${MODELS[@]}"; do
+  case "$model_name" in
+    rtmdet_nano|rtmpose_body|rtmpose_hand) build_engine "$model_name" ;;
+    *)
+      echo "Unknown TensorRT model: $model_name" >&2
+      exit 2
+      ;;
+  esac
+done
 
 echo "TensorRT engines are ready in $ENGINE_DIR"

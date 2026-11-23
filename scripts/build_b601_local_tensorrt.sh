@@ -6,12 +6,34 @@ REPO="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 LOCAL_ONNX_DIR="$REPO/models/onnx"
 LEGACY_ONNX_DIR="$HOME/ws/Jetson_Femto_Realman_Brainco_Demo_RTMPose_TensorRT/models/onnx"
 ENGINE_DIR="${B601_LOCAL_ENGINE_DIR:-$REPO/models/tensorrt_local}"
+ENGINE_SET="${B601_ENGINE_SET:-hand}"
+
+case "$ENGINE_SET" in
+  hand)
+    REQUIRED_MODELS=(rtmpose_hand)
+    BUILD_MODELS=(rtmpose_hand)
+    BUILD_OPT_LEVEL="${TRT_BUILDER_OPT_LEVEL:-2}"
+    AVG_TIMING="${TRT_AVG_TIMING:-1}"
+    ;;
+  all)
+    REQUIRED_MODELS=(rtmdet_nano rtmpose_body rtmpose_hand)
+    BUILD_MODELS=(rtmdet_nano rtmpose_body rtmpose_hand)
+    BUILD_OPT_LEVEL="${TRT_BUILDER_OPT_LEVEL:-3}"
+    AVG_TIMING="${TRT_AVG_TIMING:-8}"
+    ;;
+  *)
+    echo "B601_ENGINE_SET must be 'hand' or 'all': $ENGINE_SET" >&2
+    exit 2
+    ;;
+esac
 
 has_models() {
   local directory="$1"
-  [[ -s "$directory/rtmdet_nano.onnx" \
-     && -s "$directory/rtmpose_body.onnx" \
-     && -s "$directory/rtmpose_hand.onnx" ]]
+  local model_name
+  for model_name in "${REQUIRED_MODELS[@]}"; do
+    [[ -s "$directory/$model_name.onnx" ]] || return 1
+  done
+  return 0
 }
 
 if [[ -n "${SOURCE_ONNX_DIR:-}" ]]; then
@@ -21,9 +43,8 @@ elif has_models "$LOCAL_ONNX_DIR"; then
 elif has_models "$LEGACY_ONNX_DIR"; then
   ONNX_DIR="$LEGACY_ONNX_DIR"
 else
-  echo "The three ONNX models were not found." >&2
-  echo "Set SOURCE_ONNX_DIR to the directory containing rtmdet_nano.onnx," >&2
-  echo "rtmpose_body.onnx and rtmpose_hand.onnx." >&2
+  echo "The required ONNX model set was not found: $ENGINE_SET" >&2
+  echo "Set SOURCE_ONNX_DIR to the ONNX model directory." >&2
   exit 2
 fi
 
@@ -32,10 +53,13 @@ if ! has_models "$ONNX_DIR"; then
   exit 2
 fi
 
-echo "Building B601 vision engines on this Jetson"
+echo "Building B601 vision engine set on this Jetson: $ENGINE_SET"
 echo "ONNX source: $ONNX_DIR"
 echo "Engine output: $ENGINE_DIR"
-bash "$REPO/deploy/build_tensorrt_engines.sh" "$ONNX_DIR" "$ENGINE_DIR"
+TRT_BUILDER_OPT_LEVEL="$BUILD_OPT_LEVEL" \
+TRT_AVG_TIMING="$AVG_TIMING" \
+  bash "$REPO/deploy/build_tensorrt_engines.sh" \
+    "$ONNX_DIR" "$ENGINE_DIR" "${BUILD_MODELS[@]}"
 
 {
   echo "built_at=$(date --iso-8601=seconds)"
@@ -48,8 +72,11 @@ bash "$REPO/deploy/build_tensorrt_engines.sh" "$ONNX_DIR" "$ENGINE_DIR"
     dpkg-query -W -f='tensorrt=${Version}\n' tensorrt 2>/dev/null || true
     dpkg-query -W -f='libnvinfer=${Version}\n' libnvinfer10 2>/dev/null || true
   fi
+  echo "engine_set=$ENGINE_SET"
+  echo "builder_optimization_level=$BUILD_OPT_LEVEL"
+  echo "avg_timing=$AVG_TIMING"
   echo "onnx_source=$ONNX_DIR"
 } > "$ENGINE_DIR/build_info.txt"
 
-echo "Target-local TensorRT profile is ready."
-echo "scripts/run_b601_smooth_follow.sh will select it automatically."
+echo "Target-local TensorRT engine set is ready: $ENGINE_SET"
+echo "scripts/run_b601_smooth_follow.sh will select the validated profile."
