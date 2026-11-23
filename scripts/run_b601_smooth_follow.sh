@@ -179,6 +179,7 @@ exec python "$REPO/scripts/camera_arm_b601_control_pose_hands.py" --ros-args \
   -p b601_stream_goal_velocity_max_hold_s:=0.55 \
   -p b601_stream_goal_observed_period_max_s:=0.50 \
   -p b601_semantic_outer_dt_max_s:=0.35 \
+  -p b601_stream_trajectory_dt_max_s:=0.012 \
   -p b601_stream_position_correction_gain_s:=4.0 \
   -p b601_stream_position_correction_max_fraction:=0.35 \
   -p b601_stream_planar_position_correction_min_fraction:=0.18 \

@@ -10,6 +10,7 @@ from arm_control.rebot_b601 import (
     adaptive_goal_velocity_hold_s,
     adaptive_position_correction_fraction,
     apply_tabletop_motion_envelope,
+    bounded_wall_clock_trajectory_dt,
     coupled_stream_velocity_limits,
     confirmed_stationary_planar_target,
     confirm_vector_reversals,
@@ -583,6 +584,23 @@ def test_goal_velocity_hold_adapts_to_slow_vision_without_exceeding_cap():
     assert adaptive_goal_velocity_hold_s(0.04, 0.30, 2.0, 0.55) == pytest.approx(
         0.45
     )
+
+
+def test_wall_clock_trajectory_dt_uses_real_controller_period():
+    assert bounded_wall_clock_trajectory_dt(0.0042, 0.002, 0.012) == pytest.approx(
+        0.0042
+    )
+
+
+def test_wall_clock_trajectory_dt_caps_stalls_and_recovers_invalid_samples():
+    assert bounded_wall_clock_trajectory_dt(0.050, 0.002, 0.012) == pytest.approx(
+        0.012
+    )
+    assert bounded_wall_clock_trajectory_dt(float("nan"), 0.002, 0.012) == (
+        pytest.approx(0.002)
+    )
+    with pytest.raises(ValueError):
+        bounded_wall_clock_trajectory_dt(0.004, 0.002, 0.001)
 
 
 def test_goal_velocity_preserves_planar_group_shape_and_resets_on_reversal():

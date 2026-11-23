@@ -1373,6 +1373,36 @@ def adaptive_goal_velocity_hold_s(
     return float(min(maximum, max(nominal_hold, measured_hold)))
 
 
+def bounded_wall_clock_trajectory_dt(
+    measured_period_s: float,
+    nominal_period_s: float,
+    maximum_period_s: float,
+) -> float:
+    """Use real controller cadence without turning a long stall into a jump.
+
+    The upstream reBotArm loop passes its requested period to every callback,
+    even when six serial MIT transactions make the wall-clock period longer.
+    Integrating a rad/s trajectory with that optimistic period makes the arm
+    proportionally slower and accentuates frame-by-frame motion.  A measured
+    period restores real-time velocity; the upper bound remains fail-closed
+    for debugger pauses or temporary scheduling stalls.
+    """
+
+    measured = float(measured_period_s)
+    nominal = float(nominal_period_s)
+    maximum = float(maximum_period_s)
+    if (
+        not np.isfinite(nominal)
+        or nominal <= 0.0
+        or not np.isfinite(maximum)
+        or maximum < nominal
+    ):
+        raise ValueError("trajectory nominal/maximum periods are invalid")
+    if not np.isfinite(measured) or measured <= 0.0:
+        measured = nominal
+    return float(np.clip(measured, 0.25 * nominal, maximum))
+
+
 def filtered_goal_velocity(
     requested_position: Sequence[float],
     previous_position: Sequence[float],
@@ -1997,6 +2027,19 @@ class B601PalmFollower:
         )
         if not np.isfinite(self.control_rate_hz) or self.control_rate_hz <= 0.0:
             raise ValueError("b601_control_rate_hz must be positive and finite")
+        self.stream_trajectory_dt_max_s = float(
+            node.declare_parameter(
+                "b601_stream_trajectory_dt_max_s", 0.012
+            ).value
+        )
+        if (
+            not np.isfinite(self.stream_trajectory_dt_max_s)
+            or self.stream_trajectory_dt_max_s < 1.0 / self.control_rate_hz
+        ):
+            raise ValueError(
+                "b601_stream_trajectory_dt_max_s must cover the nominal "
+                "B601 control period"
+            )
         # These high-rate limits shape the setpoint sent on every MotorBridge
         # cycle.  Semantic J1/J4/J6 limits below remain authoritative when they
         # are lower, preserving existing launch-command tuning.
@@ -3071,6 +3114,11 @@ class B601PalmFollower:
             self.stream_planar_position_correction_min_fraction
         )
         self.last_stream_planar_lead_ratio = 0.0
+        nominal_control_period_s = 1.0 / self.control_rate_hz
+        self.last_control_loop_started_s = 0.0
+        self.last_control_wall_dt_s = nominal_control_period_s
+        self.last_control_trajectory_dt_s = nominal_control_period_s
+        self.control_period_ema_s = nominal_control_period_s
         self.last_command_effort = np.zeros(self.ARM_DOF, dtype=np.float64)
         self.last_effort_limited = np.zeros(self.ARM_DOF, dtype=bool)
         self.last_motor_status = np.zeros(self.ARM_DOF, dtype=np.int64)
@@ -3382,6 +3430,28 @@ class B601PalmFollower:
 
     def _control_loop(self, robot: Any, dt: float) -> None:
         try:
+            callback_started_s = time.perf_counter()
+            nominal_dt = 1.0 / self.control_rate_hz
+            wall_dt = (
+                nominal_dt
+                if self.last_control_loop_started_s <= 0.0
+                else callback_started_s - self.last_control_loop_started_s
+            )
+            self.last_control_loop_started_s = callback_started_s
+            if not np.isfinite(wall_dt) or wall_dt <= 0.0:
+                wall_dt = nominal_dt
+            trajectory_dt = bounded_wall_clock_trajectory_dt(
+                wall_dt,
+                nominal_dt,
+                self.stream_trajectory_dt_max_s,
+            )
+            self.last_control_wall_dt_s = wall_dt
+            self.last_control_trajectory_dt_s = trajectory_dt
+            cadence_alpha = 0.05
+            self.control_period_ema_s = (
+                cadence_alpha * wall_dt
+                + (1.0 - cadence_alpha) * self.control_period_ema_s
+            )
             with self.sdk_lock:
                 q = np.asarray(robot.arm.get_positions(), dtype=np.float64)[: self.ARM_DOF]
                 dq = np.asarray(
@@ -3416,12 +3486,6 @@ class B601PalmFollower:
                 measured_tau = np.asarray(
                     [float(getattr(state, "torq", 0.0)) for state in states],
                     dtype=np.float64,
-                )
-                nominal_dt = 1.0 / self.control_rate_hz
-                trajectory_dt = (
-                    nominal_dt
-                    if not np.isfinite(dt) or float(dt) <= 0.0
-                    else float(np.clip(float(dt), 0.25 * nominal_dt, 2.0 * nominal_dt))
                 )
                 with self.target_lock:
                     goal_q = q.copy() if self.target_q is None else self.target_q.copy()
@@ -4702,6 +4766,9 @@ class B601PalmFollower:
                 f"observed_period={self.last_target_q_observed_period_s:.3f}s, "
                 f"goal_period={self.target_q_update_period_s:.3f}s, "
                 f"goal_hold={self.last_goal_velocity_hold_s:.3f}s, "
+                f"control_rate={1.0 / max(self.control_period_ema_s, 1e-6):.1f}Hz, "
+                f"control_dt={1000.0 * self.last_control_wall_dt_s:.2f}ms/"
+                f"{1000.0 * self.last_control_trajectory_dt_s:.2f}ms, "
                 f"stream_planar_correction="
                 f"{self.last_stream_planar_correction_fraction:.3f}@"
                 f"{self.last_stream_planar_lead_ratio:.2f}, "

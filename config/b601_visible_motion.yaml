@@ -71,6 +71,10 @@ hand_palm_b601_control_node:
     b601_stream_goal_velocity_max_hold_s: 0.55
     b601_stream_goal_observed_period_max_s: 0.50
     b601_semantic_outer_dt_max_s: 0.35
+    # MotorBridge supplies the requested 500 Hz period even when the six-axis
+    # serial loop runs slower. Integrate against measured wall time, capped so
+    # an exceptional scheduling pause cannot produce a large target jump.
+    b601_stream_trajectory_dt_max_s: 0.012
     # Resolved-rate velocity is primary. Planar position correction rises
     # smoothly from 18% to 32% only as target lead approaches its tracking
     # window, preventing both early arrival and gravity-loaded ratcheting.
