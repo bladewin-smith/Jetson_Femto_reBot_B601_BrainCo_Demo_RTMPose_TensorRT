@@ -74,6 +74,7 @@ export PYTHONPATH="$HOME/ws/pyorbbecsdk-2-main:$HOME/ws/brainco-hand-sdk-main/py
 echo "B601 continuous semantic follower"
 echo "Planar control: resolved-rate J2/J3/J4 + task anti-windup + continuous clearance gate"
 echo "Vertical safety: anatomical-wrist anchor + wrist-rotation rebase + no-descent guard"
+echo "Palm observation: frame-period-aware smoothing with bounded latency"
 echo "MIT stream: coordinated velocity interpolation + bounded position correction + adaptive frame hold"
 echo "Workspace: Seeed published range intersected with current DM URDF, plus 0.10 rad margin"
 echo "Channels: $CHANNELS"
@@ -90,6 +91,9 @@ exec python "$REPO/scripts/camera_arm_b601_control_pose_hands.py" --ros-args \
   -p rtmdet_engine_path:="$DET_ENGINE" \
   -p rtmpose_body_engine_path:="$BODY_ENGINE" \
   -p rtmpose_hand_engine_path:="$HAND_ENGINE" \
+  -p rtmdet_inference_hz:=4.0 \
+  -p finger_segmentation_enabled:=false \
+  -p finger_segmentation_debug_overlay:=false \
   -p robot_motion_enabled:=true \
   -p b601_tabletop_startup_confirmed:=true \
   -p b601_tabletop_joints_rad:="$TABLE_Q" \
@@ -116,13 +120,16 @@ exec python "$REPO/scripts/camera_arm_b601_control_pose_hands.py" --ros-args \
   -p b601_semantic_stall_error_rad:='[0.010,0.015,0.030,0.025,0.010,0.018]' \
   -p b601_semantic_stall_min_progress_rad:=0.0010 \
   -p b601_semantic_stall_timeout_s:=6.0 \
-  -p palm_filter_alpha:=0.38 \
-  -p palm_filter_fast_alpha:=0.72 \
-  -p palm_filter_speed_scale_m_s:=0.30 \
+  -p palm_filter_alpha:=0.42 \
+  -p palm_filter_fast_alpha:=0.80 \
+  -p palm_filter_speed_scale_m_s:=0.10 \
+  -p palm_filter_max_time_constant_s:=0.22 \
+  -p palm_filter_hold_deadband_m:=0.006 \
+  -p palm_filter_release_deadband_m:=0.010 \
   -p palm_filter_max_innovation_m:='[0.030,0.030,0.030]' \
   -p b601_semantic_planar_input_scale:='[0.45,1.0]' \
   -p b601_semantic_motion_reverse_deadband_m:='[0.0045,0.0035,0.0040]' \
-  -p b601_semantic_motion_reverse_confirm_samples:=3 \
+  -p b601_semantic_motion_reverse_confirm_samples:=2 \
   -p b601_semantic_planar_command_max_velocity_m_s:='[0.060,0.040]' \
   -p b601_semantic_planar_command_max_acceleration_m_s2:='[0.24,0.12]' \
   -p b601_semantic_planar_command_deadband_m:='[0.0012,0.0015]' \

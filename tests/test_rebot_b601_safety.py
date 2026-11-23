@@ -25,6 +25,7 @@ from arm_control.rebot_b601 import (
     jerk_limited_joint_target,
     joint_tracking_bounds,
     joint_target_safety_violations,
+    latency_bounded_palm_filter_alpha,
     limit_mit_target_by_effort,
     minimum_jerk_blend,
     ramp_joint_target_with_tracking_window,
@@ -46,6 +47,34 @@ from arm_control.rebot_b601 import (
     wrist_hold_vertical_planner_state,
     wrapped_rate_motion_hold,
 )
+
+
+def test_palm_filter_bounds_real_time_lag_at_slow_vision_rate():
+    alpha = latency_bounded_palm_filter_alpha(
+        base_alpha=0.38,
+        fast_alpha=0.72,
+        speed_m_s=0.02,
+        speed_scale_m_s=0.30,
+        dt_s=0.18,
+        max_time_constant_s=0.22,
+    )
+
+    adaptive_only = 0.38 + (0.72 - 0.38) * (0.02 / (0.02 + 0.30))
+    assert alpha > adaptive_only
+    assert alpha == pytest.approx(1.0 - np.exp(-0.18 / 0.22))
+
+
+def test_palm_filter_keeps_speed_adaptive_alpha_at_high_frame_rate():
+    alpha = latency_bounded_palm_filter_alpha(
+        base_alpha=0.42,
+        fast_alpha=0.80,
+        speed_m_s=0.10,
+        speed_scale_m_s=0.10,
+        dt_s=0.02,
+        max_time_constant_s=0.22,
+    )
+
+    assert alpha == pytest.approx(0.61)
 
 
 def test_tabletop_startup_accepts_stationary_reference_pose():

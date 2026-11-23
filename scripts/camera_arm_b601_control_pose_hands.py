@@ -6960,6 +6960,10 @@ class HandPalmB601ControlNode(Node):
             f"runtime={rtmpose_runtime if self.vision_backend == 'rtmpose' else mp_pose_backend}, "
             f"control_hand={self.kinematics.control_hand_side}, "
             f"hand_interval={rtmpose_hand_inference_interval if self.vision_backend == 'rtmpose' else 1}, "
+            f"detector_hz="
+            f"{self.person_selector.detector_hz if self.vision_backend == 'rtmpose' else 'n/a'}, "
+            f"finger_segmentation="
+            f"{'on' if finger_segmentation_enabled else 'off'}, "
             f"depth_enhancement="
             f"{self.depth_enhancer.backend if self.depth_enhancer else 'off'}"
         )

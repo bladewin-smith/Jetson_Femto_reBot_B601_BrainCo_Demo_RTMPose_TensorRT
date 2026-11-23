@@ -54,6 +54,51 @@ def _positive_vector(values: Sequence[float], size: int, name: str) -> np.ndarra
     return result
 
 
+def latency_bounded_palm_filter_alpha(
+    base_alpha: float,
+    fast_alpha: float,
+    speed_m_s: float,
+    speed_scale_m_s: float,
+    dt_s: float,
+    max_time_constant_s: float,
+) -> float:
+    """Return an adaptive palm-filter alpha with a real-time lag bound.
+
+    A fixed per-frame alpha becomes unexpectedly sluggish when TensorRT pose
+    updates arrive at only 5--7 Hz: the same nominal smoothing can then add
+    several hundred milliseconds of group delay. Keep the existing
+    speed-adaptive bandwidth, but impose the alpha needed for the filter to
+    have at most ``max_time_constant_s`` of time constant at the measured
+    observation period. This only moves the filtered observation toward the
+    current measured sample; it does not extrapolate past it.
+    """
+
+    values = np.asarray(
+        [
+            base_alpha,
+            fast_alpha,
+            speed_m_s,
+            speed_scale_m_s,
+            dt_s,
+            max_time_constant_s,
+        ],
+        dtype=np.float64,
+    )
+    if not np.all(np.isfinite(values)):
+        raise ValueError("palm filter alpha inputs must be finite")
+    if not 0.0 < base_alpha <= fast_alpha <= 1.0:
+        raise ValueError("palm filter alphas must satisfy 0 < base <= fast <= 1")
+    if speed_m_s < 0.0 or speed_scale_m_s <= 0.0:
+        raise ValueError("palm speed must be non-negative and scale must be positive")
+    if dt_s <= 0.0 or max_time_constant_s <= 0.0:
+        raise ValueError("palm filter dt and maximum time constant must be positive")
+
+    speed_fraction = speed_m_s / (speed_m_s + speed_scale_m_s)
+    adaptive_alpha = base_alpha + (fast_alpha - base_alpha) * speed_fraction
+    time_bounded_alpha = 1.0 - np.exp(-dt_s / max_time_constant_s)
+    return float(np.clip(max(adaptive_alpha, time_bounded_alpha), 0.0, 1.0))
+
+
 def weighted_damped_least_squares(
     jacobian: Sequence[Sequence[float]],
     error: Sequence[float],
@@ -2308,6 +2353,9 @@ class B601PalmFollower:
         self.palm_filter_speed_scale_m_s = float(
             node.declare_parameter("palm_filter_speed_scale_m_s", 0.30).value
         )
+        self.palm_filter_max_time_constant_s = float(
+            node.declare_parameter("palm_filter_max_time_constant_s", 0.22).value
+        )
         self.palm_filter_max_innovation_m = _positive_vector(
             node.declare_parameter(
                 "palm_filter_max_innovation_m", [0.030, 0.030, 0.030]
@@ -2322,10 +2370,12 @@ class B601PalmFollower:
             or not self.palm_filter_alpha <= self.palm_filter_fast_alpha <= 1.0
             or not np.isfinite(self.palm_filter_speed_scale_m_s)
             or self.palm_filter_speed_scale_m_s <= 0.0
+            or not np.isfinite(self.palm_filter_max_time_constant_s)
+            or self.palm_filter_max_time_constant_s <= 0.0
         ):
             raise ValueError(
                 "palm filter alpha must be in (0, 1], fast alpha cannot be "
-                "smaller, and speed scale must be positive"
+                "smaller, and speed scale/time constant must be positive"
             )
         self.camera_to_arm_matrix = _vector(
             node.declare_parameter(
@@ -3206,6 +3256,8 @@ class B601PalmFollower:
         self.last_palm_raw_offset = None
         self.last_palm_filter_time = 0.0
         self.palm_motion_locked = True
+        self.palm_filter_effective_alpha = 0.0
+        self.palm_filter_observed_speed_m_s = 0.0
 
         # Compatibility attributes read by the inherited direct-hand code.
         self.robot_ip = ""
@@ -4719,6 +4771,9 @@ class B601PalmFollower:
                 "B601 semantic: "
                 f"side={observation.side}, "
                 f"raw_motion={raw_motion_target.round(4).tolist()}m, "
+                f"palm_filter={self.palm_filter_effective_alpha:.2f}@"
+                f"{self.palm_filter_observed_speed_m_s:.3f}m/s:"
+                f"{'locked' if self.palm_motion_locked else 'tracking'}, "
                 f"lateral={lateral:+.4f}m, "
                 f"forward={forward:+.4f}m, planar_forward={forward_target:+.4f}m, "
                 f"lift={lift_target:+.4f}m, "
@@ -5653,6 +5708,8 @@ class B601PalmFollower:
     def _anti_drift_filter_offset(self, raw: np.ndarray) -> np.ndarray:
         raw = np.asarray(raw, dtype=np.float64)
         if not self.palm_filter_enabled:
+            self.palm_filter_effective_alpha = 1.0
+            self.palm_filter_observed_speed_m_s = 0.0
             return raw
         now = time.monotonic()
         if self.last_palm_raw_offset is None:
@@ -5660,8 +5717,12 @@ class B601PalmFollower:
             self.last_palm_filter_time = now
             self.palm_motion_locked = np.linalg.norm(raw) < self.palm_filter_release_deadband_m
             self.palm_filtered_offset = np.zeros(3) if self.palm_motion_locked else raw.copy()
+            self.palm_filter_effective_alpha = 0.0 if self.palm_motion_locked else 1.0
+            self.palm_filter_observed_speed_m_s = 0.0
             return self.palm_filtered_offset.copy()
-        dt = max(0.001, min(now - self.last_palm_filter_time, 0.2))
+        elapsed_s = now - self.last_palm_filter_time
+        motion_dt = max(0.001, min(elapsed_s, 0.2))
+        filter_dt = max(0.001, min(elapsed_s, 0.5))
         # Bound one-frame vision innovations before they enter either the
         # motion detector or the low-pass filter.  This removes RTMPose jumps
         # without adding latency to ordinary continuous hand motion.
@@ -5670,7 +5731,8 @@ class B601PalmFollower:
             -self.palm_filter_max_innovation_m,
             self.palm_filter_max_innovation_m,
         )
-        speed = np.linalg.norm(raw - self.last_palm_raw_offset) / dt
+        speed = np.linalg.norm(raw - self.last_palm_raw_offset) / motion_dt
+        self.palm_filter_observed_speed_m_s = float(speed)
         self.last_palm_raw_offset = raw.copy()
         self.last_palm_filter_time = now
         norm = np.linalg.norm(raw)
@@ -5681,19 +5743,23 @@ class B601PalmFollower:
                 self.palm_motion_locked = False
             else:
                 self.palm_filtered_offset[:] = 0.0
+                self.palm_filter_effective_alpha = 0.0
                 return self.palm_filtered_offset.copy()
-        # One-Euro-style adaptive smoothing: stay quiet around a stationary
-        # palm, but raise the bandwidth as soon as deliberate motion appears.
-        speed_fraction = speed / (speed + self.palm_filter_speed_scale_m_s)
+        # One-Euro-style adaptive smoothing stays quiet around a stationary
+        # palm and raises bandwidth during deliberate motion. The measured
+        # frame period also imposes a maximum real-time time constant, so a
+        # 5--7 Hz inference loop cannot turn a reasonable per-frame alpha into
+        # several hundred milliseconds of extra lag.
         fast_alpha = max(self.palm_filter_alpha, self.palm_filter_fast_alpha)
-        alpha = float(
-            np.clip(
-                self.palm_filter_alpha
-                + (fast_alpha - self.palm_filter_alpha) * speed_fraction,
-                0.0,
-                1.0,
-            )
+        alpha = latency_bounded_palm_filter_alpha(
+            self.palm_filter_alpha,
+            fast_alpha,
+            float(speed),
+            self.palm_filter_speed_scale_m_s,
+            filter_dt,
+            self.palm_filter_max_time_constant_s,
         )
+        self.palm_filter_effective_alpha = alpha
         self.palm_filtered_offset = alpha * raw + (1.0 - alpha) * self.palm_filtered_offset
         return self.palm_filtered_offset.copy()
 
@@ -5705,3 +5771,5 @@ class B601PalmFollower:
         self.last_palm_raw_offset = None
         self.last_palm_filter_time = 0.0
         self.palm_motion_locked = True
+        self.palm_filter_effective_alpha = 0.0
+        self.palm_filter_observed_speed_m_s = 0.0

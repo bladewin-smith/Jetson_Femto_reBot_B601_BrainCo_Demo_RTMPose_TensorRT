@@ -1,13 +1,26 @@
 hand_palm_b601_control_node:
   ros__parameters:
     b601_control_mode: semantic_joint
+    # The complete pose loop is about 6 Hz on Orin Nano. Running RTMDet at
+    # 8 Hz therefore repeated detection on every pose frame. Reuse its person
+    # box briefly so body/hand pose frames get more GPU time.
+    rtmdet_inference_hz: 4.0
+    # This profile disables BrainCo hand actuation; color segmentation is not
+    # needed for arm translation or RTMPose wrist-roll control.
+    finger_segmentation_enabled: false
+    finger_segmentation_debug_overlay: false
     # Camera-space anatomical-wrist smoothing before semantic mapping.
-    palm_filter_alpha: 0.30
+    palm_filter_alpha: 0.42
     # Adaptive bandwidth keeps a stationary palm quiet while reducing latency
     # during deliberate motion.  Per-frame innovation clipping rejects pose
     # estimator jumps before they can reverse a joint command.
-    palm_filter_fast_alpha: 0.72
-    palm_filter_speed_scale_m_s: 0.30
+    palm_filter_fast_alpha: 0.80
+    palm_filter_speed_scale_m_s: 0.10
+    # Bound smoothing lag in seconds when pose inference falls below the
+    # nominal camera rate; unlike prediction, this never leads the observation.
+    palm_filter_max_time_constant_s: 0.22
+    palm_filter_hold_deadband_m: 0.006
+    palm_filter_release_deadband_m: 0.010
     palm_filter_max_innovation_m: [0.030, 0.030, 0.030]
     b601_semantic_joint_gains: [3.00, -0.60, 0.18, 0.15, 0.75]
     b601_semantic_angle_deadband_deg: [5.0, 5.0, 3.0]
@@ -101,7 +114,7 @@ hand_palm_b601_control_node:
     b601_semantic_planar_command_max_velocity_m_s: [0.060, 0.035]
     # Reject brief direction flips, then brake/reverse with bounded acceleration.
     b601_semantic_motion_reverse_deadband_m: [0.006, 0.0035, 0.005]
-    b601_semantic_motion_reverse_confirm_samples: 3
+    b601_semantic_motion_reverse_confirm_samples: 2
     b601_semantic_planar_command_max_acceleration_m_s2: [0.32, 0.16]
     b601_semantic_planar_command_deadband_m: [0.0015, 0.0015]
     # Stop accumulating operator displacement when the physical arm has not
