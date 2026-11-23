@@ -6,6 +6,7 @@ REPO="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 SOURCE_MODEL_DIR="${SOURCE_MODEL_DIR:-$HOME/ws/Jetson_Femto_Realman_Brainco_Demo_RTMPose_TensorRT/models}"
 LOCAL_ENGINE_DIR="${B601_LOCAL_ENGINE_DIR:-$REPO/models/tensorrt_local}"
 CHANNELS="${1:-[1.0,1.0,0.0,0.0,1.0,1.0]}"
+BRAINCO_SDK="${BRAINCO_HAND_SDK_PATH:-$HOME/ws/brainco-hand-sdk-main/python}"
 VERIFIED_DET_ENGINE="$SOURCE_MODEL_DIR/tensorrt_orin_nano_20261102_170600/rtmdet_nano.engine"
 VERIFIED_BODY_ENGINE="$SOURCE_MODEL_DIR/tensorrt_pose_fp32/rtmpose_body.engine"
 LOCAL_HAND_ENGINE="$LOCAL_ENGINE_DIR/rtmpose_hand.engine"
@@ -13,6 +14,11 @@ LOCAL_HAND_ENGINE="$LOCAL_ENGINE_DIR/rtmpose_hand.engine"
 if [[ -z "${TABLE_Q:-}" ]]; then
   echo "TABLE_Q is required and must be this arm's freshly measured table pose." >&2
   echo "Example: export TABLE_Q='[q1,q2,q3,q4,q5,q6]'" >&2
+  exit 2
+fi
+if [[ ! -d "$BRAINCO_SDK" ]]; then
+  echo "BrainCo hand SDK path does not exist: $BRAINCO_SDK" >&2
+  echo "Set BRAINCO_HAND_SDK_PATH to the SDK's python directory." >&2
   exit 2
 fi
 
@@ -69,7 +75,7 @@ if [[ -f /opt/ros/humble/setup.bash ]]; then
   source /opt/ros/humble/setup.bash
   set -u
 fi
-export PYTHONPATH="$HOME/ws/pyorbbecsdk-2-main:$HOME/ws/brainco-hand-sdk-main/python:$REPO:$REPO/scripts:$REPO/third_party/reBotArm_control_py:${PYTHONPATH:-}"
+export PYTHONPATH="$HOME/ws/pyorbbecsdk-2-main:$BRAINCO_SDK:$REPO:$REPO/scripts:$REPO/third_party/reBotArm_control_py:${PYTHONPATH:-}"
 
 echo "B601 continuous semantic follower"
 echo "Planar control: resolved-rate J2/J3/J4 + task anti-windup + continuous clearance gate"
@@ -82,6 +88,7 @@ echo "Engine profile: $ENGINE_PROFILE"
 echo "Detector: $DET_ENGINE"
 echo "Body pose: $BODY_ENGINE"
 echo "Hand pose: $HAND_ENGINE"
+echo "BrainCo SDK: $BRAINCO_SDK"
 echo "Keep the arm table-supported before startup and keep the E-stop within reach."
 
 exec python "$REPO/scripts/camera_arm_b601_control_pose_hands.py" --ros-args \
@@ -92,8 +99,27 @@ exec python "$REPO/scripts/camera_arm_b601_control_pose_hands.py" --ros-args \
   -p rtmpose_body_engine_path:="$BODY_ENGINE" \
   -p rtmpose_hand_engine_path:="$HAND_ENGINE" \
   -p rtmdet_inference_hz:=4.0 \
-  -p finger_segmentation_enabled:=false \
-  -p finger_segmentation_debug_overlay:=false \
+  -p rtmpose_hand_keypoint_threshold:=0.25 \
+  -p rtmpose_hand_keypoint_tracking_threshold:=0.06 \
+  -p rtmpose_hand_keypoint_hold_frames:=3 \
+  -p rtmpose_hand_keypoint_smoothing:=0.18 \
+  -p rtmpose_hand_keypoint_fast_motion_px:=20.0 \
+  -p rtmpose_hand_roi_scale:=2.25 \
+  -p rtmpose_hand_roi_wrist_extension:=0.35 \
+  -p rtmpose_hand_tracking_roi_scale:=1.70 \
+  -p rtmpose_hand_roi_min_size_px:=96 \
+  -p rtmpose_hand_roi_max_size_px:=700 \
+  -p rtmpose_hand_inference_interval:=1 \
+  -p finger_segmentation_enabled:=true \
+  -p finger_segmentation_corridor_width_ratio:=0.08 \
+  -p finger_segmentation_color_mad_scale:=4.0 \
+  -p finger_segmentation_minimum_chroma_tolerance:=9.0 \
+  -p finger_segmentation_debug_overlay:=true \
+  -p finger_segmentation_fusion_enabled:=true \
+  -p finger_segmentation_min_confidence:=0.45 \
+  -p finger_segmentation_straight_threshold:=0.78 \
+  -p finger_segmentation_full_straight_threshold:=0.92 \
+  -p finger_segmentation_bend_cap:=0.12 \
   -p robot_motion_enabled:=true \
   -p b601_tabletop_startup_confirmed:=true \
   -p b601_tabletop_joints_rad:="$TABLE_Q" \
@@ -193,6 +219,62 @@ exec python "$REPO/scripts/camera_arm_b601_control_pose_hands.py" --ros-args \
   -p b601_stream_planar_position_correction_max_fraction:=0.32 \
   -p control_hand_side:=right \
   -p control_hand_fallback_enabled:=false \
-  -p hand_control_enabled:=false \
+  -p hand_control_enabled:=true \
+  -p hand_transport:=brainco-rs485 \
+  -p hand_rs485_sdk_path:="$BRAINCO_SDK" \
+  -p hand_rs485_port:=auto \
+  -p hand_rs485_slave_id:=0 \
+  -p hand_rs485_baudrate:=460800 \
+  -p hand_rs485_duration_ms:=200 \
+  -p hand_rs485_speed:=300 \
+  -p hand_position_min:=0 \
+  -p hand_position_max:=1000 \
+  -p hand_bend_calibration_enabled:=true \
+  -p 'hand_bend_open_calibration:=[0.18,0.08,0.13,0.09,0.13]' \
+  -p 'hand_bend_closed_calibration:=[0.56,0.92,0.91,0.86,0.87]' \
+  -p 'hand_bend_gamma:=[1.0,1.0,1.0,1.0,1.0]' \
+  -p hand_bend_deadzone:=0.12 \
+  -p hand_bend_release_threshold:=0.05 \
+  -p hand_bend_jitter_deadband:=0.025 \
+  -p hand_send_hz:=10.0 \
+  -p hand_smoothing:=0.50 \
+  -p hand_bend_smoothing:=0.60 \
+  -p hand_bend_max_delta:=0.30 \
+  -p hand_deadband:=10 \
+  -p hand_require_3d_bends_for_control:=true \
+  -p hand_thumb_rotate_mode:=opposition \
+  -p hand_thumb_opposition_open_ratio:=1.05 \
+  -p hand_thumb_opposition_closed_ratio:=0.35 \
+  -p hand_thumb_opposition_gamma:=1.0 \
+  -p hand_thumb_rotate_scale:=0.35 \
+  -p hand_thumb_straight_lock_enabled:=true \
+  -p hand_thumb_auto_zero_enabled:=true \
+  -p hand_thumb_auto_zero_samples:=5 \
+  -p hand_thumb_auto_zero_margin:=0.05 \
+  -p hand_thumb_bend_engage_threshold:=0.25 \
+  -p hand_thumb_bend_release_threshold:=0.08 \
+  -p hand_thumb_rotate_engage_threshold:=0.32 \
+  -p hand_thumb_rotate_release_threshold:=0.12 \
+  -p hand_thumb_state_confirm_frames:=3 \
+  -p hand_thumb_jitter_deadband:=0.05 \
+  -p hand_reject_single_finger_spikes:=true \
+  -p hand_single_finger_spike_delta:=0.22 \
+  -p hand_single_finger_spike_peer_max:=0.22 \
+  -p hand_spike_confirm_frames:=2 \
+  -p hand_reject_multi_finger_spikes:=true \
+  -p hand_multi_finger_spike_delta:=0.30 \
+  -p hand_multi_finger_spike_min_count:=2 \
+  -p hand_multi_finger_spike_confirm_frames:=2 \
+  -p hand_closure_confirm_frames:=2 \
+  -p hand_closure_confirm_delta:=0.25 \
+  -p hand_closure_confirm_value:=0.45 \
+  -p hand_closure_confirm_min_fingers:=2 \
+  -p hand_open_on_start:=true \
+  -p hand_open_on_home:=true \
+  -p hand_open_on_lost:=true \
+  -p hand_lost_open_delay_s:=1.0 \
+  -p hand_open_on_exit:=true \
+  -p hand_configure_tool_voltage:=false \
   -p auto_home_on_start:=false \
-  -p auto_start_on_ready:=false
+  -p auto_start_on_ready:=false \
+  -p show_window:=true
