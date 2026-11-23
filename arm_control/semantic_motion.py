@@ -103,6 +103,43 @@ def _unit_vector(vector: np.ndarray, minimum_norm: float) -> np.ndarray | None:
     return vector / norm
 
 
+def wrist_translation_anchor(
+    points_3d: Mapping[str, Sequence[float]],
+    side: str,
+    maximum_disagreement_m: float = 0.12,
+) -> np.ndarray | None:
+    """Return a rotation-invariant translation anchor for one hand.
+
+    A centroid formed from the wrist and MCP landmarks moves along an arc when
+    the operator only pronates/supinates the wrist.  That geometric motion was
+    incorrectly interpreted as a palm-height command.  The anatomical wrist
+    is the appropriate translation anchor because it stays fixed during an
+    ideal wrist rotation.  Prefer the body-pose wrist for stability and use
+    the hand wrist as a fallback.  When both depth estimates exist but disagree
+    substantially, fail closed instead of selecting the observation that would
+    create an arbitrary Cartesian command.
+    """
+
+    side = str(side or "").strip().lower()
+    if side not in ("left", "right"):
+        return None
+    maximum_disagreement = float(maximum_disagreement_m)
+    if not np.isfinite(maximum_disagreement) or maximum_disagreement <= 0.0:
+        raise ValueError("wrist-anchor disagreement limit must be positive")
+
+    body_wrist = _point(points_3d, f"pose_{side}_wrist", 3)
+    hand_wrist = _point(points_3d, f"{side}_0", 3)
+    if body_wrist is not None and hand_wrist is not None:
+        if float(np.linalg.norm(body_wrist - hand_wrist)) > maximum_disagreement:
+            return None
+        return body_wrist.copy()
+    if body_wrist is not None:
+        return body_wrist.copy()
+    if hand_wrist is not None:
+        return hand_wrist.copy()
+    return None
+
+
 def _wrist_twist(
     points_3d: Mapping[str, Sequence[float]], side: str
 ) -> float | None:

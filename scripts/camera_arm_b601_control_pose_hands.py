@@ -439,7 +439,11 @@ from hand_control import (
     FingerBendHysteresis,
     thumb_opposition,
 )
-from arm_control import B601PalmFollower, build_operator_arm_motion
+from arm_control import (
+    B601PalmFollower,
+    build_operator_arm_motion,
+    wrist_translation_anchor,
+)
 
 for _DEPTH_PACKAGE_ROOT in (_SCRIPT_DIR, _SCRIPT_DIR.parent):
     if (_DEPTH_PACKAGE_ROOT / "lingbot_depth_feature_pack").exists():
@@ -1494,18 +1498,14 @@ class HandKinematics:
         if prefix is None:
             return None, None
 
-        palm_points = [
-            points_3d[f"{prefix}_{idx}"]
-            for idx in self.PALM_LANDMARKS
-            if f"{prefix}_{idx}" in points_3d
-        ]
-        if len(palm_points) < 3:
+        translation_anchor = wrist_translation_anchor(points_3d, prefix)
+        if translation_anchor is None:
             return None, None
 
-        # Depth around an MCP landmark can occasionally land on the background
-        # or sleeve.  A coordinate-wise median keeps one or two bad palm depth
-        # patches from moving the control centroid in the opposite direction.
-        palm_point = np.median(np.asarray(palm_points, dtype=np.float64), axis=0)
+        # Translation follows the anatomical wrist, not the MCP centroid.  The
+        # latter moves vertically/depth-wise during pure wrist rotation and
+        # used to cross-couple J6 motion into J2/J3/J4 height commands.
+        palm_point = translation_anchor
         reference_point = self.palm_reference_points.get(prefix)
         if reference_point is None:
             reference_point = palm_point.copy()

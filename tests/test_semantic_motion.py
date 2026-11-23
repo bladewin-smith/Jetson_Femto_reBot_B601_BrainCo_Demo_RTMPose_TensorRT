@@ -4,6 +4,7 @@ import pytest
 from arm_control.semantic_motion import (
     build_operator_arm_motion,
     semantic_direct_joint_offsets,
+    wrist_translation_anchor,
     wrap_angle_radians,
 )
 
@@ -104,6 +105,30 @@ def test_wrist_twist_uses_body_wrist_and_two_knuckle_depth_fallback():
 def test_build_operator_arm_motion_fails_closed_without_control_hand():
     assert build_operator_arm_motion({}, {}, None, [0.0, 0.0, 0.0]) is None
     assert build_operator_arm_motion({}, {}, "right", None) is None
+
+
+def test_wrist_translation_anchor_does_not_follow_rotating_knuckles():
+    wrist = np.array([0.20, -0.10, 1.00])
+    points = {
+        "pose_right_wrist": wrist,
+        "right_0": wrist + np.array([0.005, 0.0, 0.0]),
+        # These points can move strongly as the wrist rotates; they must not
+        # influence the translation anchor.
+        "right_5": np.array([0.10, -0.25, 0.90]),
+        "right_9": np.array([0.20, -0.35, 1.10]),
+        "right_17": np.array([0.30, -0.20, 1.15]),
+    }
+
+    np.testing.assert_allclose(wrist_translation_anchor(points, "right"), wrist)
+
+
+def test_wrist_translation_anchor_rejects_conflicting_depth_estimates():
+    points = {
+        "pose_right_wrist": np.array([0.0, 0.0, 1.0]),
+        "right_0": np.array([0.0, 0.0, 1.25]),
+    }
+
+    assert wrist_translation_anchor(points, "right") is None
 
 
 def test_semantic_direct_joint_mapping_uses_only_j1_and_j6():

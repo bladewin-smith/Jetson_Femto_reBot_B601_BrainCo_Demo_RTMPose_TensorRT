@@ -1,7 +1,7 @@
 hand_palm_b601_control_node:
   ros__parameters:
     b601_control_mode: semantic_joint
-    # Camera-space palm centroid smoothing before semantic mapping.
+    # Camera-space anatomical-wrist smoothing before semantic mapping.
     palm_filter_alpha: 0.30
     # Adaptive bandwidth keeps a stationary palm quiet while reducing latency
     # during deliberate motion.  Per-frame innovation clipping rejects pose
@@ -19,6 +19,12 @@ hand_palm_b601_control_node:
     b601_wrist_twist_max_raw_jump_deg: 25.0
     b601_wrist_twist_translation_gate_m_s: 0.050
     b601_wrist_twist_stationary_confirm_samples: 3
+    # Rebase the vertical wrist anchor while the wrist angle is moving, so a
+    # pure J6 gesture cannot manufacture a J2/J3/J4 down command.
+    b601_vertical_wrist_decoupling_enabled: true
+    b601_vertical_wrist_hold_rate_deg_s: 3.0
+    b601_vertical_wrist_release_rate_deg_s: 1.0
+    b601_vertical_wrist_release_samples: 4
     b601_wrist_twist_activate_deg: 15.0
     b601_wrist_twist_release_deg: 7.0
     b601_wrist_twist_confirm_samples: 5
@@ -84,6 +90,10 @@ hand_palm_b601_control_node:
     # Resolved-rate J2/J3/J4 task feedback and coordinated acceleration limits.
     b601_semantic_planar_task_error_gain_s: [2.0, 2.0]
     b601_semantic_planar_task_correction_max_velocity_m_s: [0.025, 0.020]
+    # Downward link/TCP corrections require a negative operator command.
+    # Static pose-error adaptation may still lift, but cannot lower the arm.
+    b601_semantic_vertical_descent_guard_enabled: true
+    b601_semantic_vertical_descent_intent_deadband_m_s: 0.0015
     b601_semantic_planar_joint_max_acceleration_rad_s2: [0.45, 0.60, 0.20]
     b601_semantic_j1_target_max_velocity_rad_s: 0.08
     b601_semantic_j1_target_max_acceleration_rad_s2: 0.35

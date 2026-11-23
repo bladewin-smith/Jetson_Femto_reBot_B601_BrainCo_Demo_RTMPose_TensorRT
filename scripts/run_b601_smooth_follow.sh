@@ -34,6 +34,7 @@ export PYTHONPATH="$HOME/ws/pyorbbecsdk-2-main:$HOME/ws/brainco-hand-sdk-main/py
 
 echo "B601 continuous semantic follower"
 echo "Planar control: resolved-rate J2/J3/J4 + task anti-windup + continuous clearance gate"
+echo "Vertical safety: anatomical-wrist anchor + wrist-rotation rebase + no-descent guard"
 echo "MIT stream: velocity feed-forward + bounded position correction + adaptive frame hold"
 echo "Channels: $CHANNELS"
 echo "Detector: $DET_ENGINE"
@@ -94,12 +95,18 @@ exec python "$REPO/scripts/camera_arm_b601_control_pose_hands.py" --ros-args \
   -p b601_semantic_j4_target_max_velocity_rad_s:=0.045 \
   -p b601_semantic_j4_target_max_acceleration_rad_s2:=0.20 \
   -p b601_semantic_j4_target_deadband_rad:=0.0020 \
+  -p b601_semantic_vertical_descent_guard_enabled:=true \
+  -p b601_semantic_vertical_descent_intent_deadband_m_s:=0.0015 \
   -p b601_wrist_twist_filter_alpha:=0.10 \
   -p b601_wrist_twist_max_innovation_deg:=8.0 \
   -p b601_wrist_twist_max_raw_rate_deg_s:=180.0 \
   -p b601_wrist_twist_max_raw_jump_deg:=25.0 \
   -p b601_wrist_twist_translation_gate_m_s:=0.050 \
   -p b601_wrist_twist_stationary_confirm_samples:=3 \
+  -p b601_vertical_wrist_decoupling_enabled:=true \
+  -p b601_vertical_wrist_hold_rate_deg_s:=3.0 \
+  -p b601_vertical_wrist_release_rate_deg_s:=1.0 \
+  -p b601_vertical_wrist_release_samples:=4 \
   -p b601_wrist_twist_activate_deg:=15.0 \
   -p b601_wrist_twist_release_deg:=7.0 \
   -p b601_wrist_twist_confirm_samples:=5 \

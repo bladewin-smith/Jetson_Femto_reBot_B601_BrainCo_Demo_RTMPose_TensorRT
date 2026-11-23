@@ -26,14 +26,17 @@ from arm_control.rebot_b601 import (
     ramp_joint_target_with_tracking_window,
     rate_limited_unit_interval,
     resolve_native_frame_ids,
+    rotation_compensated_scalar_observation,
     scale_vector_to_max_abs,
     send_mit_checked,
     slew_limit_vector,
     synchronize_vertical_follower_progress,
+    suppress_uncommanded_task_descent,
     task_space_backpressure,
     validate_wrapped_angle_observation,
     validate_tabletop_startup,
     weighted_damped_least_squares,
+    wrapped_rate_motion_hold,
 )
 
 
@@ -729,6 +732,140 @@ def test_raw_wrist_observation_gate_wraps_boundary_and_rejects_depth_flip():
     assert np.rad2deg(boundary_innovation) == pytest.approx(2.0)
     assert not spike_ok
     assert abs(np.rad2deg(spike_innovation)) > 100.0
+
+
+def test_wrist_rotation_hold_rebases_height_without_delayed_drop():
+    held, bias = rotation_compensated_scalar_observation(
+        raw_value=0.025,
+        previous_intent=0.060,
+        observation_bias=0.0,
+        hold_active=True,
+        lower_bound=0.0,
+        upper_bound=0.060,
+    )
+    released, retained_bias = rotation_compensated_scalar_observation(
+        raw_value=0.025,
+        previous_intent=held,
+        observation_bias=bias,
+        hold_active=False,
+        lower_bound=0.0,
+        upper_bound=0.060,
+    )
+    deliberate_down, _ = rotation_compensated_scalar_observation(
+        raw_value=0.005,
+        previous_intent=released,
+        observation_bias=retained_bias,
+        hold_active=False,
+        lower_bound=0.0,
+        upper_bound=0.060,
+    )
+
+    assert held == pytest.approx(0.060)
+    assert bias == pytest.approx(0.035)
+    assert released == pytest.approx(0.060)
+    assert deliberate_down == pytest.approx(0.040)
+
+
+def test_logged_wrist_rotation_trace_cannot_create_vertical_drop():
+    # Reduced trace from the hardware log: visual lift fell 60 -> 25 mm while
+    # the filtered wrist angle increased.  The final invalid-depth sample must
+    # also keep the last accepted height.
+    raw_lifts = [0.060, 0.0588, 0.0488, 0.0429, 0.0331, 0.0250, 0.0]
+    wrist_deltas_deg = [9.8, 18.6, 24.2, 29.0, 44.1, 48.7, 0.0]
+    validity = [True, True, True, True, True, True, False]
+    hold = False
+    release_count = 0
+    previous_delta = np.deg2rad(5.0)
+    intent = 0.060
+    bias = 0.0
+    observed_intents = []
+
+    for raw_lift, delta_deg, valid in zip(
+        raw_lifts, wrist_deltas_deg, validity
+    ):
+        delta = np.deg2rad(delta_deg)
+        hold, release_count, _ = wrapped_rate_motion_hold(
+            current_delta_rad=delta,
+            previous_delta_rad=previous_delta,
+            dt_s=1.0,
+            hold_active=hold,
+            release_count=release_count,
+            enter_rate_rad_s=np.deg2rad(3.0),
+            release_rate_rad_s=np.deg2rad(1.0),
+            release_samples=4,
+            observation_valid=valid,
+        )
+        intent, bias = rotation_compensated_scalar_observation(
+            raw_value=raw_lift,
+            previous_intent=intent,
+            observation_bias=bias,
+            hold_active=hold,
+            lower_bound=0.0,
+            upper_bound=0.060,
+        )
+        observed_intents.append(intent)
+        previous_delta = delta
+
+    np.testing.assert_allclose(observed_intents, [0.060] * len(raw_lifts))
+
+
+def test_wrist_motion_hold_requires_stable_release_samples():
+    hold, count, rate = wrapped_rate_motion_hold(
+        current_delta_rad=np.deg2rad(5.0),
+        previous_delta_rad=0.0,
+        dt_s=0.1,
+        hold_active=False,
+        release_count=0,
+        enter_rate_rad_s=np.deg2rad(3.0),
+        release_rate_rad_s=np.deg2rad(1.0),
+        release_samples=3,
+        observation_valid=True,
+    )
+    assert hold and count == 0 and rate > 0.0
+
+    previous = np.deg2rad(5.0)
+    for expected_count in (1, 2):
+        hold, count, _ = wrapped_rate_motion_hold(
+            current_delta_rad=previous,
+            previous_delta_rad=previous,
+            dt_s=0.1,
+            hold_active=hold,
+            release_count=count,
+            enter_rate_rad_s=np.deg2rad(3.0),
+            release_rate_rad_s=np.deg2rad(1.0),
+            release_samples=3,
+            observation_valid=True,
+        )
+        assert hold and count == expected_count
+    hold, count, _ = wrapped_rate_motion_hold(
+        current_delta_rad=previous,
+        previous_delta_rad=previous,
+        dt_s=0.1,
+        hold_active=hold,
+        release_count=count,
+        enter_rate_rad_s=np.deg2rad(3.0),
+        release_rate_rad_s=np.deg2rad(1.0),
+        release_samples=3,
+        observation_valid=True,
+    )
+    assert not hold and count == 0
+
+
+def test_static_task_feedback_cannot_lower_protected_frames():
+    vertical_rows = np.array([[1.0, 0.0], [0.5, 1.0]])
+    guarded = suppress_uncommanded_task_descent(
+        joint_velocity=[-0.20, -0.10],
+        vertical_task_rows=vertical_rows,
+        descent_allowed=False,
+    )
+    deliberate = suppress_uncommanded_task_descent(
+        joint_velocity=[-0.20, -0.10],
+        vertical_task_rows=vertical_rows,
+        descent_allowed=True,
+    )
+
+    assert np.all(vertical_rows @ guarded >= -1e-10)
+    np.testing.assert_allclose(deliberate, [-0.20, -0.10])
 
 
 def test_wrist_twist_direction_requires_confirmation_and_holds_through_spike():

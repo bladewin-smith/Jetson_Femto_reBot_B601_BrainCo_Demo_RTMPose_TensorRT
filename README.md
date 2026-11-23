@@ -161,13 +161,16 @@ python scripts/camera_arm_b601_control_pose_hands.py --ros-args \
 
 | 人体信号 | B601 动作 | 实现 |
 |---|---|---|
-| 掌心左右位移 | J1 底座旋转 | 相机 X 位移直接映射到 J1 |
-| 掌心整体前后位移 | J2 + J3 + J4 | 沿当前底座到 TCP 的水平径向做加权阻尼雅可比解算 |
-| 掌心上下位移 | J2 + J3 + J4 | 与前后位移组成同一个二维任务，同时保持中间连杆净空 |
+| 手部整体左右位移 | J1 底座旋转 | 解剖腕点的相机 X 位移直接映射到 J1 |
+| 手部整体前后位移 | J2 + J3 + J4 | 解剖腕点深度沿当前底座到 TCP 的水平径向做加权阻尼雅可比解算 |
+| 手部整体上下位移 | J2 + J3 + J4 | 解剖腕点高度与前后位移组成二维任务，同时保持中间连杆净空 |
 | 肘关节屈伸、腕关节俯仰 | 不直接控制关节 | 仍可用于视觉诊断，但不再分别映射到 J3/J4 |
 | 前臂旋前/旋后 | J6 | 三维掌面法向量绕肘—腕轴的确认角映射到 J6 |
 
-J5 在该模式下保持本次跟踪开始时的参考角。二维解算器把掌心深度和高度作为一个
+J5 在该模式下保持本次跟踪开始时的参考角。平移信号不再使用腕点与多个 MCP 点的
+掌心质心，而是优先使用人体姿态模型的解剖腕点，并以手部腕点作深度一致性检查和
+回退。这样纯粹旋腕时，指根绕腕点转动不会被误识别成手掌上下/前后平移。二维解算器
+把腕点深度和高度作为一个
 连续目标，通过 `b601_semantic_planar_joint_mobility` 调整 J2/J3/J4 的相对参与度，
 不再依赖“肘是否前移”或“腕是否前倾”的判断边界。垂直通道只允许从经过验证的桌面姿态
 向上运动；手掌下移表示回落到桌面参考高度，不能命令末端进入桌面以下。控制器还会
@@ -233,6 +236,12 @@ export HAND_ENGINE='/absolute/path/to/rtmpose_hand.engine'
 只经过一次速度/加速度整形，再施加反馈跟踪窗口，使对应限速参数真正生效。最终目标
 仍会经过关节范围、桌面投影、力矩和失速保护。
 
+上下通道另有两层解耦。检测到腕部角度正在变化或腕部观测失效时，控制器冻结最后一
+个已接受的高度，并持续重置高度观测偏置；腕部稳定四帧后，从新腕姿继续计算真正的
+上下平移，因此不会在旋腕结束后补做一次延迟下移。若平面命令没有明确的负向高度速
+度，J2/J3/J4 的闭环姿态修正还会被投影到“所有受保护连杆高度不下降”的速度空间；
+主动向下移动手部时该保护自动放行，按 `H` 回桌路径也不受影响。
+
 ```bash
 REPO="$HOME/ws/Jetson_Femto_reBot_B601_BrainCo_Demo_RTMPose_TensorRT"
 ENGINE_DIR="$HOME/ws/Jetson_Femto_Realman_Brainco_Demo_RTMPose_TensorRT/models/tensorrt"
@@ -279,6 +288,10 @@ run_b601_semantic_test() {
     -p b601_wrist_twist_max_raw_jump_deg:=25.0 \
     -p b601_wrist_twist_translation_gate_m_s:=0.050 \
     -p b601_wrist_twist_stationary_confirm_samples:=3 \
+    -p b601_vertical_wrist_decoupling_enabled:=true \
+    -p b601_vertical_wrist_hold_rate_deg_s:=3.0 \
+    -p b601_vertical_wrist_release_rate_deg_s:=1.0 \
+    -p b601_vertical_wrist_release_samples:=4 \
     -p b601_wrist_twist_activate_deg:=15.0 \
     -p b601_wrist_twist_release_deg:=7.0 \
     -p b601_wrist_twist_confirm_samples:=5 \
@@ -325,6 +338,8 @@ run_b601_semantic_test() {
     -p b601_semantic_planar_follower_min_mobility_scale:=0.30 \
     -p b601_semantic_planar_task_error_gain_s:='[2.0,2.0]' \
     -p b601_semantic_planar_task_correction_max_velocity_m_s:='[0.025,0.020]' \
+    -p b601_semantic_vertical_descent_guard_enabled:=true \
+    -p b601_semantic_vertical_descent_intent_deadband_m_s:=0.0015 \
     -p b601_semantic_planar_joint_max_acceleration_rad_s2:='[0.45,0.60,0.20]' \
     -p b601_semantic_motion_reverse_deadband_m:='[0.006,0.006,0.005]' \
     -p b601_semantic_motion_reverse_confirm_samples:=4 \
@@ -357,6 +372,10 @@ run_b601_semantic_test() {
 `J6_clearance=armed` 和 `J6_observation=ready`，此时会自动在抬升后的姿态重新置零；
 看到这两个字段后保持掌心位置，再开始慢速旋腕。若出现 `outlier_hold`、
 `translation_hold` 或 `invalid_hold`，J6 应保持当前位置，待 `J6_stable=3/3` 后重新置零。
+旋腕期间 `vertical_wrist_hold=True` 时，`raw_lift` 可以随视觉几何变化，但 `lift` 应保持；
+`lift_bias` 会吸收这段伪位移。腕部稳定后 `vertical_wrist_release` 到达 `4/4` 并解除保持，
+高度目标不应跳变。手部静止时 `vertical_descent_allowed=False`，各受保护 frame 不应再
+因为误差自适应而主动向下；只有明确向下移动手部时该字段才应短暂变为 `True`。
 `q_target` 会从上一次目标连续爬坡，并由 `target_lead` 显示它相对实测关节角积累的
 有限位置误差。`q_sent` 是经过总力矩限制后真正发送的目标；`tau_g` 是重力前馈，
 `tau_measured` 是电机反馈力矩，`effort_cmd` 是包含位置、阻尼与重力项的指令估算，

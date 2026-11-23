@@ -15,6 +15,7 @@ from .semantic_motion import (
     OperatorArmMotion,
     build_operator_arm_motion,
     semantic_direct_joint_offsets,
+    wrist_translation_anchor,
     wrap_angle_radians,
 )
 
@@ -31,5 +32,6 @@ __all__ = [
     "OperatorArmMotion",
     "build_operator_arm_motion",
     "semantic_direct_joint_offsets",
+    "wrist_translation_anchor",
     "wrap_angle_radians",
 ]

@@ -642,6 +642,134 @@ def independent_planar_task_backpressure(
     return np.asarray([forward_factor, vertical_factor], dtype=np.float64)
 
 
+def wrapped_rate_motion_hold(
+    current_delta_rad: float,
+    previous_delta_rad: float | None,
+    dt_s: float,
+    hold_active: bool,
+    release_count: int,
+    enter_rate_rad_s: float,
+    release_rate_rad_s: float,
+    release_samples: int,
+    observation_valid: bool,
+) -> tuple[bool, int, float]:
+    """Latch a hold while a periodic-angle signal is moving or unreliable."""
+
+    values = np.asarray(
+        [current_delta_rad, dt_s, enter_rate_rad_s, release_rate_rad_s],
+        dtype=np.float64,
+    )
+    if not np.all(np.isfinite(values)):
+        raise ValueError("wrapped-rate hold inputs must be finite")
+    if (
+        dt_s <= 0.0
+        or enter_rate_rad_s <= 0.0
+        or release_rate_rad_s < 0.0
+        or release_rate_rad_s >= enter_rate_rad_s
+        or int(release_samples) < 1
+        or int(release_count) < 0
+    ):
+        raise ValueError("wrapped-rate hold thresholds/counts are invalid")
+
+    if previous_delta_rad is None:
+        angular_rate = 0.0
+    else:
+        previous = float(previous_delta_rad)
+        if not np.isfinite(previous):
+            raise ValueError("previous wrapped angle must be finite or None")
+        angular_rate = wrap_angle_radians(current_delta_rad - previous) / dt_s
+
+    if not observation_valid or abs(angular_rate) >= enter_rate_rad_s:
+        return True, 0, float(angular_rate)
+    if not hold_active:
+        return False, 0, float(angular_rate)
+    if abs(angular_rate) <= release_rate_rad_s:
+        next_count = int(release_count) + 1
+        if next_count >= int(release_samples):
+            return False, 0, float(angular_rate)
+        return True, next_count, float(angular_rate)
+    return True, 0, float(angular_rate)
+
+
+def rotation_compensated_scalar_observation(
+    raw_value: float,
+    previous_intent: float,
+    observation_bias: float,
+    hold_active: bool,
+    lower_bound: float,
+    upper_bound: float,
+) -> tuple[float, float]:
+    """Hold an intent during rotation and rebase its raw observation.
+
+    Updating the bias on every held frame preserves the last accepted command
+    while the visual landmark moves for a non-translational reason.  Once the
+    hold releases, subsequent operator translation is measured relative to the
+    new wrist orientation rather than causing a delayed correction jump.
+    """
+
+    values = np.asarray(
+        [raw_value, previous_intent, observation_bias, lower_bound, upper_bound],
+        dtype=np.float64,
+    )
+    if not np.all(np.isfinite(values)) or lower_bound >= upper_bound:
+        raise ValueError("rotation-compensated scalar inputs are invalid")
+    previous = float(np.clip(previous_intent, lower_bound, upper_bound))
+    if hold_active:
+        bias = previous - float(raw_value)
+        return previous, float(bias)
+    corrected = float(
+        np.clip(float(raw_value) + float(observation_bias), lower_bound, upper_bound)
+    )
+    return corrected, float(observation_bias)
+
+
+def suppress_uncommanded_task_descent(
+    joint_velocity: Sequence[float],
+    vertical_task_rows: Sequence[Sequence[float]],
+    descent_allowed: bool,
+    tolerance_m_s: float = 0.0,
+) -> np.ndarray:
+    """Project joint velocity out of downward task-space half-spaces.
+
+    When the operator is not actively lowering the vertical command, closed-
+    loop posture correction may improve one weighted link-height error by
+    lowering another link or the TCP.  Iterative orthogonal projection keeps
+    every protected height velocity non-negative while retaining as much of
+    the requested coordinated J2/J3/J4 motion as possible.
+    """
+
+    velocity = np.asarray(joint_velocity, dtype=np.float64).reshape(-1).copy()
+    rows = np.asarray(vertical_task_rows, dtype=np.float64)
+    tolerance = float(tolerance_m_s)
+    if rows.ndim != 2 or rows.shape[1] != velocity.size:
+        raise ValueError("vertical task rows must match joint velocity")
+    if not np.all(np.isfinite(velocity)) or not np.all(np.isfinite(rows)):
+        raise ValueError("descent-suppression inputs must be finite")
+    if not np.isfinite(tolerance) or tolerance < 0.0:
+        raise ValueError("descent-suppression tolerance cannot be negative")
+    if descent_allowed or rows.shape[0] == 0:
+        return velocity
+
+    for _ in range(max(1, 2 * rows.shape[0])):
+        changed = False
+        for row in rows:
+            norm_squared = float(np.dot(row, row))
+            if norm_squared <= 1e-12:
+                continue
+            task_velocity = float(np.dot(row, velocity))
+            if task_velocity < -tolerance:
+                velocity += ((-tolerance - task_velocity) / norm_squared) * row
+                changed = True
+        if not changed:
+            break
+    if np.any(rows @ velocity < -tolerance - 1e-9):
+        # Conflicting or near-singular rows can prevent the small alternating-
+        # projection loop from converging numerically.  Holding is safer than
+        # leaking a downward command on an unbraked tabletop arm.
+        velocity.fill(0.0)
+    return velocity
+
+
 def coordinated_acceleration_limited_velocity(
     requested_velocity: Sequence[float],
     previous_velocity: Sequence[float],
@@ -1905,6 +2033,30 @@ class B601PalmFollower:
                 "b601_wrist_twist_stationary_confirm_samples", 3
             ).value
         )
+        self.vertical_wrist_decoupling_enabled = bool(
+            node.declare_parameter(
+                "b601_vertical_wrist_decoupling_enabled", True
+            ).value
+        )
+        self.vertical_wrist_hold_rate_rad_s = np.deg2rad(
+            float(
+                node.declare_parameter(
+                    "b601_vertical_wrist_hold_rate_deg_s", 3.0
+                ).value
+            )
+        )
+        self.vertical_wrist_release_rate_rad_s = np.deg2rad(
+            float(
+                node.declare_parameter(
+                    "b601_vertical_wrist_release_rate_deg_s", 1.0
+                ).value
+            )
+        )
+        self.vertical_wrist_release_samples = int(
+            node.declare_parameter(
+                "b601_vertical_wrist_release_samples", 4
+            ).value
+        )
         self.wrist_twist_activate_rad = np.deg2rad(
             float(
                 node.declare_parameter(
@@ -1944,6 +2096,13 @@ class B601PalmFollower:
             or not np.isfinite(self.wrist_twist_translation_gate_m_s)
             or self.wrist_twist_translation_gate_m_s <= 0.0
             or self.wrist_twist_stationary_confirm_samples < 1
+            or not np.isfinite(self.vertical_wrist_hold_rate_rad_s)
+            or self.vertical_wrist_hold_rate_rad_s <= 0.0
+            or not np.isfinite(self.vertical_wrist_release_rate_rad_s)
+            or self.vertical_wrist_release_rate_rad_s < 0.0
+            or self.vertical_wrist_release_rate_rad_s
+            >= self.vertical_wrist_hold_rate_rad_s
+            or self.vertical_wrist_release_samples < 1
             or not np.isfinite(self.wrist_twist_activate_rad)
             or not np.isfinite(self.wrist_twist_release_rad)
             or self.wrist_twist_release_rad < 0.0
@@ -1957,6 +2116,7 @@ class B601PalmFollower:
             raise ValueError(
                 "B601 wrist-twist filter alpha must be in (0, 1] and "
                 "angle limits/rates and translation gate must be positive; "
+                "vertical wrist release rate must be below its hold rate; "
                 "activation must exceed release; reversal confirmation must "
                 "be at least the normal positive confirmation count"
             )
@@ -2260,6 +2420,25 @@ class B601PalmFollower:
             2,
             "b601_semantic_planar_task_correction_max_velocity_m_s",
         )
+        self.semantic_vertical_descent_guard_enabled = bool(
+            node.declare_parameter(
+                "b601_semantic_vertical_descent_guard_enabled", True
+            ).value
+        )
+        self.semantic_vertical_descent_intent_deadband_m_s = float(
+            node.declare_parameter(
+                "b601_semantic_vertical_descent_intent_deadband_m_s", 0.0015
+            ).value
+        )
+        if (
+            not np.isfinite(
+                self.semantic_vertical_descent_intent_deadband_m_s
+            )
+            or self.semantic_vertical_descent_intent_deadband_m_s < 0.0
+        ):
+            raise ValueError(
+                "B601 vertical descent intent deadband must be finite and non-negative"
+            )
         self.semantic_planar_joint_max_acceleration = _positive_vector(
             node.declare_parameter(
                 "b601_semantic_planar_joint_max_acceleration_rad_s2",
@@ -2490,6 +2669,14 @@ class B601PalmFollower:
         self.semantic_j6_translation_speed_m_s = 0.0
         self.semantic_j6_raw_innovation_rad = 0.0
         self.semantic_j6_observation_status = "reset"
+        self.semantic_vertical_wrist_hold = False
+        self.semantic_vertical_wrist_release_count = 0
+        self.semantic_vertical_last_wrist_delta_rad = None
+        self.semantic_vertical_wrist_rate_rad_s = 0.0
+        self.semantic_vertical_observation_bias_m = 0.0
+        self.semantic_vertical_intent_m = 0.0
+        self.semantic_vertical_raw_lift_m = 0.0
+        self.semantic_vertical_descent_allowed = False
         self.last_semantic_log_time = 0.0
         self.last_semantic_vertical_error_m = 0.0
         self.last_semantic_planar_error_m = np.zeros(2, dtype=np.float64)
@@ -2999,6 +3186,14 @@ class B601PalmFollower:
         self.semantic_j6_translation_speed_m_s = 0.0
         self.semantic_j6_raw_innovation_rad = 0.0
         self.semantic_j6_observation_status = "reset"
+        self.semantic_vertical_wrist_hold = False
+        self.semantic_vertical_wrist_release_count = 0
+        self.semantic_vertical_last_wrist_delta_rad = None
+        self.semantic_vertical_wrist_rate_rad_s = 0.0
+        self.semantic_vertical_observation_bias_m = 0.0
+        self.semantic_vertical_intent_m = 0.0
+        self.semantic_vertical_raw_lift_m = 0.0
+        self.semantic_vertical_descent_allowed = False
 
     def _reset_semantic_smoothing(self, now_s: float = 0.0) -> None:
         self.semantic_planar_command_m.fill(0.0)
@@ -3303,44 +3498,29 @@ class B601PalmFollower:
             self.semantic_j6_observation_status = "stabilizing"
         else:
             self.semantic_j6_observation_status = "ready"
-        lateral = self._scalar_deadband(
+        raw_lateral = self._scalar_deadband(
             camera_offset[0], self.semantic_linear_deadband_m[0]
         )
         # Camera Z increases away from the camera; human forward motion is -Z.
-        forward = self._scalar_deadband(
+        raw_forward = self._scalar_deadband(
             -camera_offset[2], self.semantic_linear_deadband_m[1]
         )
-        forward *= self.semantic_planar_input_scale[0]
-        forward = float(
+        raw_forward *= self.semantic_planar_input_scale[0]
+        raw_forward = float(
             np.clip(
-                forward,
+                raw_forward,
                 -self.semantic_planar_max_forward_m,
                 self.semantic_planar_max_forward_m,
             )
         )
-        # The table pose is the lower boundary.  A hand moving down commands a
-        # return toward zero lift, never motion below the validated table pose.
-        lift = self._scalar_deadband(
+        # Keep the unbounded signed observation until wrist-rotation
+        # compensation is applied. Clipping it to zero first would discard the
+        # information needed to recognize a later deliberate downward move.
+        raw_lift_unbounded = self._scalar_deadband(
             -camera_offset[1], self.semantic_linear_deadband_m[2]
         )
-        lift *= self.semantic_planar_input_scale[1]
-        lift = float(np.clip(lift, 0.0, self.semantic_vertical_max_lift_m))
-        raw_motion_target = np.asarray([lateral, forward, lift], dtype=np.float64)
-        (
-            stable_motion_target,
-            next_motion_active_direction,
-            next_motion_candidate_direction,
-            next_motion_candidate_count,
-        ) = confirm_vector_reversals(
-            raw_motion_target,
-            self.semantic_motion_target_m,
-            self.semantic_motion_active_direction,
-            self.semantic_motion_candidate_direction,
-            self.semantic_motion_candidate_count,
-            self.semantic_motion_reverse_deadband,
-            self.semantic_motion_reverse_confirm_samples,
-        )
-        lateral, forward, lift = [float(value) for value in stable_motion_target]
+        raw_lift_unbounded *= self.semantic_planar_input_scale[1]
+        self.semantic_vertical_raw_lift_m = float(raw_lift_unbounded)
 
         tcp_lift, chain_clearance = self._semantic_clearance_from_table(q_seed)
         tcp_fraction = (
@@ -3491,6 +3671,67 @@ class B601PalmFollower:
                 self.semantic_j6_activation_progress
                 + target_dt / self.wrist_twist_soft_start_s,
             )
+
+        vertical_decoupling_active = bool(
+            self.vertical_wrist_decoupling_enabled
+            and self.semantic_channel_enable[4] > 0.5
+            and clearance_fraction >= 0.95
+        )
+        if vertical_decoupling_active:
+            (
+                self.semantic_vertical_wrist_hold,
+                self.semantic_vertical_wrist_release_count,
+                self.semantic_vertical_wrist_rate_rad_s,
+            ) = wrapped_rate_motion_hold(
+                roll_delta,
+                self.semantic_vertical_last_wrist_delta_rad,
+                target_dt,
+                self.semantic_vertical_wrist_hold,
+                self.semantic_vertical_wrist_release_count,
+                self.vertical_wrist_hold_rate_rad_s,
+                self.vertical_wrist_release_rate_rad_s,
+                self.vertical_wrist_release_samples,
+                raw_wrist_valid and raw_wrist_accepted,
+            )
+        else:
+            self.semantic_vertical_wrist_hold = False
+            self.semantic_vertical_wrist_release_count = 0
+            self.semantic_vertical_wrist_rate_rad_s = 0.0
+            if self.semantic_channel_enable[4] <= 0.5:
+                self.semantic_vertical_observation_bias_m = 0.0
+        self.semantic_vertical_last_wrist_delta_rad = roll_delta
+        (
+            compensated_lift,
+            self.semantic_vertical_observation_bias_m,
+        ) = rotation_compensated_scalar_observation(
+            raw_lift_unbounded,
+            self.semantic_vertical_intent_m,
+            self.semantic_vertical_observation_bias_m,
+            self.semantic_vertical_wrist_hold,
+            0.0,
+            self.semantic_vertical_max_lift_m,
+        )
+        self.semantic_vertical_intent_m = compensated_lift
+
+        raw_motion_target = np.asarray(
+            [raw_lateral, raw_forward, compensated_lift],
+            dtype=np.float64,
+        )
+        (
+            stable_motion_target,
+            next_motion_active_direction,
+            next_motion_candidate_direction,
+            next_motion_candidate_count,
+        ) = confirm_vector_reversals(
+            raw_motion_target,
+            self.semantic_motion_target_m,
+            self.semantic_motion_active_direction,
+            self.semantic_motion_candidate_direction,
+            self.semantic_motion_candidate_count,
+            self.semantic_motion_reverse_deadband,
+            self.semantic_motion_reverse_confirm_samples,
+        )
+        lateral, forward, lift = [float(value) for value in stable_motion_target]
 
         direct_offsets = semantic_direct_joint_offsets(
             lateral,
@@ -3827,6 +4068,16 @@ class B601PalmFollower:
                 f"lateral={lateral:+.4f}m, "
                 f"forward={forward:+.4f}m, planar_forward={forward_target:+.4f}m, "
                 f"lift={lift_target:+.4f}m, "
+                f"raw_lift={self.semantic_vertical_raw_lift_m:+.4f}m, "
+                f"lift_bias={self.semantic_vertical_observation_bias_m:+.4f}m, "
+                f"vertical_wrist_hold={self.semantic_vertical_wrist_hold}, "
+                f"vertical_wrist_rate="
+                f"{np.rad2deg(self.semantic_vertical_wrist_rate_rad_s):+.1f}deg/s, "
+                f"vertical_wrist_release="
+                f"{self.semantic_vertical_wrist_release_count}/"
+                f"{self.vertical_wrist_release_samples}, "
+                f"vertical_descent_allowed="
+                f"{self.semantic_vertical_descent_allowed}, "
                 f"forward_gate={forward_gate:.2f}/{raw_forward_gate:.2f}, "
                 f"backpressure={planar_backpressure.round(2).tolist()}/"
                 f"{raw_backpressure.round(2).tolist()}, "
@@ -4046,6 +4297,16 @@ class B601PalmFollower:
             self.logger.warn("B601 resolved-rate planar Jacobian is singular; braking")
             requested_joint_velocity = np.zeros(columns.size, dtype=np.float64)
 
+        self.semantic_vertical_descent_allowed = bool(
+            not self.semantic_vertical_descent_guard_enabled
+            or task_velocity[1]
+            < -self.semantic_vertical_descent_intent_deadband_m_s
+        )
+        requested_joint_velocity = suppress_uncommanded_task_descent(
+            requested_joint_velocity,
+            height_rows,
+            self.semantic_vertical_descent_allowed,
+        )
         joint_velocity_limit = self._semantic_outer_joint_velocity_limits()[columns]
         joint_velocity = coordinated_acceleration_limited_velocity(
             requested_joint_velocity,
@@ -4054,6 +4315,23 @@ class B601PalmFollower:
             self.semantic_planar_joint_max_acceleration,
             dt,
         )
+        joint_velocity = suppress_uncommanded_task_descent(
+            joint_velocity,
+            height_rows,
+            self.semantic_vertical_descent_allowed,
+        )
+        moving = np.abs(joint_velocity) > 1e-12
+        if np.any(moving):
+            velocity_scale = min(
+                1.0,
+                float(
+                    np.min(
+                        joint_velocity_limit[moving]
+                        / np.abs(joint_velocity[moving])
+                    )
+                ),
+            )
+            joint_velocity *= velocity_scale
         q_request[columns] = previous_target[columns] + joint_velocity * dt
         tracking_lower, tracking_upper = joint_tracking_bounds(
             self._joint_lower,
