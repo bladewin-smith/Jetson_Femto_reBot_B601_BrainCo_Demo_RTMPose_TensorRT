@@ -854,6 +854,40 @@ def test_wrist_motion_hold_requires_stable_release_samples():
     assert not hold and count == 0
 
 
+def test_wrist_motion_hold_requires_semantic_arming_only_for_new_latch():
+    common = dict(
+        current_delta_rad=np.deg2rad(2.0),
+        previous_delta_rad=0.0,
+        dt_s=0.1,
+        release_count=0,
+        enter_rate_rad_s=np.deg2rad(3.0),
+        release_rate_rad_s=np.deg2rad(1.0),
+        release_samples=3,
+        observation_valid=False,
+    )
+
+    hold, count, rate = wrapped_rate_motion_hold(
+        hold_active=False,
+        activation_enabled=False,
+        **common,
+    )
+    assert not hold and count == 0 and rate > 0.0
+
+    hold, count, _ = wrapped_rate_motion_hold(
+        hold_active=False,
+        activation_enabled=True,
+        **common,
+    )
+    assert hold and count == 0
+
+    hold, count, _ = wrapped_rate_motion_hold(
+        hold_active=True,
+        activation_enabled=False,
+        **common,
+    )
+    assert hold and count == 0
+
+
 def test_wrist_hold_release_waits_for_height_estimator_to_settle():
     # A real vertical gesture must not create a wrist hold by itself.
     assert wrist_height_release_ready(True, False, -0.080, 0.012)

@@ -22,10 +22,12 @@ hand_palm_b601_control_node:
     # Rebase the vertical wrist anchor while the wrist angle is moving, so a
     # pure J6 gesture cannot manufacture a J2/J3/J4 down command.
     b601_vertical_wrist_decoupling_enabled: true
-    # A faster J6-filtered angular speed latches the hold; using raw angle speed
-    # here would react to normal pose jitter. Release additionally requires the
-    # anatomical-wrist height estimate to stop settling.
+    # A faster J6-filtered angular speed can latch the hold only after a
+    # meaningful roll delta (or confirmed J6 direction) arms it. This rejects
+    # the persistent 1--2 degree landmark noise seen in the hardware logs.
+    # Release additionally requires anatomical-wrist height to stop settling.
     b601_vertical_wrist_hold_rate_deg_s: 3.0
+    b601_vertical_wrist_hold_min_delta_deg: 6.0
     b601_vertical_wrist_release_rate_deg_s: 1.0
     b601_vertical_wrist_release_samples: 5
     b601_vertical_wrist_release_lift_rate_m_s: 0.012

@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 SOURCE_MODEL_DIR="${SOURCE_MODEL_DIR:-$HOME/ws/Jetson_Femto_Realman_Brainco_Demo_RTMPose_TensorRT/models}"
+LOCAL_ENGINE_DIR="${B601_LOCAL_ENGINE_DIR:-$REPO/models/tensorrt_local}"
 CHANNELS="${1:-[1.0,1.0,0.0,0.0,1.0,1.0]}"
 
 if [[ -z "${TABLE_Q:-}" ]]; then
@@ -12,17 +13,54 @@ if [[ -z "${TABLE_Q:-}" ]]; then
   exit 2
 fi
 
-# Keep support for the mixed engine directories used by the validated Jetson
-# setup. Explicit environment variables always take precedence.
-DET_ENGINE="${DET_ENGINE:-$SOURCE_MODEL_DIR/tensorrt_orin_nano_20261102_170600/rtmdet_nano.engine}"
-BODY_ENGINE="${BODY_ENGINE:-$SOURCE_MODEL_DIR/tensorrt_pose_fp32/rtmpose_body.engine}"
-HAND_ENGINE="${HAND_ENGINE:-$SOURCE_MODEL_DIR/tensorrt/rtmpose_hand.engine}"
+# Prefer engines built in this repository on the current Jetson.  TensorRT
+# plans are not portable between GPU/JetPack/TensorRT combinations; the old
+# mixed RealMan paths remain only as a migration fallback. Explicit paths
+# always take precedence.
+CUSTOM_ENGINE_COUNT=0
+if [[ -n "${DET_ENGINE:-}" ]]; then ((CUSTOM_ENGINE_COUNT += 1)); fi
+if [[ -n "${BODY_ENGINE:-}" ]]; then ((CUSTOM_ENGINE_COUNT += 1)); fi
+if [[ -n "${HAND_ENGINE:-}" ]]; then ((CUSTOM_ENGINE_COUNT += 1)); fi
+if (( CUSTOM_ENGINE_COUNT != 0 && CUSTOM_ENGINE_COUNT != 3 )); then
+  echo "Set DET_ENGINE, BODY_ENGINE and HAND_ENGINE together, or unset all three." >&2
+  exit 2
+fi
+if [[ -s "$LOCAL_ENGINE_DIR/rtmdet_nano.engine" \
+   && -s "$LOCAL_ENGINE_DIR/rtmpose_body.engine" \
+   && -s "$LOCAL_ENGINE_DIR/rtmpose_hand.engine" ]]; then
+  DEFAULT_DET_ENGINE="$LOCAL_ENGINE_DIR/rtmdet_nano.engine"
+  DEFAULT_BODY_ENGINE="$LOCAL_ENGINE_DIR/rtmpose_body.engine"
+  DEFAULT_HAND_ENGINE="$LOCAL_ENGINE_DIR/rtmpose_hand.engine"
+  ENGINE_PROFILE="target-local"
+else
+  DEFAULT_DET_ENGINE="$SOURCE_MODEL_DIR/tensorrt_orin_nano_20261102_170600/rtmdet_nano.engine"
+  DEFAULT_BODY_ENGINE="$SOURCE_MODEL_DIR/tensorrt_pose_fp32/rtmpose_body.engine"
+  DEFAULT_HAND_ENGINE="$SOURCE_MODEL_DIR/tensorrt/rtmpose_hand.engine"
+  ENGINE_PROFILE="legacy-fallback"
+fi
+DET_ENGINE="${DET_ENGINE:-$DEFAULT_DET_ENGINE}"
+BODY_ENGINE="${BODY_ENGINE:-$DEFAULT_BODY_ENGINE}"
+HAND_ENGINE="${HAND_ENGINE:-$DEFAULT_HAND_ENGINE}"
+if (( CUSTOM_ENGINE_COUNT == 3 )); then
+  ENGINE_PROFILE="custom"
+fi
+if [[ "$ENGINE_PROFILE" == "legacy-fallback" \
+   && "${B601_ALLOW_LEGACY_ENGINES:-0}" != "1" ]]; then
+  echo "Refusing legacy mixed TensorRT plans because they can add latency and" >&2
+  echo "produce the cross-device compatibility warning seen in the test logs." >&2
+  echo "Build target-local plans with: bash scripts/build_b601_local_tensorrt.sh" >&2
+  echo "Temporary diagnostic override: export B601_ALLOW_LEGACY_ENGINES=1" >&2
+  exit 2
+fi
 for file in "$DET_ENGINE" "$BODY_ENGINE" "$HAND_ENGINE"; do
   if [[ ! -s "$file" ]]; then
     echo "Missing or empty TensorRT engine; refusing hardware startup: $file" >&2
     exit 2
   fi
 done
+if [[ "$ENGINE_PROFILE" == "legacy-fallback" ]]; then
+  echo "WARNING: legacy TensorRT diagnostic override is active." >&2
+fi
 
 if [[ -f /opt/ros/humble/setup.bash ]]; then
   set +u
@@ -37,6 +75,7 @@ echo "Planar control: resolved-rate J2/J3/J4 + task anti-windup + continuous cle
 echo "Vertical safety: anatomical-wrist anchor + wrist-rotation rebase + no-descent guard"
 echo "MIT stream: velocity feed-forward + bounded position correction + adaptive frame hold"
 echo "Channels: $CHANNELS"
+echo "Engine profile: $ENGINE_PROFILE"
 echo "Detector: $DET_ENGINE"
 echo "Body pose: $BODY_ENGINE"
 echo "Hand pose: $HAND_ENGINE"
@@ -107,6 +146,7 @@ exec python "$REPO/scripts/camera_arm_b601_control_pose_hands.py" --ros-args \
   -p b601_wrist_twist_stationary_confirm_samples:=3 \
   -p b601_vertical_wrist_decoupling_enabled:=true \
   -p b601_vertical_wrist_hold_rate_deg_s:=3.0 \
+  -p b601_vertical_wrist_hold_min_delta_deg:=6.0 \
   -p b601_vertical_wrist_release_rate_deg_s:=1.0 \
   -p b601_vertical_wrist_release_samples:=5 \
   -p b601_vertical_wrist_release_lift_rate_m_s:=0.012 \

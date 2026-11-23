@@ -8,6 +8,7 @@ dist/
 
 # Generated/downloaded deployment artifacts are platform-specific and large.
 models/mmdeploy/*/
+models/tensorrt_local/
 *.engine
 *.onnx
 *.pth

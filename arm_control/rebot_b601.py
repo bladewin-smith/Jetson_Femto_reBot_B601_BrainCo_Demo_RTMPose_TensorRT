@@ -652,8 +652,15 @@ def wrapped_rate_motion_hold(
     release_rate_rad_s: float,
     release_samples: int,
     observation_valid: bool,
+    activation_enabled: bool = True,
 ) -> tuple[bool, int, float]:
-    """Latch a hold while a periodic-angle signal is moving or unreliable."""
+    """Latch a hold while an armed periodic-angle signal moves or is unreliable.
+
+    ``activation_enabled`` only gates a new latch.  An existing hold remains
+    active until the normal stable-sample release conditions are satisfied.
+    This keeps invalid observations safe during a real wrist gesture without
+    allowing small pose-estimator noise to start a long vertical hold.
+    """
 
     values = np.asarray(
         [current_delta_rad, dt_s, enter_rate_rad_s, release_rate_rad_s],
@@ -679,6 +686,8 @@ def wrapped_rate_motion_hold(
             raise ValueError("previous wrapped angle must be finite or None")
         angular_rate = wrap_angle_radians(current_delta_rad - previous) / dt_s
 
+    if not hold_active and not activation_enabled:
+        return False, 0, float(angular_rate)
     if not observation_valid or abs(angular_rate) >= enter_rate_rad_s:
         return True, 0, float(angular_rate)
     if not hold_active:
@@ -2150,6 +2159,13 @@ class B601PalmFollower:
                 "b601_vertical_wrist_release_lift_rate_m_s", 0.012
             ).value
         )
+        self.vertical_wrist_hold_min_delta_rad = np.deg2rad(
+            float(
+                node.declare_parameter(
+                    "b601_vertical_wrist_hold_min_delta_deg", 6.0
+                ).value
+            )
+        )
         self.wrist_twist_activate_rad = np.deg2rad(
             float(
                 node.declare_parameter(
@@ -2198,6 +2214,10 @@ class B601PalmFollower:
             or self.vertical_wrist_release_samples < 1
             or not np.isfinite(self.vertical_wrist_release_lift_rate_m_s)
             or self.vertical_wrist_release_lift_rate_m_s <= 0.0
+            or not np.isfinite(self.vertical_wrist_hold_min_delta_rad)
+            or self.vertical_wrist_hold_min_delta_rad < 0.0
+            or self.vertical_wrist_hold_min_delta_rad
+            > self.wrist_twist_activate_rad
             or not np.isfinite(self.wrist_twist_activate_rad)
             or not np.isfinite(self.wrist_twist_release_rad)
             or self.wrist_twist_release_rad < 0.0
@@ -2212,7 +2232,8 @@ class B601PalmFollower:
                 "B601 wrist-twist filter alpha must be in (0, 1] and "
                 "angle limits/rates and translation gate must be positive; "
                 "vertical wrist release rate must be below its hold rate and "
-                "the release lift-rate limit must be positive; "
+                "the release lift-rate limit must be positive; the vertical "
+                "hold arming angle must be between zero and activation; "
                 "activation must exceed release; reversal confirmation must "
                 "be at least the normal positive confirmation count"
             )
@@ -3799,6 +3820,10 @@ class B601PalmFollower:
             and self.semantic_channel_enable[4] > 0.5
             and clearance_fraction >= 0.95
         )
+        vertical_wrist_armed = bool(
+            self.semantic_j6_active_direction != 0
+            or abs(roll_delta) >= self.vertical_wrist_hold_min_delta_rad
+        )
         if vertical_decoupling_active:
             # Use the faster J6 angle filter (alpha 0.18 in the validated
             # profile), not raw angular velocity: hardware logs show raw pose
@@ -3824,6 +3849,7 @@ class B601PalmFollower:
                 self.vertical_wrist_release_rate_rad_s,
                 self.vertical_wrist_release_samples,
                 vertical_release_observation_valid,
+                activation_enabled=vertical_wrist_armed,
             )
         else:
             self.semantic_vertical_wrist_hold = False
@@ -4214,6 +4240,7 @@ class B601PalmFollower:
                 f"lift={lift_target:+.4f}m, "
                 f"raw_lift={self.semantic_vertical_raw_lift_m:+.4f}m, "
                 f"lift_bias={self.semantic_vertical_observation_bias_m:+.4f}m, "
+                f"vertical_wrist_armed={vertical_wrist_armed}, "
                 f"vertical_wrist_hold={self.semantic_vertical_wrist_hold}, "
                 f"vertical_wrist_rate="
                 f"{np.rad2deg(self.semantic_vertical_wrist_rate_rad_s):+.1f}deg/s, "

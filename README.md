@@ -197,9 +197,20 @@ J4 另外使用两级抑振：任务空间的前后/上下目标先按最大速�
 必须先完成上面的桌面姿态标定。下面的第一阶段已经提高到肉眼可见但仍受约束的
 验证范围：目标 TCP 抬升约 `25 mm`，J2/J3/J4 最大偏移约 `4.6°/5.7°/4.0°`，
 同时把六轴 MIT 总指令力矩分别限制为 `8/10/16/6/4/4 Nm`。灵巧手保持关闭。
-引擎路径使用已经在同一台
-Jetson 上验收过的
-RealMan 旧仓库引擎文件；不要跨 JetPack/TensorRT 版本复制 engine。
+TensorRT engine 必须在当前目标 Jetson 上构建；不要跨 GPU、JetPack 或 TensorRT
+版本复制 engine。三份最新日志中的语义目标周期中位数约为 `0.133s`（约 `7.5Hz`），
+且 TensorRT 明确报告跨设备 plan 警告，因此先从 ONNX 重建本机 engine：
+
+```bash
+cd "$HOME/ws/Jetson_Femto_reBot_B601_BrainCo_Demo_RTMPose_TensorRT"
+export SOURCE_ONNX_DIR="$HOME/ws/Jetson_Femto_Realman_Brainco_Demo_RTMPose_TensorRT/models/onnx"
+bash scripts/build_b601_local_tensorrt.sh
+```
+
+输出位于 `models/tensorrt_local`，并记录 `build_info.txt`。后续平滑跟随脚本会自动
+优先选择这组三个本机 engine，并打印 `Engine profile: target-local`；若仍显示
+`legacy-fallback`，脚本会拒绝真机启动。仅排查旧环境时可临时设置
+`B601_ALLOW_LEGACY_ENGINES=1`，但不要用该覆盖进行完整跟随测试。
 
 为避免旧 shell 函数继续覆盖成 12 mm 小幅参数，仓库同时提供可直接运行的明显运动
 验证入口。`TABLE_Q` 必须使用本机最新读取的桌面姿态：
@@ -236,7 +247,9 @@ export HAND_ENGINE='/absolute/path/to/rtmpose_hand.engine'
 只经过一次速度/加速度整形，再施加反馈跟踪窗口，使对应限速参数真正生效。最终目标
 仍会经过关节范围、桌面投影、力矩和失速保护。
 
-上下通道另有两层解耦。经过提速滤波的持续腕角变化会触发高度冻结；控制器持续重置
+上下通道另有两层解耦。经过提速滤波的持续腕角变化只有在腕部相对零位达到 `6°`
+或 J6 方向已经确认后才会触发高度冻结，避免日志中 `1--2°` 关键点噪声把高度长期
+锁住；控制器持续重置
 高度观测偏置，并要求腕角与解剖腕点高度漂移都连续稳定五帧，才从新腕姿继续计算真正
 的上下平移，因此不会在旋腕结束后补做一次延迟下移。若平面命令没有明确的负向高度速
 度，TCP 的闭环修正会被投影到不下降的速度空间；中间连杆只在距离桌面参考高度
@@ -292,6 +305,7 @@ run_b601_semantic_test() {
     -p b601_wrist_twist_stationary_confirm_samples:=3 \
     -p b601_vertical_wrist_decoupling_enabled:=true \
     -p b601_vertical_wrist_hold_rate_deg_s:=3.0 \
+    -p b601_vertical_wrist_hold_min_delta_deg:=6.0 \
     -p b601_vertical_wrist_release_rate_deg_s:=1.0 \
     -p b601_vertical_wrist_release_samples:=5 \
     -p b601_vertical_wrist_release_lift_rate_m_s:=0.012 \
@@ -377,7 +391,9 @@ run_b601_semantic_test() {
 `J6_clearance=armed` 和 `J6_observation=ready`，此时会自动在抬升后的姿态重新置零；
 看到这两个字段后保持掌心位置，再开始慢速旋腕。若出现 `outlier_hold`、
 `translation_hold` 或 `invalid_hold`，J6 应保持当前位置，待 `J6_stable=3/3` 后重新置零。
-旋腕期间 `vertical_wrist_hold=True` 时，`raw_lift` 可以随视觉几何变化，但 `lift` 应保持；
+旋腕前 `vertical_wrist_armed=False` 时，轻微角速度或无效帧不应启动高度冻结；腕角达到
+`6°` 或 J6 方向确认后应变为 `vertical_wrist_armed=True`。旋腕期间
+`vertical_wrist_hold=True` 时，`raw_lift` 可以随视觉几何变化，但 `lift` 应保持；
 `lift_bias` 会吸收这段伪位移。腕角和腕点高度都稳定后 `vertical_wrist_release` 到达 `5/5`
 并解除保持；`vertical_lift_rate` 可用于确认释放前的高度观测已经停止漂移，
 高度目标不应跳变。手部静止时 `vertical_descent_allowed=False`，各受保护 frame 不应再
