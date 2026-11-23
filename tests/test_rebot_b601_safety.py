@@ -19,6 +19,7 @@ from arm_control.rebot_b601 import (
     gate_outward_scalar_increment,
     horizontal_radial_axis,
     independent_planar_task_backpressure,
+    intersect_joint_position_limits,
     jerk_limited_joint_target,
     joint_tracking_bounds,
     joint_target_safety_violations,
@@ -32,6 +33,7 @@ from arm_control.rebot_b601 import (
     select_descent_guard_rows,
     send_mit_checked,
     slew_limit_vector,
+    smoothed_semantic_goal_velocity,
     synchronize_vertical_follower_progress,
     suppress_uncommanded_task_descent,
     task_space_backpressure,
@@ -182,6 +184,43 @@ def test_joint_tracking_bounds_keep_validated_table_pose_reachable():
 
     np.testing.assert_allclose(lower, [-2.75, -3.09, -3.09])
     np.testing.assert_allclose(upper, [2.75, -0.009, -0.011])
+
+
+def test_official_safety_envelope_uses_conservative_urdf_intersection():
+    lower, upper = intersect_joint_position_limits(
+        [-2.8, -3.14, -3.14, -1.87, -1.57, -3.14],
+        [2.8, 0.0, 0.0, 1.57, 1.57, 3.14],
+        [-2.6005, -3.5954, -3.5954, -1.4992, -1.4992, -1.4992],
+        [2.6005, 0.0, 0.0, 1.4992, 1.4992, 1.4992],
+    )
+
+    np.testing.assert_allclose(
+        lower, [-2.6005, -3.14, -3.14, -1.4992, -1.4992, -1.4992]
+    )
+    np.testing.assert_allclose(
+        upper, [2.6005, 0.0, 0.0, 1.4992, 1.4992, 1.4992]
+    )
+
+
+def test_official_safety_envelope_rejects_non_overlapping_ranges():
+    with pytest.raises(ValueError, match="do not overlap"):
+        intersect_joint_position_limits([-1.0], [0.0], [0.1], [1.0])
+
+
+def test_official_envelope_retains_margin_without_trapping_table_pose():
+    lower, upper = joint_tracking_bounds(
+        [-2.6005, -3.14, -3.14, -1.4992, -1.4992, -1.4992],
+        [2.6005, 0.0, 0.0, 1.4992, 1.4992, 1.4992],
+        0.10,
+        [-1.6173, -0.0105, -0.0498, 0.1383, -0.0116, -0.4606],
+    )
+
+    np.testing.assert_allclose(
+        lower, [-2.5005, -3.04, -3.04, -1.3992, -1.3992, -1.3992]
+    )
+    np.testing.assert_allclose(
+        upper, [2.5005, -0.0105, -0.0498, 1.3992, 1.3992, 1.3992]
+    )
 
 
 def test_coordinated_joint_step_scaling_preserves_direction():
@@ -503,6 +542,25 @@ def test_goal_velocity_preserves_planar_group_shape_and_resets_on_reversal():
         np.abs(reversed_velocity[1:4]),
         0.5 * np.abs(velocity[1:4]),
     )
+
+
+def test_semantic_goal_velocity_filters_planar_group_but_keeps_direct_rates():
+    velocity = smoothed_semantic_goal_velocity(
+        requested_position=[0.0, 0.0044, -0.0056, 0.0024, 0.0, 0.0],
+        previous_position=[0.0] * 6,
+        previous_velocity=[0.0] * 6,
+        max_velocity=[0.10, 0.11, 0.14, 0.045, 0.02, 0.16],
+        filter_alpha=0.45,
+        dt_s=0.04,
+        j1_velocity_rad_s=0.07,
+        j6_velocity_rad_s=-0.12,
+    )
+
+    np.testing.assert_allclose(
+        velocity[1:4], 0.45 * np.asarray([0.0825, -0.105, 0.045])
+    )
+    assert velocity[0] == pytest.approx(0.07)
+    assert velocity[5] == pytest.approx(-0.12)
 
 
 def test_high_rate_stream_preloads_velocity_without_overshooting_latest_goal():

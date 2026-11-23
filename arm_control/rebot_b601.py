@@ -363,6 +363,46 @@ def joint_tracking_bounds(
     return np.maximum(lower_guard, lower), np.minimum(upper_guard, upper)
 
 
+def intersect_joint_position_limits(
+    model_lower_rad: Sequence[float],
+    model_upper_rad: Sequence[float],
+    safety_lower_rad: Sequence[float],
+    safety_upper_rad: Sequence[float],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Intersect model limits with an independently configured safety envelope.
+
+    Seeed's published B601-DM range table and the current official DM URDF are
+    not identical.  Treating either source as permission to exceed the other
+    would be unsafe, so runtime control uses their intersection.  The normal
+    joint-limit margin is applied later by :func:`joint_tracking_bounds`.
+    """
+
+    model_lower = np.asarray(model_lower_rad, dtype=np.float64).reshape(-1)
+    model_upper = np.asarray(model_upper_rad, dtype=np.float64).reshape(-1)
+    safety_lower = np.asarray(safety_lower_rad, dtype=np.float64).reshape(-1)
+    safety_upper = np.asarray(safety_upper_rad, dtype=np.float64).reshape(-1)
+    if not (
+        model_lower.shape
+        == model_upper.shape
+        == safety_lower.shape
+        == safety_upper.shape
+    ):
+        raise ValueError("joint position-limit vectors must have matching shapes")
+    if not all(
+        np.all(np.isfinite(value))
+        for value in (model_lower, model_upper, safety_lower, safety_upper)
+    ):
+        raise ValueError("joint position limits must be finite")
+    if np.any(model_lower >= model_upper) or np.any(safety_lower >= safety_upper):
+        raise ValueError("joint position lower limits must be below upper limits")
+
+    lower = np.maximum(model_lower, safety_lower)
+    upper = np.minimum(model_upper, safety_upper)
+    if np.any(lower >= upper):
+        raise ValueError("model and configured joint safety limits do not overlap")
+    return lower, upper
+
+
 def scale_vector_to_max_abs(
     values: Sequence[float], max_abs_value: float
 ) -> np.ndarray:
@@ -1359,6 +1399,42 @@ def filtered_goal_velocity(
     return np.clip(result, -velocity_limit, velocity_limit)
 
 
+def smoothed_semantic_goal_velocity(
+    requested_position: Sequence[float],
+    previous_position: Sequence[float],
+    previous_velocity: Sequence[float],
+    max_velocity: Sequence[float],
+    filter_alpha: float,
+    dt_s: float,
+    j1_velocity_rad_s: float,
+    j6_velocity_rad_s: float,
+) -> np.ndarray:
+    """Build feed-forward velocity without bypassing planar interpolation.
+
+    J1 and J6 already have dedicated scalar acceleration limiters, so their
+    accepted velocities pass through unchanged.  J2/J3/J4 are filtered as one
+    coordinated vector.  This is important when inference supplies only about
+    five target updates per second: copying the raw resolved-rate vector into
+    the 500 Hz stream turns every camera frame into a visible velocity step.
+    """
+
+    result = filtered_goal_velocity(
+        requested_position,
+        previous_position,
+        previous_velocity,
+        max_velocity,
+        filter_alpha,
+        dt_s,
+        coordinated_indices=(1, 2, 3),
+    )
+    direct = np.asarray([j1_velocity_rad_s, j6_velocity_rad_s], dtype=np.float64)
+    if not np.all(np.isfinite(direct)):
+        raise ValueError("direct semantic goal velocities must be finite")
+    result[0] = float(direct[0])
+    result[5] = float(direct[1])
+    return result
+
+
 def jerk_limited_joint_target(
     requested: Sequence[float],
     previous: Sequence[float],
@@ -1848,6 +1924,33 @@ class B601PalmFollower:
             or self.joint_limit_margin_rad < 0.0
         ):
             raise ValueError("b601_joint_limit_margin_rad must be finite and non-negative")
+        # Conservative intersection target from Seeed's published B601-DM
+        # range table: J1 +/-149 deg, J2/J3 -206..0 deg, J4/J5/J6 +/-85.9 deg.
+        # The current official DM URDF is intersected with this envelope after
+        # loading; joint_tracking_bounds then applies the additional margin.
+        self.configured_safe_joint_lower = _vector(
+            node.declare_parameter(
+                "b601_safe_joint_lower_rad",
+                [-2.6005, -3.5954, -3.5954, -1.4992, -1.4992, -1.4992],
+            ).value,
+            self.ARM_DOF,
+            "b601_safe_joint_lower_rad",
+        )
+        self.configured_safe_joint_upper = _vector(
+            node.declare_parameter(
+                "b601_safe_joint_upper_rad",
+                [2.6005, 0.0, 0.0, 1.4992, 1.4992, 1.4992],
+            ).value,
+            self.ARM_DOF,
+            "b601_safe_joint_upper_rad",
+        )
+        if np.any(
+            self.configured_safe_joint_lower >= self.configured_safe_joint_upper
+        ):
+            raise ValueError(
+                "b601_safe_joint_lower_rad must be below "
+                "b601_safe_joint_upper_rad for every joint"
+            )
         self.control_rate_hz = float(
             node.declare_parameter("b601_control_rate_hz", 500.0).value
         )
@@ -1918,6 +2021,11 @@ class B601PalmFollower:
                 "b601_stream_position_correction_max_fraction", 0.35
             ).value
         )
+        self.stream_planar_position_correction_max_fraction = float(
+            node.declare_parameter(
+                "b601_stream_planar_position_correction_max_fraction", 0.20
+            ).value
+        )
         if (
             not np.isfinite(self.stream_outer_velocity_scale)
             or self.stream_outer_velocity_scale < 1.0
@@ -1935,10 +2043,17 @@ class B601PalmFollower:
             or self.stream_position_correction_gain_s <= 0.0
             or not np.isfinite(self.stream_position_correction_max_fraction)
             or not 0.0 < self.stream_position_correction_max_fraction <= 1.0
+            or not np.isfinite(
+                self.stream_planar_position_correction_max_fraction
+            )
+            or not 0.0
+            < self.stream_planar_position_correction_max_fraction
+            <= self.stream_position_correction_max_fraction
         ):
             raise ValueError(
                 "B601 stream follow scale/stale cycles must be >= 1 and "
-                "goal-velocity alpha/correction fraction must be in (0, 1]"
+                "goal-velocity alpha/correction fractions must be valid; the "
+                "planar correction fraction cannot exceed the global fraction"
             )
 
         self.auto_home_on_start = bool(
@@ -3036,8 +3151,18 @@ class B601PalmFollower:
             self._model,
             ("link3", "link4", "end_link"),
         )
-        self._joint_lower = self._model.lowerPositionLimit[: self.ARM_DOF].copy()
-        self._joint_upper = self._model.upperPositionLimit[: self.ARM_DOF].copy()
+        self._urdf_joint_lower = self._model.lowerPositionLimit[
+            : self.ARM_DOF
+        ].copy()
+        self._urdf_joint_upper = self._model.upperPositionLimit[
+            : self.ARM_DOF
+        ].copy()
+        self._joint_lower, self._joint_upper = intersect_joint_position_limits(
+            self._urdf_joint_lower,
+            self._urdf_joint_upper,
+            self.configured_safe_joint_lower,
+            self.configured_safe_joint_upper,
+        )
 
         self.robot = RebotArm(str(self.hardware_yaml.resolve()))
         try:
@@ -3056,7 +3181,7 @@ class B601PalmFollower:
             if np.any(outside_hard_limits):
                 raise StartupGuardError(
                     "Refusing to enable B601-DM torque: validated table feedback is "
-                    "outside the URDF hard limits for joints "
+                    "outside the official/URDF joint safety intersection for joints "
                     f"{(np.flatnonzero(outside_hard_limits) + 1).tolist()}"
                 )
             self.startup_joint_reference = q.copy()
@@ -3097,6 +3222,17 @@ class B601PalmFollower:
             f"q={q.round(4).tolist()} rad, TCP={self.initial_pose[:3]}, "
             f"control={self.control_rate_hz:.0f}Hz MIT + Pinocchio g(q)"
         )
+        safe_lower, safe_upper = joint_tracking_bounds(
+            self._joint_lower,
+            self._joint_upper,
+            self.joint_limit_margin_rad,
+            self.startup_joint_reference,
+        )
+        self.logger.info(
+            "B601 official/URDF joint safety envelope after software margin: "
+            f"lower={safe_lower.round(4).tolist()}rad, "
+            f"upper={safe_upper.round(4).tolist()}rad"
+        )
 
     def _read_complete_feedback(self) -> tuple[np.ndarray, np.ndarray]:
         deadline = time.monotonic() + max(0.1, self.feedback_timeout_s)
@@ -3127,6 +3263,30 @@ class B601PalmFollower:
         limit[3] = min(limit[3], self.semantic_j4_target_max_velocity)
         limit[5] = min(limit[5], self.semantic_j6_target_max_velocity)
         return limit
+
+    def _semantic_joint_bounds(
+        self, reference_q: Sequence[float]
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return semantic offsets clipped by official/URDF tracking limits."""
+
+        reference = _vector(reference_q, self.ARM_DOF, "semantic reference_q")
+        tracking_lower, tracking_upper = joint_tracking_bounds(
+            self._joint_lower,
+            self._joint_upper,
+            self.joint_limit_margin_rad,
+            self.startup_joint_reference,
+        )
+        lower = np.maximum(
+            reference - self.semantic_max_joint_offset,
+            tracking_lower,
+        )
+        upper = np.minimum(
+            reference + self.semantic_max_joint_offset,
+            tracking_upper,
+        )
+        if np.any(lower > upper):
+            raise RuntimeError("B601 semantic joint bounds have no valid overlap")
+        return lower, upper
 
     def _control_loop(self, robot: Any, dt: float) -> None:
         try:
@@ -3212,9 +3372,16 @@ class B601PalmFollower:
                             stream_correction_gain = (
                                 self.stream_position_correction_gain_s
                             )
+                            correction_fraction = np.full(
+                                self.ARM_DOF,
+                                self.stream_position_correction_max_fraction,
+                                dtype=np.float64,
+                            )
+                            correction_fraction[1:4] = (
+                                self.stream_planar_position_correction_max_fraction
+                            )
                             stream_correction_limit = (
-                                self.stream_position_correction_max_fraction
-                                * stream_velocity_limit
+                                correction_fraction * stream_velocity_limit
                             )
                             goal_age = time.monotonic() - self.target_q_update_time
                             goal_hold_s = adaptive_goal_velocity_hold_s(
@@ -4051,7 +4218,15 @@ class B601PalmFollower:
             previous_target[0] - q_reference[0],
             forward_gate,
         )
-        q_base = q_reference + direct_offsets
+        semantic_lower, semantic_upper = self._semantic_joint_bounds(q_reference)
+        # Saturate direct J1/J6 requests at the safe envelope instead of
+        # rejecting the complete J2/J3/J4 update when the operator reaches an
+        # expanded-workspace boundary.
+        q_base = np.clip(
+            q_reference + direct_offsets,
+            semantic_lower,
+            semantic_upper,
+        )
         requested_forward_target = (
             forward
             if self.semantic_channel_enable[1] > 0.5
@@ -4319,18 +4494,16 @@ class B601PalmFollower:
                             alpha * bounded_period
                             + (1.0 - alpha) * self.target_q_update_period_s
                         )
-            next_goal_velocity = filtered_goal_velocity(
+            next_goal_velocity = smoothed_semantic_goal_velocity(
                 q_target,
                 previous_target,
                 self.target_q_velocity,
                 outer_velocity_limit,
                 self.stream_goal_velocity_filter_alpha,
                 target_dt,
-                coordinated_indices=(1, 2, 3),
+                j1_velocity,
+                j6_velocity,
             )
-            next_goal_velocity[planar_indices] = accepted_planar_joint_velocity
-            next_goal_velocity[0] = j1_velocity
-            next_goal_velocity[5] = j6_velocity
             self.target_q_velocity = next_goal_velocity
             self.target_q = q_target.copy()
             self.target_q_update_time = now
@@ -4672,19 +4845,8 @@ class B601PalmFollower:
             )
             joint_velocity *= velocity_scale
         q_request[columns] = previous_target[columns] + joint_velocity * dt
-        tracking_lower, tracking_upper = joint_tracking_bounds(
-            self._joint_lower,
-            self._joint_upper,
-            self.joint_limit_margin_rad,
-            self.startup_joint_reference,
-        )
-        lower = np.maximum(
-            self.semantic_control_reference_q - self.semantic_max_joint_offset,
-            tracking_lower,
-        )
-        upper = np.minimum(
-            self.semantic_control_reference_q + self.semantic_max_joint_offset,
-            tracking_upper,
+        lower, upper = self._semantic_joint_bounds(
+            self.semantic_control_reference_q
         )
         q_request = np.clip(q_request, lower, upper)
         joint_velocity = (q_request[columns] - previous_target[columns]) / dt
@@ -4729,20 +4891,7 @@ class B601PalmFollower:
             reference_heights[self._articulation_clearance_frame_ids]
             + self.semantic_vertical_height_profile * float(lift_m)
         )
-        tracking_lower, tracking_upper = joint_tracking_bounds(
-            self._joint_lower,
-            self._joint_upper,
-            self.joint_limit_margin_rad,
-            self.startup_joint_reference,
-        )
-        lower = np.maximum(
-            q_reference - self.semantic_max_joint_offset,
-            tracking_lower,
-        )
-        upper = np.minimum(
-            q_reference + self.semantic_max_joint_offset,
-            tracking_upper,
-        )
+        lower, upper = self._semantic_joint_bounds(q_reference)
         q = np.clip(q, lower, upper)
 
         forward_error = 0.0

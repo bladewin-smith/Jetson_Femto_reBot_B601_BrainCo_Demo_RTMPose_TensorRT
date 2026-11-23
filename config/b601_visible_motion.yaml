@@ -9,7 +9,7 @@ hand_palm_b601_control_node:
     palm_filter_fast_alpha: 0.72
     palm_filter_speed_scale_m_s: 0.30
     palm_filter_max_innovation_m: [0.030, 0.030, 0.030]
-    b601_semantic_joint_gains: [0.65, -0.60, 0.18, 0.15, 0.45]
+    b601_semantic_joint_gains: [3.00, -0.60, 0.18, 0.15, 0.75]
     b601_semantic_angle_deadband_deg: [5.0, 5.0, 3.0]
     # Wrist intent is accepted only while the palm is translationally stable.
     # Raw depth-angle flips are rejected, not clipped and accumulated.
@@ -37,7 +37,15 @@ hand_palm_b601_control_node:
     b601_wrist_twist_reverse_confirm_samples: 6
     b601_wrist_twist_min_joint_offset_rad: 0.080
     b601_wrist_twist_soft_start_s: 0.30
-    b601_semantic_max_joint_offset_rad: [0.035, 0.080, 0.100, 0.070, 0.008, 0.250]
+    # Published B601-DM range intersected with the current official DM URDF.
+    # A second 0.10 rad tracking margin is retained inside these boundaries;
+    # J2/J3 may return to the verified table pose but never cross it.
+    b601_safe_joint_lower_rad: [-2.6005, -3.5954, -3.5954, -1.4992, -1.4992, -1.4992]
+    b601_safe_joint_upper_rad: [2.6005, 0.0, 0.0, 1.4992, 1.4992, 1.4992]
+    b601_joint_limit_margin_rad: 0.10
+    # These broad semantic offsets no longer define the hard safety boundary;
+    # the official/URDF intersection above and table-clearance projection do.
+    b601_semantic_max_joint_offset_rad: [1.60, 1.40, 1.50, 1.00, 0.008, 1.20]
     b601_semantic_max_step_rad: [0.0025, 0.0025, 0.0030, 0.0020, 0.0010, 0.0060]
     b601_joint_kp: [120.0, 120.0, 180.0, 30.0, 35.0, 30.0]
     b601_joint_kd: [8.0, 8.0, 8.0, 4.0, 2.0, 2.0]
@@ -52,28 +60,30 @@ hand_palm_b601_control_node:
     # target rate, then feed the estimated target velocity into the stream.
     # This avoids arriving early and stopping at every camera update.
     b601_stream_outer_velocity_scale: 1.35
+    b601_stream_planar_outer_velocity_scale: 1.05
     b601_stream_goal_velocity_filter_alpha: 0.45
     b601_stream_goal_velocity_stale_cycles: 2.0
     b601_stream_goal_period_filter_alpha: 0.20
-    b601_stream_goal_velocity_max_hold_s: 0.20
+    b601_stream_goal_velocity_max_hold_s: 0.32
     # Resolved-rate velocity is primary; position error contributes only a
     # bounded correction instead of making the stream race to every sample.
     b601_stream_position_correction_gain_s: 5.0
-    b601_stream_position_correction_max_fraction: 0.35
+    b601_stream_position_correction_max_fraction: 0.28
+    b601_stream_planar_position_correction_max_fraction: 0.18
     b601_semantic_max_tracking_error_rad: [0.012, 0.020, 0.055, 0.018, 0.008, 0.040]
     b601_semantic_stall_error_rad: [0.010, 0.015, 0.030, 0.015, 0.010, 0.012]
     b601_semantic_stall_min_progress_rad: 0.0015
     b601_semantic_stall_timeout_s: 4.0
     b601_semantic_vertical_primary_joint: 3
     b601_semantic_vertical_follower_progress_lead: 0.15
-    b601_semantic_vertical_max_lift_m: 0.025
+    b601_semantic_vertical_max_lift_m: 0.180
     b601_semantic_min_lift_before_articulation_m: 0.018
     b601_semantic_min_chain_clearance_m: 0.001
     b601_semantic_vertical_height_profile: [0.50, 0.82, 1.0]
     # Palm depth/height form one 2-D Cartesian task solved over J2/J3/J4.
     # Input scale is [forward, height]; mobility is [J2, J3, J4].
     b601_semantic_planar_input_scale: [0.45, 1.0]
-    b601_semantic_planar_max_forward_m: 0.035
+    b601_semantic_planar_max_forward_m: 0.150
     b601_semantic_planar_joint_mobility: [0.85, 1.00, 0.50]
     b601_semantic_planar_task_weights: [1.00, 0.65, 0.85, 1.00]
     b601_semantic_planar_command_max_velocity_m_s: [0.060, 0.035]

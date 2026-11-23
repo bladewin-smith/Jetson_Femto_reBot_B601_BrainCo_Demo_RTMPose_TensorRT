@@ -74,7 +74,8 @@ export PYTHONPATH="$HOME/ws/pyorbbecsdk-2-main:$HOME/ws/brainco-hand-sdk-main/py
 echo "B601 continuous semantic follower"
 echo "Planar control: resolved-rate J2/J3/J4 + task anti-windup + continuous clearance gate"
 echo "Vertical safety: anatomical-wrist anchor + wrist-rotation rebase + no-descent guard"
-echo "MIT stream: velocity feed-forward + bounded position correction + adaptive frame hold"
+echo "MIT stream: coordinated velocity interpolation + bounded position correction + adaptive frame hold"
+echo "Workspace: Seeed published range intersected with current DM URDF, plus 0.10 rad margin"
 echo "Channels: $CHANNELS"
 echo "Engine profile: $ENGINE_PROFILE"
 echo "Detector: $DET_ENGINE"
@@ -93,14 +94,17 @@ exec python "$REPO/scripts/camera_arm_b601_control_pose_hands.py" --ros-args \
   -p b601_tabletop_startup_confirmed:=true \
   -p b601_tabletop_joints_rad:="$TABLE_Q" \
   -p b601_tabletop_joint_tolerance_rad:='[0.12,0.12,0.12,0.12,0.12,0.12]' \
+  -p b601_safe_joint_lower_rad:='[-2.6005,-3.5954,-3.5954,-1.4992,-1.4992,-1.4992]' \
+  -p b601_safe_joint_upper_rad:='[2.6005,0.0,0.0,1.4992,1.4992,1.4992]' \
+  -p b601_joint_limit_margin_rad:=0.10 \
   -p b601_control_mode:=semantic_joint \
   -p b601_semantic_channel_enable:="$CHANNELS" \
-  -p b601_semantic_joint_gains:='[2.00,-0.60,0.18,0.15,0.75]' \
-  -p b601_semantic_max_joint_offset_rad:='[0.70,0.45,0.55,0.35,0.008,0.25]' \
+  -p b601_semantic_joint_gains:='[3.00,-0.60,0.18,0.15,0.75]' \
+  -p b601_semantic_max_joint_offset_rad:='[1.60,1.40,1.50,1.00,0.008,1.20]' \
   -p b601_semantic_max_step_rad:='[0.0036,0.0044,0.0056,0.0024,0.0008,0.0072]' \
   -p b601_semantic_max_tracking_error_rad:='[0.026,0.042,0.085,0.040,0.008,0.090]' \
-  -p b601_semantic_vertical_max_lift_m:=0.060 \
-  -p b601_semantic_planar_max_forward_m:=0.055 \
+  -p b601_semantic_vertical_max_lift_m:=0.180 \
+  -p b601_semantic_planar_max_forward_m:=0.150 \
   -p b601_semantic_vertical_solver_step_rad:=0.020 \
   -p b601_semantic_vertical_solver_iterations:=20 \
   -p arm_command_interval_s:=0.04 \
@@ -167,13 +171,14 @@ exec python "$REPO/scripts/camera_arm_b601_control_pose_hands.py" --ros-args \
   -p b601_stream_max_acceleration_rad_s2:='[1.6,2.0,2.4,0.85,0.8,3.0]' \
   -p b601_stream_max_jerk_rad_s3:='[50.0,65.0,80.0,32.0,30.0,100.0]' \
   -p b601_stream_outer_velocity_scale:=1.30 \
-  -p b601_stream_planar_outer_velocity_scale:=1.08 \
+  -p b601_stream_planar_outer_velocity_scale:=1.05 \
   -p b601_stream_goal_velocity_filter_alpha:=0.45 \
   -p b601_stream_goal_velocity_stale_cycles:=2.0 \
   -p b601_stream_goal_period_filter_alpha:=0.20 \
   -p b601_stream_goal_velocity_max_hold_s:=0.32 \
   -p b601_stream_position_correction_gain_s:=4.0 \
   -p b601_stream_position_correction_max_fraction:=0.28 \
+  -p b601_stream_planar_position_correction_max_fraction:=0.18 \
   -p control_hand_side:=right \
   -p control_hand_fallback_enabled:=false \
   -p hand_control_enabled:=false \
