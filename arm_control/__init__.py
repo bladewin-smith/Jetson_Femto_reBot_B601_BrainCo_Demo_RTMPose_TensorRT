@@ -3,6 +3,7 @@
 from .rebot_b601 import (
     B601PalmFollower,
     StartupGuardError,
+    adaptive_position_correction_fraction,
     apply_tabletop_motion_envelope,
     intersect_joint_position_limits,
     joint_tracking_bounds,
@@ -24,6 +25,7 @@ from .semantic_motion import (
 __all__ = [
     "B601PalmFollower",
     "StartupGuardError",
+    "adaptive_position_correction_fraction",
     "apply_tabletop_motion_envelope",
     "intersect_joint_position_limits",
     "joint_tracking_bounds",

@@ -270,6 +270,47 @@ def minimum_jerk_blend(progress: float) -> float:
     return 10.0 * s**3 - 15.0 * s**4 + 6.0 * s**5
 
 
+def adaptive_position_correction_fraction(
+    tracking_error_rad: Sequence[float],
+    tracking_limit_rad: Sequence[float],
+    minimum_fraction: float,
+    maximum_fraction: float,
+    ramp_start_fraction: float = 0.45,
+    full_correction_fraction: float = 0.90,
+) -> tuple[float, float]:
+    """Increase stream catch-up smoothly as target lead consumes its window.
+
+    A fixed small position-correction fraction is quiet near the goal but can
+    trap a slow, gravity-loaded arm at the outer tracking boundary.  The outer
+    target then advances only when feedback moves, producing a visible ratchet.
+    This schedule keeps the small correction near the goal and blends toward a
+    larger value only when the coordinated J2/J3/J4 lead approaches its limit.
+    """
+
+    error = np.asarray(tracking_error_rad, dtype=np.float64).reshape(-1)
+    limit = np.asarray(tracking_limit_rad, dtype=np.float64).reshape(-1)
+    minimum = float(minimum_fraction)
+    maximum = float(maximum_fraction)
+    start = float(ramp_start_fraction)
+    full = float(full_correction_fraction)
+    if error.shape != limit.shape:
+        raise ValueError("tracking error and correction-limit vectors must match")
+    if not np.all(np.isfinite(error)) or not np.all(np.isfinite(limit)):
+        raise ValueError("adaptive correction vectors must be finite")
+    if (
+        np.any(limit <= 0.0)
+        or not all(np.isfinite(value) for value in (minimum, maximum, start, full))
+        or not 0.0 < minimum <= maximum <= 1.0
+        or not 0.0 <= start < full <= 1.0
+    ):
+        raise ValueError("adaptive position-correction settings are invalid")
+
+    lead_ratio = float(np.max(np.abs(error) / limit)) if error.size else 0.0
+    progress = float(np.clip((lead_ratio - start) / (full - start), 0.0, 1.0))
+    fraction = minimum + (maximum - minimum) * minimum_jerk_blend(progress)
+    return float(fraction), lead_ratio
+
+
 def joint_target_safety_violations(
     target_rad: Sequence[float],
     current_rad: Sequence[float],
@@ -2008,7 +2049,12 @@ class B601PalmFollower:
         )
         self.stream_goal_velocity_max_hold_s = float(
             node.declare_parameter(
-                "b601_stream_goal_velocity_max_hold_s", 0.20
+                "b601_stream_goal_velocity_max_hold_s", 0.55
+            ).value
+        )
+        self.stream_goal_observed_period_max_s = float(
+            node.declare_parameter(
+                "b601_stream_goal_observed_period_max_s", 0.50
             ).value
         )
         self.stream_position_correction_gain_s = float(
@@ -2023,7 +2069,12 @@ class B601PalmFollower:
         )
         self.stream_planar_position_correction_max_fraction = float(
             node.declare_parameter(
-                "b601_stream_planar_position_correction_max_fraction", 0.20
+                "b601_stream_planar_position_correction_max_fraction", 0.32
+            ).value
+        )
+        self.stream_planar_position_correction_min_fraction = float(
+            node.declare_parameter(
+                "b601_stream_planar_position_correction_min_fraction", 0.18
             ).value
         )
         if (
@@ -2039,6 +2090,8 @@ class B601PalmFollower:
             or not 0.0 < self.stream_goal_period_filter_alpha <= 1.0
             or not np.isfinite(self.stream_goal_velocity_max_hold_s)
             or self.stream_goal_velocity_max_hold_s <= 0.0
+            or not np.isfinite(self.stream_goal_observed_period_max_s)
+            or self.stream_goal_observed_period_max_s <= 0.0
             or not np.isfinite(self.stream_position_correction_gain_s)
             or self.stream_position_correction_gain_s <= 0.0
             or not np.isfinite(self.stream_position_correction_max_fraction)
@@ -2049,6 +2102,12 @@ class B601PalmFollower:
             or not 0.0
             < self.stream_planar_position_correction_max_fraction
             <= self.stream_position_correction_max_fraction
+            or not np.isfinite(
+                self.stream_planar_position_correction_min_fraction
+            )
+            or not 0.0
+            < self.stream_planar_position_correction_min_fraction
+            <= self.stream_planar_position_correction_max_fraction
         ):
             raise ValueError(
                 "B601 stream follow scale/stale cycles must be >= 1 and "
@@ -2144,14 +2203,24 @@ class B601PalmFollower:
         self.command_interval_s = float(
             node.declare_parameter("arm_command_interval_s", 0.06).value
         )
+        self.semantic_outer_dt_max_s = float(
+            node.declare_parameter("b601_semantic_outer_dt_max_s", 0.35).value
+        )
         if (
             not np.isfinite(self.command_interval_s)
             or self.command_interval_s <= 0.0
             or self.stream_goal_velocity_max_hold_s < self.command_interval_s
+            or not np.isfinite(self.semantic_outer_dt_max_s)
+            or self.semantic_outer_dt_max_s < self.command_interval_s
+            or self.semantic_outer_dt_max_s
+            > self.stream_goal_observed_period_max_s
+            or self.stream_goal_velocity_max_hold_s
+            < self.semantic_outer_dt_max_s
         ):
             raise ValueError(
-                "arm_command_interval_s must be positive and cannot exceed "
-                "b601_stream_goal_velocity_max_hold_s"
+                "B601 command/outer-loop timing must satisfy command_interval "
+                "<= outer_dt_max <= observed_period_max and velocity_hold must "
+                "cover outer_dt_max"
             )
         self.min_command_delta_m = float(
             node.declare_parameter("min_command_delta_m", 0.0015).value
@@ -2973,12 +3042,17 @@ class B601PalmFollower:
         self.target_q_velocity = np.zeros(self.ARM_DOF, dtype=np.float64)
         self.target_q_update_time = 0.0
         self.target_q_update_period_s = self.command_interval_s
+        self.last_target_q_observed_period_s = self.command_interval_s
         self.last_goal_velocity_hold_s = adaptive_goal_velocity_hold_s(
             self.command_interval_s,
             self.command_interval_s,
             self.stream_goal_velocity_stale_cycles,
             self.stream_goal_velocity_max_hold_s,
         )
+        self.last_stream_planar_correction_fraction = (
+            self.stream_planar_position_correction_min_fraction
+        )
+        self.last_stream_planar_lead_ratio = 0.0
         self.last_command_effort = np.zeros(self.ARM_DOF, dtype=np.float64)
         self.last_effort_limited = np.zeros(self.ARM_DOF, dtype=bool)
         self.last_motor_status = np.zeros(self.ARM_DOF, dtype=np.int64)
@@ -3377,9 +3451,20 @@ class B601PalmFollower:
                                 self.stream_position_correction_max_fraction,
                                 dtype=np.float64,
                             )
-                            correction_fraction[1:4] = (
-                                self.stream_planar_position_correction_max_fraction
+                            (
+                                planar_correction_fraction,
+                                planar_lead_ratio,
+                            ) = adaptive_position_correction_fraction(
+                                goal_q[1:4] - q[1:4],
+                                self.semantic_max_tracking_error[1:4],
+                                self.stream_planar_position_correction_min_fraction,
+                                self.stream_planar_position_correction_max_fraction,
                             )
+                            correction_fraction[1:4] = planar_correction_fraction
+                            self.last_stream_planar_correction_fraction = (
+                                planar_correction_fraction
+                            )
+                            self.last_stream_planar_lead_ratio = planar_lead_ratio
                             stream_correction_limit = (
                                 correction_fraction * stream_velocity_limit
                             )
@@ -3614,12 +3699,17 @@ class B601PalmFollower:
         self.semantic_clearance_gate = 0.0
         self.last_semantic_raw_clearance_gate = 0.0
         self.target_q_update_period_s = self.command_interval_s
+        self.last_target_q_observed_period_s = self.command_interval_s
         self.last_goal_velocity_hold_s = adaptive_goal_velocity_hold_s(
             self.command_interval_s,
             self.command_interval_s,
             self.stream_goal_velocity_stale_cycles,
             self.stream_goal_velocity_max_hold_s,
         )
+        self.last_stream_planar_correction_fraction = (
+            self.stream_planar_position_correction_min_fraction
+        )
+        self.last_stream_planar_lead_ratio = 0.0
         self.last_semantic_planar_command_time = float(now_s)
         self.semantic_motion_target_m.fill(0.0)
         self.semantic_motion_active_direction.fill(0)
@@ -3809,7 +3899,13 @@ class B601PalmFollower:
         target_dt = (
             self.command_interval_s
             if self.last_submit_time <= 0.0
-            else float(np.clip(now - self.last_submit_time, 0.001, 0.2))
+            else float(
+                np.clip(
+                    now - self.last_submit_time,
+                    0.001,
+                    self.semantic_outer_dt_max_s,
+                )
+            )
         )
         q_reference = self.semantic_control_reference_q
         with self.target_lock:
@@ -4277,7 +4373,7 @@ class B601PalmFollower:
                 np.clip(
                     now - self.last_semantic_planar_command_time,
                     0.001,
-                    0.2,
+                    self.semantic_outer_dt_max_s,
                 )
             )
         )
@@ -4478,12 +4574,12 @@ class B601PalmFollower:
                     np.isfinite(observed_period)
                     and 0.5 * self.command_interval_s
                     <= observed_period
-                    <= 2.0 * self.stream_goal_velocity_max_hold_s
                 ):
+                    self.last_target_q_observed_period_s = observed_period
                     alpha = self.stream_goal_period_filter_alpha
                     bounded_period = min(
                         observed_period,
-                        self.stream_goal_velocity_max_hold_s / 1.5,
+                        self.stream_goal_observed_period_max_s,
                     )
                     if bounded_period > self.target_q_update_period_s:
                         # Adapt immediately when vision is slower so velocity
@@ -4584,8 +4680,13 @@ class B601PalmFollower:
                 f"J4_target_velocity={self.semantic_j4_target_velocity:+.4f}rad/s, "
                 f"J6_target_velocity={self.semantic_j6_target_velocity:+.4f}rad/s, "
                 f"goal_velocity={self.target_q_velocity.round(4).tolist()}rad/s, "
+                f"outer_dt={target_dt:.3f}s, "
+                f"observed_period={self.last_target_q_observed_period_s:.3f}s, "
                 f"goal_period={self.target_q_update_period_s:.3f}s, "
                 f"goal_hold={self.last_goal_velocity_hold_s:.3f}s, "
+                f"stream_planar_correction="
+                f"{self.last_stream_planar_correction_fraction:.3f}@"
+                f"{self.last_stream_planar_lead_ratio:.2f}, "
                 f"stream_velocity={self.stream_target_velocity.round(4).tolist()}rad/s, "
                 f"articulation={'ready' if articulation_ready else 'locked'}, "
                 f"J6_clearance={'armed' if self.semantic_j6_clearance_enabled else 'locked'}, "

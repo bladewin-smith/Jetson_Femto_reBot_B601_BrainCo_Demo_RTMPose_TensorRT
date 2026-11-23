@@ -8,6 +8,7 @@ from arm_control.rebot_b601 import (
     acceleration_limited_scalar_target_with_tracking_window,
     acceleration_limited_vector_target,
     adaptive_goal_velocity_hold_s,
+    adaptive_position_correction_fraction,
     apply_tabletop_motion_envelope,
     coupled_stream_velocity_limits,
     confirmed_stationary_planar_target,
@@ -486,19 +487,55 @@ def test_stream_velocity_caps_follow_the_outer_semantic_rate():
     )
 
 
-def test_stream_velocity_caps_accept_slower_planar_follow_scale():
+def test_stream_velocity_caps_accept_current_planar_follow_scale():
     effective = coupled_stream_velocity_limits(
         configured_limit=[0.25, 0.30, 0.35, 0.15, 0.10, 0.30],
         semantic_max_step=[0.0036, 0.0044, 0.0056, 0.0024, 0.0008, 0.0072],
         command_interval_s=0.04,
         outer_velocity_limit=[0.10, 10.0, 10.0, 0.045, 10.0, 0.16],
-        follow_scale=[1.30, 1.08, 1.08, 1.08, 1.30, 1.30],
+        follow_scale=[1.30, 1.15, 1.15, 1.15, 1.30, 1.30],
     )
 
     np.testing.assert_allclose(
         effective,
-        [0.1170, 0.1188, 0.1512, 0.0486, 0.0260, 0.2080],
+        [0.1170, 0.1265, 0.1610, 0.05175, 0.0260, 0.2080],
     )
+
+
+def test_adaptive_position_correction_is_quiet_near_goal():
+    fraction, lead_ratio = adaptive_position_correction_fraction(
+        tracking_error_rad=[0.0055, 0.0110, 0.0060],
+        tracking_limit_rad=[0.055, 0.110, 0.060],
+        minimum_fraction=0.18,
+        maximum_fraction=0.32,
+    )
+
+    assert lead_ratio == pytest.approx(0.10)
+    assert fraction == pytest.approx(0.18)
+
+
+def test_adaptive_position_correction_reaches_full_catch_up_at_window_edge():
+    fraction, lead_ratio = adaptive_position_correction_fraction(
+        tracking_error_rad=[0.0, 0.099, 0.0],
+        tracking_limit_rad=[0.055, 0.110, 0.060],
+        minimum_fraction=0.18,
+        maximum_fraction=0.32,
+    )
+
+    assert lead_ratio == pytest.approx(0.90)
+    assert fraction == pytest.approx(0.32)
+
+
+def test_adaptive_position_correction_blends_smoothly_mid_window():
+    fraction, lead_ratio = adaptive_position_correction_fraction(
+        tracking_error_rad=[0.0, 0.07425, 0.0],
+        tracking_limit_rad=[0.055, 0.110, 0.060],
+        minimum_fraction=0.18,
+        maximum_fraction=0.32,
+    )
+
+    assert lead_ratio == pytest.approx(0.675)
+    assert fraction == pytest.approx(0.25)
 
 
 def test_goal_velocity_hold_adapts_to_slow_vision_without_exceeding_cap():
@@ -510,6 +547,9 @@ def test_goal_velocity_hold_adapts_to_slow_vision_without_exceeding_cap():
     )
     assert adaptive_goal_velocity_hold_s(0.04, 0.30, 2.0, 0.20) == pytest.approx(
         0.20
+    )
+    assert adaptive_goal_velocity_hold_s(0.04, 0.30, 2.0, 0.55) == pytest.approx(
+        0.45
     )
 
 
