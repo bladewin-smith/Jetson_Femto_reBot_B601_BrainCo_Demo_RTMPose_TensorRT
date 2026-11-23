@@ -28,6 +28,7 @@ from arm_control.rebot_b601 import (
     resolve_native_frame_ids,
     rotation_compensated_scalar_observation,
     scale_vector_to_max_abs,
+    select_descent_guard_rows,
     send_mit_checked,
     slew_limit_vector,
     synchronize_vertical_follower_progress,
@@ -36,6 +37,8 @@ from arm_control.rebot_b601 import (
     validate_wrapped_angle_observation,
     validate_tabletop_startup,
     weighted_damped_least_squares,
+    wrist_height_release_ready,
+    wrist_hold_vertical_planner_state,
     wrapped_rate_motion_hold,
 )
 
@@ -851,6 +854,27 @@ def test_wrist_motion_hold_requires_stable_release_samples():
     assert not hold and count == 0
 
 
+def test_wrist_hold_release_waits_for_height_estimator_to_settle():
+    # A real vertical gesture must not create a wrist hold by itself.
+    assert wrist_height_release_ready(True, False, -0.080, 0.012)
+    # Once wrist rotation has latched the hold, the same visual height rate is
+    # treated as estimator settling and extends the rebase window.
+    assert not wrist_height_release_ready(True, True, -0.080, 0.012)
+    assert wrist_height_release_ready(True, True, -0.006, 0.012)
+    assert not wrist_height_release_ready(False, True, 0.0, 0.012)
+
+
+def test_wrist_hold_cancels_queued_vertical_descent_velocity():
+    target, velocity = wrist_hold_vertical_planner_state(
+        requested_lift_m=0.025,
+        current_command_m=0.050,
+        previous_velocity_m_s=-0.020,
+        hold_active=True,
+    )
+    assert target == pytest.approx(0.050)
+    assert velocity == 0.0
+
+
 def test_static_task_feedback_cannot_lower_protected_frames():
     vertical_rows = np.array([[1.0, 0.0], [0.5, 1.0]])
     guarded = suppress_uncommanded_task_descent(
@@ -866,6 +890,44 @@ def test_static_task_feedback_cannot_lower_protected_frames():
 
     assert np.all(vertical_rows @ guarded >= -1e-10)
     np.testing.assert_allclose(deliberate, [-0.20, -0.10])
+
+
+def test_descent_guard_allows_planar_articulation_above_table_safety_band():
+    rows = np.array(
+        [
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+        ]
+    )
+    selected, mask = select_descent_guard_rows(
+        rows,
+        frame_ids=[30, 40, 50],
+        end_frame_id=50,
+        current_heights_m=[0.030, 0.025, 0.040],
+        table_heights_m=[0.0, 0.0, 0.0],
+        clearance_margin_m=0.010,
+    )
+    np.testing.assert_array_equal(mask, [False, False, True])
+
+    # Lowering one elevated intermediate link while raising another can keep
+    # the TCP level and is necessary for normal forward/backward motion.
+    requested = np.array([-0.2, 0.2])
+    guarded = suppress_uncommanded_task_descent(requested, selected, False)
+    np.testing.assert_allclose(guarded, requested)
+
+
+def test_descent_guard_adds_intermediate_link_inside_table_safety_band():
+    rows = np.eye(3)
+    _, mask = select_descent_guard_rows(
+        rows,
+        frame_ids=[30, 40, 50],
+        end_frame_id=50,
+        current_heights_m=[0.006, 0.025, 0.040],
+        table_heights_m=[0.0, 0.0, 0.0],
+        clearance_margin_m=0.010,
+    )
+    np.testing.assert_array_equal(mask, [True, False, True])
 
 
 def test_wrist_twist_direction_requires_confirmation_and_holds_through_spike():

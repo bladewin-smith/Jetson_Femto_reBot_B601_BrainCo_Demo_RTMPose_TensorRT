@@ -236,11 +236,13 @@ export HAND_ENGINE='/absolute/path/to/rtmpose_hand.engine'
 只经过一次速度/加速度整形，再施加反馈跟踪窗口，使对应限速参数真正生效。最终目标
 仍会经过关节范围、桌面投影、力矩和失速保护。
 
-上下通道另有两层解耦。检测到腕部角度正在变化或腕部观测失效时，控制器冻结最后一
-个已接受的高度，并持续重置高度观测偏置；腕部稳定四帧后，从新腕姿继续计算真正的
-上下平移，因此不会在旋腕结束后补做一次延迟下移。若平面命令没有明确的负向高度速
-度，J2/J3/J4 的闭环姿态修正还会被投影到“所有受保护连杆高度不下降”的速度空间；
-主动向下移动手部时该保护自动放行，按 `H` 回桌路径也不受影响。
+上下通道另有两层解耦。经过提速滤波的持续腕角变化会触发高度冻结；控制器持续重置
+高度观测偏置，并要求腕角与解剖腕点高度漂移都连续稳定五帧，才从新腕姿继续计算真正
+的上下平移，因此不会在旋腕结束后补做一次延迟下移。若平面命令没有明确的负向高度速
+度，TCP 的闭环修正会被投影到不下降的速度空间；中间连杆只在距离桌面参考高度
+`10 mm` 的安全带内启用同样的速度保护，安全带外允许完成前后运动所必需的小幅降高。
+所有连杆仍经过完整路径的桌面高度硬投影。主动向下移动手部时速度保护自动放行，
+按 `H` 回桌路径也不受影响。
 
 ```bash
 REPO="$HOME/ws/Jetson_Femto_reBot_B601_BrainCo_Demo_RTMPose_TensorRT"
@@ -282,7 +284,7 @@ run_b601_semantic_test() {
     -p palm_filter_fast_alpha:=0.72 \
     -p palm_filter_speed_scale_m_s:=0.30 \
     -p palm_filter_max_innovation_m:='[0.030,0.030,0.030]' \
-    -p b601_wrist_twist_filter_alpha:=0.10 \
+    -p b601_wrist_twist_filter_alpha:=0.18 \
     -p b601_wrist_twist_max_innovation_deg:=8.0 \
     -p b601_wrist_twist_max_raw_rate_deg_s:=180.0 \
     -p b601_wrist_twist_max_raw_jump_deg:=25.0 \
@@ -291,13 +293,14 @@ run_b601_semantic_test() {
     -p b601_vertical_wrist_decoupling_enabled:=true \
     -p b601_vertical_wrist_hold_rate_deg_s:=3.0 \
     -p b601_vertical_wrist_release_rate_deg_s:=1.0 \
-    -p b601_vertical_wrist_release_samples:=4 \
-    -p b601_wrist_twist_activate_deg:=15.0 \
-    -p b601_wrist_twist_release_deg:=7.0 \
-    -p b601_wrist_twist_confirm_samples:=5 \
-    -p b601_wrist_twist_reverse_confirm_samples:=9 \
+    -p b601_vertical_wrist_release_samples:=5 \
+    -p b601_vertical_wrist_release_lift_rate_m_s:=0.012 \
+    -p b601_wrist_twist_activate_deg:=12.0 \
+    -p b601_wrist_twist_release_deg:=6.0 \
+    -p b601_wrist_twist_confirm_samples:=3 \
+    -p b601_wrist_twist_reverse_confirm_samples:=6 \
     -p b601_wrist_twist_min_joint_offset_rad:=0.080 \
-    -p b601_wrist_twist_soft_start_s:=0.60 \
+    -p b601_wrist_twist_soft_start_s:=0.30 \
     -p b601_semantic_max_joint_offset_rad:='[0.035,0.080,0.100,0.070,0.008,0.250]' \
     -p b601_semantic_max_step_rad:='[0.0025,0.0025,0.0030,0.0020,0.0010,0.0060]' \
     -p b601_joint_kp:='[120.0,120.0,180.0,30.0,35.0,30.0]' \
@@ -323,12 +326,12 @@ run_b601_semantic_test() {
     -p b601_semantic_min_lift_before_articulation_m:=0.018 \
     -p b601_semantic_min_chain_clearance_m:=0.001 \
     -p b601_semantic_vertical_height_profile:='[0.50,0.82,1.0]' \
-    -p b601_semantic_planar_input_scale:='[0.35,1.0]' \
+    -p b601_semantic_planar_input_scale:='[0.45,1.0]' \
     -p b601_semantic_planar_max_forward_m:=0.035 \
     -p b601_semantic_planar_joint_mobility:='[0.85,1.00,0.50]' \
     -p b601_semantic_planar_task_weights:='[1.00,0.65,0.85,1.00]' \
-    -p b601_semantic_planar_command_max_velocity_m_s:='[0.040,0.035]' \
-    -p b601_semantic_planar_command_max_acceleration_m_s2:='[0.18,0.16]' \
+    -p b601_semantic_planar_command_max_velocity_m_s:='[0.060,0.035]' \
+    -p b601_semantic_planar_command_max_acceleration_m_s2:='[0.32,0.16]' \
     -p b601_semantic_planar_command_deadband_m:='[0.0015,0.0015]' \
     -p b601_semantic_planar_tracking_error_m:='[0.025,0.025]' \
     -p b601_semantic_planar_backpressure_start_fraction:=0.55 \
@@ -340,18 +343,20 @@ run_b601_semantic_test() {
     -p b601_semantic_planar_task_correction_max_velocity_m_s:='[0.025,0.020]' \
     -p b601_semantic_vertical_descent_guard_enabled:=true \
     -p b601_semantic_vertical_descent_intent_deadband_m_s:=0.0015 \
+    -p b601_semantic_vertical_descent_guard_clearance_margin_m:=0.010 \
     -p b601_semantic_planar_joint_max_acceleration_rad_s2:='[0.45,0.60,0.20]' \
-    -p b601_semantic_motion_reverse_deadband_m:='[0.006,0.006,0.005]' \
-    -p b601_semantic_motion_reverse_confirm_samples:=4 \
+    -p b601_semantic_motion_reverse_deadband_m:='[0.006,0.0035,0.005]' \
+    -p b601_semantic_motion_reverse_confirm_samples:=3 \
     -p b601_semantic_j1_target_max_velocity_rad_s:=0.08 \
     -p b601_semantic_j1_target_max_acceleration_rad_s2:=0.35 \
     -p b601_semantic_j1_target_deadband_rad:=0.0015 \
     -p b601_semantic_j4_target_max_velocity_rad_s:=0.025 \
     -p b601_semantic_j4_target_max_acceleration_rad_s2:=0.10 \
     -p b601_semantic_j4_target_deadband_rad:=0.0015 \
-    -p b601_semantic_j6_target_max_velocity_rad_s:=0.05 \
-    -p b601_semantic_j6_target_max_acceleration_rad_s2:=0.15 \
+    -p b601_semantic_j6_target_max_velocity_rad_s:=0.10 \
+    -p b601_semantic_j6_target_max_acceleration_rad_s2:=0.40 \
     -p b601_semantic_j6_target_deadband_rad:=0.0015 \
+    -p b601_semantic_linear_deadband_m:='[0.012,0.008,0.008]' \
     -p b601_semantic_vertical_solver_step_rad:=0.015 \
     -p b601_semantic_vertical_solver_iterations:=12 \
     -p b601_semantic_vertical_orientation_weight_m_per_rad:=0.02 \
@@ -373,7 +378,8 @@ run_b601_semantic_test() {
 看到这两个字段后保持掌心位置，再开始慢速旋腕。若出现 `outlier_hold`、
 `translation_hold` 或 `invalid_hold`，J6 应保持当前位置，待 `J6_stable=3/3` 后重新置零。
 旋腕期间 `vertical_wrist_hold=True` 时，`raw_lift` 可以随视觉几何变化，但 `lift` 应保持；
-`lift_bias` 会吸收这段伪位移。腕部稳定后 `vertical_wrist_release` 到达 `4/4` 并解除保持，
+`lift_bias` 会吸收这段伪位移。腕角和腕点高度都稳定后 `vertical_wrist_release` 到达 `5/5`
+并解除保持；`vertical_lift_rate` 可用于确认释放前的高度观测已经停止漂移，
 高度目标不应跳变。手部静止时 `vertical_descent_allowed=False`，各受保护 frame 不应再
 因为误差自适应而主动向下；只有明确向下移动手部时该字段才应短暂变为 `True`。
 `q_target` 会从上一次目标连续爬坡，并由 `target_lead` 显示它相对实测关节角积累的

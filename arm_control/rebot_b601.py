@@ -723,6 +723,54 @@ def rotation_compensated_scalar_observation(
     return corrected, float(observation_bias)
 
 
+def wrist_height_release_ready(
+    wrist_observation_valid: bool,
+    hold_active: bool,
+    raw_lift_rate_m_s: float,
+    maximum_release_lift_rate_m_s: float,
+) -> bool:
+    """Require the visual wrist height to settle before ending a twist hold.
+
+    A large height rate must not *start* a twist hold because it may be an
+    intentional vertical gesture.  It only extends a hold already triggered
+    by wrist rotation.  This keeps the two gestures independent without
+    releasing into the pose estimator's post-rotation height transient.
+    """
+
+    lift_rate = float(raw_lift_rate_m_s)
+    maximum_rate = float(maximum_release_lift_rate_m_s)
+    if not np.isfinite(lift_rate) or not np.isfinite(maximum_rate):
+        raise ValueError("wrist-height release rates must be finite")
+    if maximum_rate <= 0.0:
+        raise ValueError("maximum wrist-height release rate must be positive")
+    return bool(
+        wrist_observation_valid
+        and (
+            not hold_active
+            or abs(lift_rate) <= maximum_rate
+        )
+    )
+
+
+def wrist_hold_vertical_planner_state(
+    requested_lift_m: float,
+    current_command_m: float,
+    previous_velocity_m_s: float,
+    hold_active: bool,
+) -> tuple[float, float]:
+    """Freeze both height position and queued velocity during wrist motion."""
+
+    values = np.asarray(
+        [requested_lift_m, current_command_m, previous_velocity_m_s],
+        dtype=np.float64,
+    )
+    if not np.all(np.isfinite(values)):
+        raise ValueError("vertical planner hold state must be finite")
+    if hold_active:
+        return float(current_command_m), 0.0
+    return float(requested_lift_m), float(previous_velocity_m_s)
+
+
 def suppress_uncommanded_task_descent(
     joint_velocity: Sequence[float],
     vertical_task_rows: Sequence[Sequence[float]],
@@ -768,6 +816,46 @@ def suppress_uncommanded_task_descent(
         # leaking a downward command on an unbraked tabletop arm.
         velocity.fill(0.0)
     return velocity
+
+
+def select_descent_guard_rows(
+    vertical_task_rows: Sequence[Sequence[float]],
+    frame_ids: Sequence[int],
+    end_frame_id: int,
+    current_heights_m: Sequence[float],
+    table_heights_m: Sequence[float] | None,
+    clearance_margin_m: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Select height constraints without blocking normal planar articulation.
+
+    The TCP is always protected against an uncommanded descent. Intermediate
+    links are protected only while they are inside a configurable safety band
+    above their validated tabletop heights. Requiring every elevated link to
+    have a non-negative instantaneous Z velocity over-constrains J2/J3/J4 and
+    can make forward/backward Cartesian motion mathematically impossible.
+    The independent full-path table projection remains the hard floor.
+    """
+
+    rows = np.asarray(vertical_task_rows, dtype=np.float64)
+    ids = np.asarray(frame_ids, dtype=np.int64).reshape(-1)
+    current = np.asarray(current_heights_m, dtype=np.float64).reshape(-1)
+    margin = float(clearance_margin_m)
+    if rows.ndim != 2 or rows.shape[0] != ids.size or ids.size != current.size:
+        raise ValueError("descent-guard rows, frames and heights must align")
+    if not np.all(np.isfinite(rows)) or not np.all(np.isfinite(current)):
+        raise ValueError("descent-guard rows and heights must be finite")
+    if not np.isfinite(margin) or margin < 0.0:
+        raise ValueError("descent-guard clearance margin cannot be negative")
+
+    mask = ids == int(end_frame_id)
+    if table_heights_m is not None:
+        table = np.asarray(table_heights_m, dtype=np.float64).reshape(-1)
+        if table.size != ids.size or not np.all(np.isfinite(table)):
+            raise ValueError("descent-guard table heights must align and be finite")
+        mask |= (current - table) <= margin
+    if not np.any(mask):
+        raise ValueError("descent guard is missing the end-effector frame")
+    return rows[mask].copy(), mask
 
 
 def coordinated_acceleration_limited_velocity(
@@ -1970,7 +2058,7 @@ class B601PalmFollower:
         self.semantic_linear_deadband_m = np.maximum(
             _vector(
                 node.declare_parameter(
-                    "b601_semantic_linear_deadband_m", [0.015, 0.020, 0.010]
+                    "b601_semantic_linear_deadband_m", [0.012, 0.008, 0.008]
                 ).value,
                 3,
                 "b601_semantic_linear_deadband_m",
@@ -1999,7 +2087,7 @@ class B601PalmFollower:
         )
         self.wrist_twist_filter_alpha = float(
             node.declare_parameter(
-                "b601_wrist_twist_filter_alpha", 0.15
+                "b601_wrist_twist_filter_alpha", 0.18
             ).value
         )
         self.wrist_twist_max_innovation_rad = np.deg2rad(
@@ -2054,7 +2142,12 @@ class B601PalmFollower:
         )
         self.vertical_wrist_release_samples = int(
             node.declare_parameter(
-                "b601_vertical_wrist_release_samples", 4
+                "b601_vertical_wrist_release_samples", 5
+            ).value
+        )
+        self.vertical_wrist_release_lift_rate_m_s = float(
+            node.declare_parameter(
+                "b601_vertical_wrist_release_lift_rate_m_s", 0.012
             ).value
         )
         self.wrist_twist_activate_rad = np.deg2rad(
@@ -2073,16 +2166,16 @@ class B601PalmFollower:
         )
         self.wrist_twist_confirm_samples = int(
             node.declare_parameter(
-                "b601_wrist_twist_confirm_samples", 4
+                "b601_wrist_twist_confirm_samples", 3
             ).value
         )
         self.wrist_twist_reverse_confirm_samples = int(
             node.declare_parameter(
-                "b601_wrist_twist_reverse_confirm_samples", 7
+                "b601_wrist_twist_reverse_confirm_samples", 6
             ).value
         )
         self.wrist_twist_soft_start_s = float(
-            node.declare_parameter("b601_wrist_twist_soft_start_s", 0.25).value
+            node.declare_parameter("b601_wrist_twist_soft_start_s", 0.30).value
         )
         if (
             not np.isfinite(self.wrist_twist_filter_alpha)
@@ -2103,6 +2196,8 @@ class B601PalmFollower:
             or self.vertical_wrist_release_rate_rad_s
             >= self.vertical_wrist_hold_rate_rad_s
             or self.vertical_wrist_release_samples < 1
+            or not np.isfinite(self.vertical_wrist_release_lift_rate_m_s)
+            or self.vertical_wrist_release_lift_rate_m_s <= 0.0
             or not np.isfinite(self.wrist_twist_activate_rad)
             or not np.isfinite(self.wrist_twist_release_rad)
             or self.wrist_twist_release_rad < 0.0
@@ -2116,7 +2211,8 @@ class B601PalmFollower:
             raise ValueError(
                 "B601 wrist-twist filter alpha must be in (0, 1] and "
                 "angle limits/rates and translation gate must be positive; "
-                "vertical wrist release rate must be below its hold rate; "
+                "vertical wrist release rate must be below its hold rate and "
+                "the release lift-rate limit must be positive; "
                 "activation must exceed release; reversal confirmation must "
                 "be at least the normal positive confirmation count"
             )
@@ -2319,7 +2415,7 @@ class B601PalmFollower:
             )
         self.semantic_planar_input_scale = _positive_vector(
             node.declare_parameter(
-                "b601_semantic_planar_input_scale", [0.35, 1.0]
+                "b601_semantic_planar_input_scale", [0.45, 1.0]
             ).value,
             2,
             "b601_semantic_planar_input_scale",
@@ -2354,7 +2450,7 @@ class B601PalmFollower:
         )
         self.semantic_planar_command_max_velocity = _positive_vector(
             node.declare_parameter(
-                "b601_semantic_planar_command_max_velocity_m_s", [0.040, 0.035]
+                "b601_semantic_planar_command_max_velocity_m_s", [0.060, 0.035]
             ).value,
             2,
             "b601_semantic_planar_command_max_velocity_m_s",
@@ -2362,7 +2458,7 @@ class B601PalmFollower:
         self.semantic_planar_command_max_acceleration = _positive_vector(
             node.declare_parameter(
                 "b601_semantic_planar_command_max_acceleration_m_s2",
-                [0.18, 0.16],
+                [0.32, 0.16],
             ).value,
             2,
             "b601_semantic_planar_command_max_acceleration_m_s2",
@@ -2430,14 +2526,25 @@ class B601PalmFollower:
                 "b601_semantic_vertical_descent_intent_deadband_m_s", 0.0015
             ).value
         )
+        self.semantic_vertical_descent_guard_clearance_margin_m = float(
+            node.declare_parameter(
+                "b601_semantic_vertical_descent_guard_clearance_margin_m",
+                0.010,
+            ).value
+        )
         if (
             not np.isfinite(
                 self.semantic_vertical_descent_intent_deadband_m_s
             )
             or self.semantic_vertical_descent_intent_deadband_m_s < 0.0
+            or not np.isfinite(
+                self.semantic_vertical_descent_guard_clearance_margin_m
+            )
+            or self.semantic_vertical_descent_guard_clearance_margin_m < 0.0
         ):
             raise ValueError(
-                "B601 vertical descent intent deadband must be finite and non-negative"
+                "B601 vertical descent intent deadband and clearance margin "
+                "must be finite and non-negative"
             )
         self.semantic_planar_joint_max_acceleration = _positive_vector(
             node.declare_parameter(
@@ -2472,14 +2579,14 @@ class B601PalmFollower:
         self.semantic_motion_reverse_deadband = _positive_vector(
             node.declare_parameter(
                 "b601_semantic_motion_reverse_deadband_m",
-                [0.006, 0.006, 0.005],
+                [0.006, 0.0035, 0.005],
             ).value,
             3,
             "b601_semantic_motion_reverse_deadband_m",
         )
         self.semantic_motion_reverse_confirm_samples = int(
             node.declare_parameter(
-                "b601_semantic_motion_reverse_confirm_samples", 4
+                "b601_semantic_motion_reverse_confirm_samples", 3
             ).value
         )
         if not 1 <= self.semantic_motion_reverse_confirm_samples <= 30:
@@ -2547,7 +2654,7 @@ class B601PalmFollower:
         )
         self.semantic_j6_target_max_acceleration = float(
             node.declare_parameter(
-                "b601_semantic_j6_target_max_acceleration_rad_s2", 0.50
+                "b601_semantic_j6_target_max_acceleration_rad_s2", 0.40
             ).value
         )
         self.semantic_j6_target_deadband = float(
@@ -2673,10 +2780,13 @@ class B601PalmFollower:
         self.semantic_vertical_wrist_release_count = 0
         self.semantic_vertical_last_wrist_delta_rad = None
         self.semantic_vertical_wrist_rate_rad_s = 0.0
+        self.semantic_vertical_last_raw_lift_m = None
+        self.semantic_vertical_raw_lift_rate_m_s = 0.0
         self.semantic_vertical_observation_bias_m = 0.0
         self.semantic_vertical_intent_m = 0.0
         self.semantic_vertical_raw_lift_m = 0.0
         self.semantic_vertical_descent_allowed = False
+        self.semantic_vertical_descent_guard_row_count = 0
         self.last_semantic_log_time = 0.0
         self.last_semantic_vertical_error_m = 0.0
         self.last_semantic_planar_error_m = np.zeros(2, dtype=np.float64)
@@ -3190,10 +3300,13 @@ class B601PalmFollower:
         self.semantic_vertical_wrist_release_count = 0
         self.semantic_vertical_last_wrist_delta_rad = None
         self.semantic_vertical_wrist_rate_rad_s = 0.0
+        self.semantic_vertical_last_raw_lift_m = None
+        self.semantic_vertical_raw_lift_rate_m_s = 0.0
         self.semantic_vertical_observation_bias_m = 0.0
         self.semantic_vertical_intent_m = 0.0
         self.semantic_vertical_raw_lift_m = 0.0
         self.semantic_vertical_descent_allowed = False
+        self.semantic_vertical_descent_guard_row_count = 0
 
     def _reset_semantic_smoothing(self, now_s: float = 0.0) -> None:
         self.semantic_planar_command_m.fill(0.0)
@@ -3452,6 +3565,7 @@ class B601PalmFollower:
             raw_wrist_twist is not None and np.isfinite(raw_wrist_twist)
         )
         raw_wrist_accepted = False
+        raw_innovation = 0.0
         if raw_wrist_valid:
             raw_wrist_accepted, raw_innovation = (
                 validate_wrapped_angle_observation(
@@ -3521,6 +3635,14 @@ class B601PalmFollower:
         )
         raw_lift_unbounded *= self.semantic_planar_input_scale[1]
         self.semantic_vertical_raw_lift_m = float(raw_lift_unbounded)
+        if self.semantic_vertical_last_raw_lift_m is None:
+            self.semantic_vertical_raw_lift_rate_m_s = 0.0
+        else:
+            self.semantic_vertical_raw_lift_rate_m_s = float(
+                (raw_lift_unbounded - self.semantic_vertical_last_raw_lift_m)
+                / target_dt
+            )
+        self.semantic_vertical_last_raw_lift_m = float(raw_lift_unbounded)
 
         tcp_lift, chain_clearance = self._semantic_clearance_from_table(q_seed)
         tcp_fraction = (
@@ -3678,6 +3800,16 @@ class B601PalmFollower:
             and clearance_fraction >= 0.95
         )
         if vertical_decoupling_active:
+            # Use the faster J6 angle filter (alpha 0.18 in the validated
+            # profile), not raw angular velocity: hardware logs show raw pose
+            # jitter above 8 deg/s even with no confirmed wrist gesture. Once
+            # latched, height settling is an independent release condition.
+            vertical_release_observation_valid = wrist_height_release_ready(
+                raw_wrist_valid and raw_wrist_accepted,
+                self.semantic_vertical_wrist_hold,
+                self.semantic_vertical_raw_lift_rate_m_s,
+                self.vertical_wrist_release_lift_rate_m_s,
+            )
             (
                 self.semantic_vertical_wrist_hold,
                 self.semantic_vertical_wrist_release_count,
@@ -3691,7 +3823,7 @@ class B601PalmFollower:
                 self.vertical_wrist_hold_rate_rad_s,
                 self.vertical_wrist_release_rate_rad_s,
                 self.vertical_wrist_release_samples,
-                raw_wrist_valid and raw_wrist_accepted,
+                vertical_release_observation_valid,
             )
         else:
             self.semantic_vertical_wrist_hold = False
@@ -3793,6 +3925,18 @@ class B601PalmFollower:
         requested_lift_target = (
             lift if self.semantic_channel_enable[5] > 0.5 else 0.0
         )
+        previous_planar_velocity = (
+            self.semantic_planar_command_velocity_m_s.copy()
+        )
+        (
+            requested_lift_target,
+            previous_planar_velocity[1],
+        ) = wrist_hold_vertical_planner_state(
+            requested_lift_target,
+            self.semantic_planar_command_m[1],
+            previous_planar_velocity[1],
+            self.semantic_vertical_wrist_hold,
+        )
         planar_dt = (
             self.command_interval_s
             if self.last_semantic_planar_command_time <= 0.0
@@ -3808,7 +3952,7 @@ class B601PalmFollower:
             acceleration_limited_vector_target(
                 [requested_forward_target, requested_lift_target],
                 self.semantic_planar_command_m,
-                self.semantic_planar_command_velocity_m_s,
+                previous_planar_velocity,
                 self.semantic_planar_command_max_velocity,
                 self.semantic_planar_command_max_acceleration,
                 self.semantic_planar_command_deadband,
@@ -4073,11 +4217,16 @@ class B601PalmFollower:
                 f"vertical_wrist_hold={self.semantic_vertical_wrist_hold}, "
                 f"vertical_wrist_rate="
                 f"{np.rad2deg(self.semantic_vertical_wrist_rate_rad_s):+.1f}deg/s, "
+                f"vertical_lift_rate="
+                f"{self.semantic_vertical_raw_lift_rate_m_s:+.3f}m/s, "
                 f"vertical_wrist_release="
                 f"{self.semantic_vertical_wrist_release_count}/"
                 f"{self.vertical_wrist_release_samples}, "
                 f"vertical_descent_allowed="
                 f"{self.semantic_vertical_descent_allowed}, "
+                f"descent_guard_rows="
+                f"{self.semantic_vertical_descent_guard_row_count}/"
+                f"{len(self._articulation_clearance_frame_ids)}, "
                 f"forward_gate={forward_gate:.2f}/{raw_forward_gate:.2f}, "
                 f"backpressure={planar_backpressure.round(2).tolist()}/"
                 f"{raw_backpressure.round(2).tolist()}, "
@@ -4302,9 +4451,27 @@ class B601PalmFollower:
             or task_velocity[1]
             < -self.semantic_vertical_descent_intent_deadband_m_s
         )
+        guard_table_heights = (
+            None
+            if self.table_frame_heights is None
+            else self.table_frame_heights[
+                self._articulation_clearance_frame_ids
+            ]
+        )
+        descent_guard_rows, descent_guard_mask = select_descent_guard_rows(
+            height_rows,
+            self._articulation_clearance_frame_ids,
+            self._end_frame_id,
+            current_heights,
+            guard_table_heights,
+            self.semantic_vertical_descent_guard_clearance_margin_m,
+        )
+        self.semantic_vertical_descent_guard_row_count = int(
+            np.count_nonzero(descent_guard_mask)
+        )
         requested_joint_velocity = suppress_uncommanded_task_descent(
             requested_joint_velocity,
-            height_rows,
+            descent_guard_rows,
             self.semantic_vertical_descent_allowed,
         )
         joint_velocity_limit = self._semantic_outer_joint_velocity_limits()[columns]
@@ -4317,7 +4484,7 @@ class B601PalmFollower:
         )
         joint_velocity = suppress_uncommanded_task_descent(
             joint_velocity,
-            height_rows,
+            descent_guard_rows,
             self.semantic_vertical_descent_allowed,
         )
         moving = np.abs(joint_velocity) > 1e-12
