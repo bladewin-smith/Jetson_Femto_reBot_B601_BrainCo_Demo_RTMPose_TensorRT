@@ -97,6 +97,7 @@ exec python "$REPO/scripts/camera_arm_b601_control_pose_hands.py" --ros-args \
   -p b601_safe_joint_lower_rad:='[-2.6005,-3.5954,-3.5954,-1.4992,-1.4992,-1.4992]' \
   -p b601_safe_joint_upper_rad:='[2.6005,0.0,0.0,1.4992,1.4992,1.4992]' \
   -p b601_joint_limit_margin_rad:=0.10 \
+  -p b601_max_joint_target_delta_rad:='[0.045,0.065,0.125,0.075,0.012,0.105]' \
   -p b601_control_mode:=semantic_joint \
   -p b601_semantic_channel_enable:="$CHANNELS" \
   -p b601_semantic_joint_gains:='[3.00,-0.60,0.18,0.15,0.75]' \

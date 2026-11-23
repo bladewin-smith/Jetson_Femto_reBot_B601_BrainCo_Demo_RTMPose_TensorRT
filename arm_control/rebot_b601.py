@@ -2532,6 +2532,24 @@ class B601PalmFollower:
             6,
             "b601_semantic_max_tracking_error_rad",
         )
+        if np.any(
+            self.semantic_max_tracking_error
+            > self.max_joint_target_delta + 1e-9
+        ):
+            offending = (
+                np.flatnonzero(
+                    self.semantic_max_tracking_error
+                    > self.max_joint_target_delta + 1e-9
+                )
+                + 1
+            ).tolist()
+            raise ValueError(
+                "B601 semantic tracking windows must not exceed the independent "
+                "joint-target safety deltas; conflicting joints="
+                f"{offending}, tracking="
+                f"{self.semantic_max_tracking_error.round(4).tolist()}, safety="
+                f"{self.max_joint_target_delta.round(4).tolist()}"
+            )
         self.semantic_stall_error = _positive_vector(
             node.declare_parameter(
                 "b601_semantic_stall_error_rad",

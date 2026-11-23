@@ -43,6 +43,10 @@ hand_palm_b601_control_node:
     b601_safe_joint_lower_rad: [-2.6005, -3.5954, -3.5954, -1.4992, -1.4992, -1.4992]
     b601_safe_joint_upper_rad: [2.6005, 0.0, 0.0, 1.4992, 1.4992, 1.4992]
     b601_joint_limit_margin_rad: 0.10
+    # Independent fail-closed target deltas sit just outside the semantic
+    # tracking windows. They must never be smaller than those windows, or an
+    # otherwise valid J2/J3/J4 frame is discarded and motion becomes stepped.
+    b601_max_joint_target_delta_rad: [0.045, 0.065, 0.125, 0.075, 0.012, 0.105]
     # These broad semantic offsets no longer define the hard safety boundary;
     # the official/URDF intersection above and table-clearance projection do.
     b601_semantic_max_joint_offset_rad: [1.60, 1.40, 1.50, 1.00, 0.008, 1.20]

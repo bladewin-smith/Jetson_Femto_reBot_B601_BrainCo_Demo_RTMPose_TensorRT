@@ -101,6 +101,38 @@ def test_joint_limit_margin_allows_retreat_from_tabletop_upper_limit():
     assert not np.any(jump)
 
 
+def test_smooth_follow_safety_delta_contains_every_semantic_tracking_window():
+    current = np.zeros(6)
+    target = np.asarray([0.032, -0.055, -0.110, 0.060, 0.008, 0.090])
+    safety_delta = [0.045, 0.065, 0.125, 0.075, 0.012, 0.105]
+
+    outside, jump = joint_target_safety_violations(
+        target,
+        current,
+        [-3.0] * 6,
+        [3.0] * 6,
+        0.10,
+        safety_delta,
+    )
+
+    assert not np.any(outside)
+    assert not np.any(jump)
+    assert np.all(np.asarray(safety_delta) > np.abs(target))
+
+
+def test_old_j3_safety_delta_rejects_the_new_tracking_window():
+    _, jump = joint_target_safety_violations(
+        [0.0, 0.0, -0.110, 0.0, 0.0, 0.0],
+        [0.0] * 6,
+        [-3.0] * 6,
+        [3.0] * 6,
+        0.10,
+        [0.10, 0.10, 0.10, 0.14, 0.14, 0.14],
+    )
+
+    assert jump[2]
+
+
 @pytest.mark.parametrize(
     "target",
     [
