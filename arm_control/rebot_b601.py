@@ -738,12 +738,14 @@ def wrist_height_release_ready(
     raw_lift_rate_m_s: float,
     maximum_release_lift_rate_m_s: float,
 ) -> bool:
-    """Require the visual wrist height to settle before ending a twist hold.
+    """Validate release observations without swallowing vertical gestures.
 
-    A large height rate must not *start* a twist hold because it may be an
-    intentional vertical gesture.  It only extends a hold already triggered
-    by wrist rotation.  This keeps the two gestures independent without
-    releasing into the pose estimator's post-rotation height transient.
+    Wrist-angle stability already has its own multi-sample confirmation in
+    :func:`wrapped_rate_motion_hold`.  Using visual height rate as a second
+    release veto made a real downward gesture continuously rebase itself into
+    the height bias, so the lift command could remain at its upper bound
+    forever.  Height rate remains validated and logged for diagnostics, but it
+    must not prolong an already latched wrist hold.
     """
 
     lift_rate = float(raw_lift_rate_m_s)
@@ -752,13 +754,71 @@ def wrist_height_release_ready(
         raise ValueError("wrist-height release rates must be finite")
     if maximum_rate <= 0.0:
         raise ValueError("maximum wrist-height release rate must be positive")
-    return bool(
-        wrist_observation_valid
-        and (
-            not hold_active
-            or abs(lift_rate) <= maximum_rate
+    del hold_active, lift_rate, maximum_rate
+    return bool(wrist_observation_valid)
+
+
+def confirmed_stationary_planar_target(
+    requested_target_m: Sequence[float],
+    current_target_m: Sequence[float],
+    current_velocity_m_s: Sequence[float],
+    target_deadband_m: Sequence[float],
+    velocity_deadband_m_s: Sequence[float],
+    previous_count: int,
+    confirm_samples: int,
+) -> tuple[bool, int]:
+    """Latch an operator-idle state after consecutive quiet target samples.
+
+    The resolved-rate controller normally keeps correcting residual task
+    error even after the human hand stops.  Because a redundant three-joint
+    chain has many nearby solutions, tiny pose-estimator changes can then make
+    J2/J3/J4 continuously trade angle.  This detector distinguishes an idle
+    operator target from a backpressured or still-moving command so the outer
+    task correction can brake to a fixed accepted joint target.
+    """
+
+    requested = np.asarray(requested_target_m, dtype=np.float64).reshape(-1)
+    current = np.asarray(current_target_m, dtype=np.float64).reshape(-1)
+    velocity = np.asarray(current_velocity_m_s, dtype=np.float64).reshape(-1)
+    target_deadband = np.asarray(target_deadband_m, dtype=np.float64).reshape(-1)
+    velocity_deadband = np.asarray(
+        velocity_deadband_m_s, dtype=np.float64
+    ).reshape(-1)
+    if not (
+        requested.shape
+        == current.shape
+        == velocity.shape
+        == target_deadband.shape
+        == velocity_deadband.shape
+    ):
+        raise ValueError("planar idle vectors must have matching shapes")
+    if not all(
+        np.all(np.isfinite(value))
+        for value in (
+            requested,
+            current,
+            velocity,
+            target_deadband,
+            velocity_deadband,
         )
+    ):
+        raise ValueError("planar idle vectors must be finite")
+    if (
+        np.any(target_deadband <= 0.0)
+        or np.any(velocity_deadband <= 0.0)
+        or int(previous_count) < 0
+        or int(confirm_samples) < 1
+    ):
+        raise ValueError("planar idle thresholds/counts are invalid")
+
+    quiet = bool(
+        np.all(np.abs(requested - current) <= target_deadband)
+        and np.all(np.abs(velocity) <= velocity_deadband)
     )
+    next_count = min(
+        int(confirm_samples), int(previous_count) + 1
+    ) if quiet else 0
+    return bool(next_count >= int(confirm_samples)), next_count
 
 
 def wrist_hold_vertical_planner_state(
@@ -1171,7 +1231,7 @@ def coupled_stream_velocity_limits(
     semantic_max_step: Sequence[float],
     command_interval_s: float,
     outer_velocity_limit: Sequence[float],
-    follow_scale: float,
+    follow_scale: float | Sequence[float],
 ) -> np.ndarray:
     """Match the high-rate stream to the semantic goal's achievable velocity.
 
@@ -1191,15 +1251,20 @@ def coupled_stream_velocity_limits(
     ):
         raise ValueError("coupled stream-limit vectors must be finite")
     interval = float(command_interval_s)
-    scale = float(follow_scale)
+    scale = np.asarray(follow_scale, dtype=np.float64)
+    if scale.ndim == 0:
+        scale = np.full(configured.shape, float(scale), dtype=np.float64)
+    else:
+        scale = scale.reshape(-1)
     if (
         np.any(configured <= 0.0)
         or np.any(max_step <= 0.0)
         or np.any(outer_limit <= 0.0)
+        or scale.shape != configured.shape
+        or not np.all(np.isfinite(scale))
         or not np.isfinite(interval)
         or interval <= 0.0
-        or not np.isfinite(scale)
-        or scale < 1.0
+        or np.any(scale < 1.0)
     ):
         raise ValueError("coupled stream limits, interval and follow scale are invalid")
     semantic_rate = np.minimum(max_step / interval, outer_limit)
@@ -1818,6 +1883,11 @@ class B601PalmFollower:
         self.stream_outer_velocity_scale = float(
             node.declare_parameter("b601_stream_outer_velocity_scale", 1.35).value
         )
+        self.stream_planar_outer_velocity_scale = float(
+            node.declare_parameter(
+                "b601_stream_planar_outer_velocity_scale", 1.10
+            ).value
+        )
         self.stream_goal_velocity_filter_alpha = float(
             node.declare_parameter(
                 "b601_stream_goal_velocity_filter_alpha", 0.45
@@ -1851,6 +1921,8 @@ class B601PalmFollower:
         if (
             not np.isfinite(self.stream_outer_velocity_scale)
             or self.stream_outer_velocity_scale < 1.0
+            or not np.isfinite(self.stream_planar_outer_velocity_scale)
+            or self.stream_planar_outer_velocity_scale < 1.0
             or not np.isfinite(self.stream_goal_velocity_filter_alpha)
             or not 0.0 < self.stream_goal_velocity_filter_alpha <= 1.0
             or not np.isfinite(self.stream_goal_velocity_stale_cycles)
@@ -2491,6 +2563,31 @@ class B601PalmFollower:
             2,
             "b601_semantic_planar_command_deadband_m",
         )
+        self.semantic_planar_idle_target_deadband = _positive_vector(
+            node.declare_parameter(
+                "b601_semantic_planar_idle_target_deadband_m",
+                [0.0025, 0.0030],
+            ).value,
+            2,
+            "b601_semantic_planar_idle_target_deadband_m",
+        )
+        self.semantic_planar_idle_velocity_deadband = _positive_vector(
+            node.declare_parameter(
+                "b601_semantic_planar_idle_velocity_deadband_m_s",
+                [0.0030, 0.0030],
+            ).value,
+            2,
+            "b601_semantic_planar_idle_velocity_deadband_m_s",
+        )
+        self.semantic_planar_idle_confirm_samples = int(
+            node.declare_parameter(
+                "b601_semantic_planar_idle_confirm_samples", 3
+            ).value
+        )
+        if self.semantic_planar_idle_confirm_samples < 1:
+            raise ValueError(
+                "b601_semantic_planar_idle_confirm_samples must be positive"
+            )
         self.semantic_planar_tracking_error = _positive_vector(
             node.declare_parameter(
                 "b601_semantic_planar_tracking_error_m", [0.025, 0.025]
@@ -2818,6 +2915,8 @@ class B601PalmFollower:
         self.semantic_planar_joint_velocity_rad_s = np.zeros(3, dtype=np.float64)
         self.semantic_planar_task_error_vector_m = np.zeros(4, dtype=np.float64)
         self.semantic_planar_backpressure = np.ones(2, dtype=np.float64)
+        self.semantic_planar_idle_count = 0
+        self.semantic_planar_idle_active = False
         self.semantic_clearance_gate = 0.0
         self.last_semantic_raw_clearance_gate = 0.0
         self.last_semantic_planar_command_time = 0.0
@@ -3095,12 +3194,20 @@ class B601PalmFollower:
                             outer_velocity_limit = (
                                 self._semantic_outer_joint_velocity_limits()
                             )
+                            stream_follow_scale = np.full(
+                                self.ARM_DOF,
+                                self.stream_outer_velocity_scale,
+                                dtype=np.float64,
+                            )
+                            stream_follow_scale[1:4] = (
+                                self.stream_planar_outer_velocity_scale
+                            )
                             stream_velocity_limit = coupled_stream_velocity_limits(
                                 stream_velocity_limit,
                                 self.semantic_max_step,
                                 self.command_interval_s,
                                 outer_velocity_limit,
-                                self.stream_outer_velocity_scale,
+                                stream_follow_scale,
                             )
                             stream_correction_gain = (
                                 self.stream_position_correction_gain_s
@@ -3335,6 +3442,8 @@ class B601PalmFollower:
         self.semantic_planar_joint_velocity_rad_s.fill(0.0)
         self.semantic_planar_task_error_vector_m.fill(0.0)
         self.semantic_planar_backpressure.fill(1.0)
+        self.semantic_planar_idle_count = 0
+        self.semantic_planar_idle_active = False
         self.semantic_clearance_gate = 0.0
         self.last_semantic_raw_clearance_gate = 0.0
         self.target_q_update_period_s = self.command_interval_s
@@ -3963,6 +4072,29 @@ class B601PalmFollower:
             previous_planar_velocity[1],
             self.semantic_vertical_wrist_hold,
         )
+        requested_planar_target = np.asarray(
+            [requested_forward_target, requested_lift_target],
+            dtype=np.float64,
+        )
+        (
+            self.semantic_planar_idle_active,
+            self.semantic_planar_idle_count,
+        ) = confirmed_stationary_planar_target(
+            requested_planar_target,
+            self.semantic_planar_command_m,
+            previous_planar_velocity,
+            self.semantic_planar_idle_target_deadband,
+            self.semantic_planar_idle_velocity_deadband,
+            self.semantic_planar_idle_count,
+            self.semantic_planar_idle_confirm_samples,
+        )
+        if self.semantic_planar_idle_active:
+            # Keep the last accepted task target and brake the coordinated
+            # joint velocity.  The 500 Hz MIT loop still finishes and holds
+            # its already accepted setpoint; only redundant task re-solving
+            # from stationary visual noise is suppressed.
+            requested_planar_target = self.semantic_planar_command_m.copy()
+            previous_planar_velocity.fill(0.0)
         planar_dt = (
             self.command_interval_s
             if self.last_semantic_planar_command_time <= 0.0
@@ -3976,7 +4108,7 @@ class B601PalmFollower:
         )
         candidate_planar_command, _candidate_planar_velocity = (
             acceleration_limited_vector_target(
-                [requested_forward_target, requested_lift_target],
+                requested_planar_target,
                 self.semantic_planar_command_m,
                 previous_planar_velocity,
                 self.semantic_planar_command_max_velocity,
@@ -4040,6 +4172,7 @@ class B601PalmFollower:
             planar_velocity,
             forward_gate,
             planar_dt,
+            settle_hold=self.semantic_planar_idle_active,
         )
         resolved_max_step = self.semantic_max_step.copy()
         planar_indices = np.asarray([1, 2, 3], dtype=np.int64)
@@ -4257,6 +4390,9 @@ class B601PalmFollower:
                 f"forward_gate={forward_gate:.2f}/{raw_forward_gate:.2f}, "
                 f"backpressure={planar_backpressure.round(2).tolist()}/"
                 f"{raw_backpressure.round(2).tolist()}, "
+                f"planar_idle={self.semantic_planar_idle_active}:"
+                f"{self.semantic_planar_idle_count}/"
+                f"{self.semantic_planar_idle_confirm_samples}, "
                 f"planar_velocity={planar_velocity.round(4).tolist()}m/s, "
                 f"resolved_qdot={accepted_planar_joint_velocity.round(4).tolist()}rad/s, "
                 f"requested_qdot={requested_planar_joint_velocity.round(4).tolist()}rad/s, "
@@ -4323,6 +4459,7 @@ class B601PalmFollower:
         planar_velocity_m_s: np.ndarray,
         clearance_gate: float,
         dt_s: float,
+        settle_hold: bool = False,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Resolve a continuous J2/J3/J4 velocity from the planar task.
 
@@ -4434,10 +4571,14 @@ class B601PalmFollower:
             ],
             dtype=np.float64,
         )
-        correction_velocity = np.clip(
-            error_gain * task_error,
-            -correction_limit,
-            correction_limit,
+        correction_velocity = (
+            np.zeros_like(task_error)
+            if settle_hold
+            else np.clip(
+                error_gain * task_error,
+                -correction_limit,
+                correction_limit,
+            )
         )
         feedforward_velocity = np.concatenate(
             (
@@ -4445,7 +4586,11 @@ class B601PalmFollower:
                 self.semantic_vertical_height_profile * task_velocity[1],
             )
         )
-        desired_task_velocity = feedforward_velocity + correction_velocity
+        desired_task_velocity = (
+            np.zeros_like(feedforward_velocity)
+            if settle_hold
+            else feedforward_velocity + correction_velocity
+        )
         desired = np.concatenate(
             (
                 self.semantic_planar_task_weights * desired_task_velocity,

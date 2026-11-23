@@ -121,6 +121,9 @@ exec python "$REPO/scripts/camera_arm_b601_control_pose_hands.py" --ros-args \
   -p b601_semantic_planar_command_max_velocity_m_s:='[0.060,0.040]' \
   -p b601_semantic_planar_command_max_acceleration_m_s2:='[0.24,0.12]' \
   -p b601_semantic_planar_command_deadband_m:='[0.0012,0.0015]' \
+  -p b601_semantic_planar_idle_target_deadband_m:='[0.0025,0.0030]' \
+  -p b601_semantic_planar_idle_velocity_deadband_m_s:='[0.0030,0.0030]' \
+  -p b601_semantic_planar_idle_confirm_samples:=3 \
   -p b601_semantic_planar_tracking_error_m:='[0.030,0.035]' \
   -p b601_semantic_planar_backpressure_start_fraction:=0.55 \
   -p b601_semantic_planar_backpressure_rates_s:='[1.30,2.50]' \
@@ -164,10 +167,11 @@ exec python "$REPO/scripts/camera_arm_b601_control_pose_hands.py" --ros-args \
   -p b601_stream_max_acceleration_rad_s2:='[1.6,2.0,2.4,0.85,0.8,3.0]' \
   -p b601_stream_max_jerk_rad_s3:='[50.0,65.0,80.0,32.0,30.0,100.0]' \
   -p b601_stream_outer_velocity_scale:=1.30 \
+  -p b601_stream_planar_outer_velocity_scale:=1.08 \
   -p b601_stream_goal_velocity_filter_alpha:=0.45 \
   -p b601_stream_goal_velocity_stale_cycles:=2.0 \
   -p b601_stream_goal_period_filter_alpha:=0.20 \
-  -p b601_stream_goal_velocity_max_hold_s:=0.26 \
+  -p b601_stream_goal_velocity_max_hold_s:=0.32 \
   -p b601_stream_position_correction_gain_s:=4.0 \
   -p b601_stream_position_correction_max_fraction:=0.28 \
   -p control_hand_side:=right \

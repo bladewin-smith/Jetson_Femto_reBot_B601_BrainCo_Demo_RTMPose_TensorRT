@@ -10,6 +10,7 @@ from arm_control.rebot_b601 import (
     adaptive_goal_velocity_hold_s,
     apply_tabletop_motion_envelope,
     coupled_stream_velocity_limits,
+    confirmed_stationary_planar_target,
     confirm_vector_reversals,
     confirm_directional_wrist_twist,
     coordinated_acceleration_limited_velocity,
@@ -443,6 +444,21 @@ def test_stream_velocity_caps_follow_the_outer_semantic_rate():
     np.testing.assert_allclose(
         effective,
         [0.1215, 0.1485, 0.1890, 0.06075, 0.0270, 0.1350],
+    )
+
+
+def test_stream_velocity_caps_accept_slower_planar_follow_scale():
+    effective = coupled_stream_velocity_limits(
+        configured_limit=[0.25, 0.30, 0.35, 0.15, 0.10, 0.30],
+        semantic_max_step=[0.0036, 0.0044, 0.0056, 0.0024, 0.0008, 0.0072],
+        command_interval_s=0.04,
+        outer_velocity_limit=[0.10, 10.0, 10.0, 0.045, 10.0, 0.16],
+        follow_scale=[1.30, 1.08, 1.08, 1.08, 1.30, 1.30],
+    )
+
+    np.testing.assert_allclose(
+        effective,
+        [0.1170, 0.1188, 0.1512, 0.0486, 0.0260, 0.2080],
     )
 
 
@@ -888,14 +904,78 @@ def test_wrist_motion_hold_requires_semantic_arming_only_for_new_latch():
     assert hold and count == 0
 
 
-def test_wrist_hold_release_waits_for_height_estimator_to_settle():
+def test_wrist_hold_release_is_not_vetoed_by_real_vertical_motion():
     # A real vertical gesture must not create a wrist hold by itself.
     assert wrist_height_release_ready(True, False, -0.080, 0.012)
-    # Once wrist rotation has latched the hold, the same visual height rate is
-    # treated as estimator settling and extends the rebase window.
-    assert not wrist_height_release_ready(True, True, -0.080, 0.012)
+    # Once wrist rotation has latched the hold, wrist-angle confirmation owns
+    # release timing. A large real downward rate must not keep rebasing height
+    # forever and lock the arm at its upper lift limit.
+    assert wrist_height_release_ready(True, True, -0.080, 0.012)
     assert wrist_height_release_ready(True, True, -0.006, 0.012)
     assert not wrist_height_release_ready(False, True, 0.0, 0.012)
+
+
+def test_high_vertical_rate_trace_still_releases_after_stable_wrist_samples():
+    hold = True
+    count = 0
+    angle = np.deg2rad(20.0)
+    for rate_m_s in (-0.080, -0.060, -0.040, -0.020):
+        observation_valid = wrist_height_release_ready(
+            True, hold, rate_m_s, 0.012
+        )
+        hold, count, _ = wrapped_rate_motion_hold(
+            current_delta_rad=angle,
+            previous_delta_rad=angle,
+            dt_s=0.17,
+            hold_active=hold,
+            release_count=count,
+            enter_rate_rad_s=np.deg2rad(3.0),
+            release_rate_rad_s=np.deg2rad(1.0),
+            release_samples=4,
+            observation_valid=observation_valid,
+            activation_enabled=False,
+        )
+
+    assert not hold and count == 0
+
+
+def test_stationary_planar_target_requires_consecutive_quiet_samples():
+    count = 0
+    for expected_count in (1, 2):
+        active, count = confirmed_stationary_planar_target(
+            requested_target_m=[0.0208, 0.0600],
+            current_target_m=[0.0200, 0.0600],
+            current_velocity_m_s=[0.0010, 0.0],
+            target_deadband_m=[0.0025, 0.0030],
+            velocity_deadband_m_s=[0.0030, 0.0030],
+            previous_count=count,
+            confirm_samples=3,
+        )
+        assert not active and count == expected_count
+
+    active, count = confirmed_stationary_planar_target(
+        requested_target_m=[0.0208, 0.0600],
+        current_target_m=[0.0200, 0.0600],
+        current_velocity_m_s=[0.0010, 0.0],
+        target_deadband_m=[0.0025, 0.0030],
+        velocity_deadband_m_s=[0.0030, 0.0030],
+        previous_count=count,
+        confirm_samples=3,
+    )
+    assert active and count == 3
+
+
+def test_stationary_planar_target_releases_immediately_for_new_motion():
+    active, count = confirmed_stationary_planar_target(
+        requested_target_m=[0.035, 0.040],
+        current_target_m=[0.020, 0.060],
+        current_velocity_m_s=[0.0, 0.0],
+        target_deadband_m=[0.0025, 0.0030],
+        velocity_deadband_m_s=[0.0030, 0.0030],
+        previous_count=3,
+        confirm_samples=3,
+    )
+    assert not active and count == 0
 
 
 def test_wrist_hold_cancels_queued_vertical_descent_velocity():
