@@ -13,6 +13,7 @@ from .rebot_b601 import (
     resolve_native_frame_ids,
     scale_vector_to_max_abs,
     smoothed_semantic_goal_velocity,
+    validate_startup_joint_limits,
     validate_tabletop_startup,
 )
 from .semantic_motion import (
@@ -36,6 +37,7 @@ __all__ = [
     "resolve_native_frame_ids",
     "scale_vector_to_max_abs",
     "smoothed_semantic_goal_velocity",
+    "validate_startup_joint_limits",
     "validate_tabletop_startup",
     "OperatorArmMotion",
     "build_operator_arm_motion",

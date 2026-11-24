@@ -49,6 +49,8 @@ Orbbec RGB-D
 | `arm_control/rebot_b601.py` | B601 启动门、Pinocchio IK、MIT + `g(q)`、桌面回位 |
 | `config/rebotarm_dm_brainco.yaml` | 仅六轴 DM 电机；刻意不注册 Seeed 夹爪 0x07 |
 | `scripts/read_b601_table_pose.py` | 不使能电机，只读取并输出桌面姿态参数 |
+| `scripts/install_b601_desktop_app.sh` | 复制已验证模型并安装桌面一键启动图标 |
+| `scripts/b601_desktop_app.py` | 失能力矩状态下扫描姿态，失败时按 `r` 重试 |
 | `vision_backends/` | TensorRT 10、RTMDet/RTMPose、深度选人和手部分割 |
 | `hand_control/` | BrainCo 手指标定、迟滞、防抖与拇指对掌 |
 | `third_party/reBotArm_control_py` | Seeed 官方 SDK Git submodule |
@@ -71,6 +73,32 @@ python -m pip install -r deploy/requirements-jetson-runtime.txt
 
 另外需要：ROS 2 Humble、`pyorbbecsdk`、目标 JetPack 自带 TensorRT/CUDA，及
 BrainCo 官方手部 SDK（启用灵巧手时）。不要用 pip 覆盖 JetPack 的 TensorRT。
+
+### 一键桌面程序
+
+在目标 Jetson 上执行一次安装器：
+
+```bash
+cd "$HOME/ws/Jetson_Femto_reBot_B601_BrainCo_Demo_RTMPose_TensorRT"
+bash scripts/install_b601_desktop_app.sh
+```
+
+安装器会从相邻的
+`$HOME/ws/Jetson_Femto_Realman_Brainco_Demo_RTMPose_TensorRT` 复制并覆盖以下
+三份已验证模型到本仓库的 `models/tensorrt/`：
+
+- `tensorrt_orin_nano_20261102_170600/rtmdet_nano.engine`
+- `tensorrt_pose_fp32/rtmpose_body.engine`
+- `tensorrt/rtmpose_hand.engine`
+
+复制过程会比较 SHA-256，之后在桌面和应用菜单生成
+`reBot B601 Vision Control`。双击图标后，程序会在不使能电机的状态下自动读取
+六轴反馈，并验证静止状态、官方/URDF关节交集以及J2/J3/J4桌面平放包络。失败时
+电机保持失能；重新摆好并完整支撑机械臂后按 `r` 再次扫描，按 `q` 退出。扫描
+通过后才启动整臂和灵巧手程序，人员识别稳定后仍需按 `S` 开始跟随。
+
+扫描只能根据关节反馈拒绝明显不安全的姿态，不能感知桌面对机械臂的真实支撑力；
+每次双击前仍必须由操作者确认机械臂平行且完整支撑在桌面上。
 
 TensorRT engine 必须在目标 Jetson/JetPack/TensorRT 组合上构建；流程见
 [`deploy/README.md`](deploy/README.md)。

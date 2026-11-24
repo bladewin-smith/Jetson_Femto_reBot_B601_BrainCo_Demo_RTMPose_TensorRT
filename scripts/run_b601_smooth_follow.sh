@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 SOURCE_MODEL_DIR="${SOURCE_MODEL_DIR:-$HOME/ws/Jetson_Femto_Realman_Brainco_Demo_RTMPose_TensorRT/models}"
 LOCAL_ENGINE_DIR="${B601_LOCAL_ENGINE_DIR:-$REPO/models/tensorrt_local}"
+VERIFIED_LOCAL_ENGINE_DIR="${B601_VERIFIED_ENGINE_DIR:-$REPO/models/tensorrt}"
 CHANNELS="${1:-[1.0,1.0,0.0,0.0,1.0,1.0]}"
 BRAINCO_SDK="${BRAINCO_HAND_SDK_PATH:-$HOME/ws/brainco-hand-sdk-main/python}"
 VERIFIED_DET_ENGINE="$SOURCE_MODEL_DIR/tensorrt_orin_nano_20261102_170600/rtmdet_nano.engine"
@@ -37,6 +38,13 @@ if (( CUSTOM_ENGINE_COUNT != 0 && CUSTOM_ENGINE_COUNT != 3 )); then
 fi
 if (( CUSTOM_ENGINE_COUNT == 3 )); then
   ENGINE_PROFILE="custom"
+elif [[ -s "$VERIFIED_LOCAL_ENGINE_DIR/rtmdet_nano.engine" \
+     && -s "$VERIFIED_LOCAL_ENGINE_DIR/rtmpose_body.engine" \
+     && -s "$VERIFIED_LOCAL_ENGINE_DIR/rtmpose_hand.engine" ]]; then
+  DET_ENGINE="$VERIFIED_LOCAL_ENGINE_DIR/rtmdet_nano.engine"
+  BODY_ENGINE="$VERIFIED_LOCAL_ENGINE_DIR/rtmpose_body.engine"
+  HAND_ENGINE="$VERIFIED_LOCAL_ENGINE_DIR/rtmpose_hand.engine"
+  ENGINE_PROFILE="verified-local-copy"
 elif [[ "${B601_USE_ALL_LOCAL_ENGINES:-0}" == "1" \
      && -s "$LOCAL_ENGINE_DIR/rtmdet_nano.engine" \
      && -s "$LOCAL_ENGINE_DIR/rtmpose_body.engine" \
@@ -54,8 +62,8 @@ elif [[ -s "$VERIFIED_DET_ENGINE" \
   ENGINE_PROFILE="verified-hybrid"
 else
   echo "No validated B601 TensorRT engine profile is available." >&2
-  echo "Expected the verified detector/body plans plus a target-local hand plan." >&2
-  echo "Build the hand plan with: bash scripts/build_b601_local_tensorrt.sh" >&2
+  echo "Install the verified engines and desktop app with:" >&2
+  echo "  bash scripts/install_b601_desktop_app.sh" >&2
   exit 2
 fi
 for file in "$DET_ENGINE" "$BODY_ENGINE" "$HAND_ENGINE"; do
@@ -123,7 +131,7 @@ exec python "$REPO/scripts/camera_arm_b601_control_pose_hands.py" --ros-args \
   -p robot_motion_enabled:=true \
   -p b601_tabletop_startup_confirmed:=true \
   -p b601_tabletop_joints_rad:="$TABLE_Q" \
-  -p b601_tabletop_joint_tolerance_rad:='[0.12,0.12,0.12,0.12,0.12,0.12]' \
+  -p b601_tabletop_joint_tolerance_rad:="${B601_TABLETOP_JOINT_TOLERANCE_RAD:-[0.12,0.12,0.12,0.12,0.12,0.12]}" \
   -p b601_safe_joint_lower_rad:='[-2.6005,-3.5954,-3.5954,-1.4992,-1.4992,-1.4992]' \
   -p b601_safe_joint_upper_rad:='[2.6005,0.0,0.0,1.4992,1.4992,1.4992]' \
   -p b601_joint_limit_margin_rad:=0.10 \

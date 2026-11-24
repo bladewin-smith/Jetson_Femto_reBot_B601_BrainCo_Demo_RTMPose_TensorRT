@@ -43,6 +43,7 @@ from arm_control.rebot_b601 import (
     task_space_backpressure,
     validate_wrapped_angle_observation,
     validate_tabletop_startup,
+    validate_startup_joint_limits,
     weighted_damped_least_squares,
     wrist_height_release_ready,
     wrist_hold_vertical_planner_state,
@@ -98,6 +99,27 @@ def test_tabletop_startup_accepts_stationary_reference_pose():
 def test_tabletop_startup_rejects_wrong_or_moving_pose(positions, velocities):
     with pytest.raises(StartupGuardError):
         validate_tabletop_startup(positions, velocities, [0.0] * 6, 0.35, 0.2)
+
+
+def test_startup_joint_limits_report_one_based_outside_joints():
+    lower, upper = validate_startup_joint_limits(
+        positions_rad=[0.0, -0.1, -0.1, 0.0, 0.0, 0.0],
+        model_lower_rad=[-3.0] * 6,
+        model_upper_rad=[3.0] * 6,
+        safety_lower_rad=[-2.0] * 6,
+        safety_upper_rad=[2.0] * 6,
+    )
+    np.testing.assert_allclose(lower, [-2.0] * 6)
+    np.testing.assert_allclose(upper, [2.0] * 6)
+
+    with pytest.raises(StartupGuardError, match=r"joints \[2\]"):
+        validate_startup_joint_limits(
+            positions_rad=[0.0, 0.1, -0.1, 0.0, 0.0, 0.0],
+            model_lower_rad=[-3.0, -3.0, -3.0, -3.0, -3.0, -3.0],
+            model_upper_rad=[3.0, 0.0, 0.0, 3.0, 3.0, 3.0],
+            safety_lower_rad=[-2.0] * 6,
+            safety_upper_rad=[2.0] * 6,
+        )
 
 
 def test_tabletop_envelope_blocks_xy_until_lifted_and_never_moves_down():

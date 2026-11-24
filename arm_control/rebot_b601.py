@@ -489,6 +489,34 @@ def intersect_joint_position_limits(
     return lower, upper
 
 
+def validate_startup_joint_limits(
+    positions_rad: Sequence[float],
+    model_lower_rad: Sequence[float],
+    model_upper_rad: Sequence[float],
+    safety_lower_rad: Sequence[float],
+    safety_upper_rad: Sequence[float],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Validate startup feedback against the official/model intersection."""
+
+    positions = np.asarray(positions_rad, dtype=np.float64).reshape(-1)
+    lower, upper = intersect_joint_position_limits(
+        model_lower_rad,
+        model_upper_rad,
+        safety_lower_rad,
+        safety_upper_rad,
+    )
+    if positions.shape != lower.shape or not np.all(np.isfinite(positions)):
+        raise ValueError("startup joint feedback and limits must be finite and match")
+    outside = np.logical_or(positions < lower, positions > upper)
+    if np.any(outside):
+        raise StartupGuardError(
+            "Refusing to enable B601-DM torque: validated table feedback is "
+            "outside the official/URDF joint safety intersection for joints "
+            f"{(np.flatnonzero(outside) + 1).tolist()}"
+        )
+    return lower, upper
+
+
 def scale_vector_to_max_abs(
     values: Sequence[float], max_abs_value: float
 ) -> np.ndarray:
@@ -3411,13 +3439,6 @@ class B601PalmFollower:
         self._urdf_joint_upper = self._model.upperPositionLimit[
             : self.ARM_DOF
         ].copy()
-        self._joint_lower, self._joint_upper = intersect_joint_position_limits(
-            self._urdf_joint_lower,
-            self._urdf_joint_upper,
-            self.configured_safe_joint_lower,
-            self.configured_safe_joint_upper,
-        )
-
         self.robot = RebotArm(str(self.hardware_yaml.resolve()))
         try:
             self.robot.connect()
@@ -3429,15 +3450,13 @@ class B601PalmFollower:
                 self.tabletop_tolerance,
                 self.startup_max_velocity,
             )
-            outside_hard_limits = np.logical_or(
-                q < self._joint_lower, q > self._joint_upper
+            self._joint_lower, self._joint_upper = validate_startup_joint_limits(
+                q,
+                self._urdf_joint_lower,
+                self._urdf_joint_upper,
+                self.configured_safe_joint_lower,
+                self.configured_safe_joint_upper,
             )
-            if np.any(outside_hard_limits):
-                raise StartupGuardError(
-                    "Refusing to enable B601-DM torque: validated table feedback is "
-                    "outside the official/URDF joint safety intersection for joints "
-                    f"{(np.flatnonzero(outside_hard_limits) + 1).tolist()}"
-                )
             self.startup_joint_reference = q.copy()
             self._set_reference_from_q(q)
             self.table_frame_heights = self._frame_heights(q)
