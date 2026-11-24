@@ -32,6 +32,7 @@ DEFAULT_HARDWARE_YAML = REPOSITORY_ROOT / "config" / "rebotarm_dm_brainco.yaml"
 DEFAULT_URDF = (
     DEFAULT_SDK_ROOT / "urdf" / "DM" / "urdf" / "ReBot_Arm_DM.urdf"
 )
+SCAN_RESULT_PREFIX = "B601_SCAN_RESULT_JSON="
 
 # Seeed's published B601-DM range, intersected with the official URDF by the
 # shared validator below.  Keep these values identical to the runtime defaults.
@@ -65,6 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hardware-yaml", type=Path, default=DEFAULT_HARDWARE_YAML)
     parser.add_argument("--urdf", type=Path, default=DEFAULT_URDF)
     parser.add_argument("--engine-dir", type=Path, default=DEFAULT_ENGINE_DIR)
+    parser.add_argument("--scan-worker", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -233,6 +235,102 @@ def scan_table_pose(
     return q_table, max_velocity, max_spread
 
 
+def parse_scan_worker_output(output: str) -> dict[str, object]:
+    """Extract the final structured result from a noisy hardware subprocess."""
+
+    for line in reversed(output.splitlines()):
+        if line.startswith(SCAN_RESULT_PREFIX):
+            payload = json.loads(line[len(SCAN_RESULT_PREFIX) :])
+            if not isinstance(payload, dict):
+                break
+            return payload
+    raise RuntimeError("B601 feedback scan worker returned no structured result")
+
+
+def scan_worker_main(args: argparse.Namespace) -> int:
+    """Scan in a disposable process so native serial handles cannot survive."""
+
+    try:
+        q_table, max_velocity, max_spread = scan_table_pose(
+            args.sdk_root,
+            args.hardware_yaml,
+            args.urdf,
+            args.samples,
+            args.interval,
+        )
+        payload: dict[str, object] = {
+            "ok": True,
+            "q_table": q_table.tolist(),
+            "max_velocity": max_velocity,
+            "max_spread": max_spread,
+        }
+        return_code = 0
+    except Exception as exc:
+        payload = {
+            "ok": False,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
+        return_code = 2
+    print(SCAN_RESULT_PREFIX + json.dumps(payload, separators=(",", ":")), flush=True)
+    return return_code
+
+
+def scan_table_pose_isolated(
+    args: argparse.Namespace,
+) -> tuple[np.ndarray, float, float]:
+    """Run the read-only scan in a process that fully releases MotorBridge."""
+
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--scan-worker",
+        "--samples",
+        str(args.samples),
+        "--interval",
+        str(args.interval),
+        "--sdk-root",
+        str(args.sdk_root),
+        "--hardware-yaml",
+        str(args.hardware_yaml),
+        "--urdf",
+        str(args.urdf),
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=REPOSITORY_ROOT,
+        text=True,
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    try:
+        payload = parse_scan_worker_output(completed.stdout)
+    except Exception as exc:
+        diagnostic = completed.stdout.strip()
+        raise RuntimeError(
+            f"B601 feedback scan process failed (exit={completed.returncode}): "
+            f"{diagnostic or exc}"
+        ) from exc
+    if not bool(payload.get("ok")):
+        error_type = str(payload.get("error_type", "StartupGuardError"))
+        error = str(payload.get("error", "unknown feedback scan failure"))
+        raise StartupGuardError(f"{error_type}: {error}")
+    q_table = np.asarray(payload["q_table"], dtype=np.float64).reshape(-1)
+    if q_table.size != 6 or not np.all(np.isfinite(q_table)):
+        raise RuntimeError("B601 feedback scan returned an invalid six-joint pose")
+    # subprocess.run() has already reaped the worker. This short bounded delay
+    # also lets the USB CDC driver finish its final close before the controller
+    # process opens /dev/ttyACM0 again.
+    time.sleep(0.35)
+    return (
+        q_table,
+        float(payload["max_velocity"]),
+        float(payload["max_spread"]),
+    )
+
+
 def read_action(prompt: str, allowed: set[str]) -> str:
     """Read one key on Linux terminals, with a line-input fallback."""
 
@@ -302,6 +400,8 @@ def run_control(
 
 def main() -> int:
     args = parse_args()
+    if args.scan_worker:
+        return scan_worker_main(args)
     engine_paths = required_engines(args.engine_dir)
     print_banner()
     try:
@@ -314,13 +414,7 @@ def main() -> int:
     while True:
         print("[安全扫描] 正在读取六关节反馈（电机保持失能）……")
         try:
-            q_table, max_velocity, max_spread = scan_table_pose(
-                args.sdk_root,
-                args.hardware_yaml,
-                args.urdf,
-                args.samples,
-                args.interval,
-            )
+            q_table, max_velocity, max_spread = scan_table_pose_isolated(args)
         except Exception as exc:
             print("\n[启动被安全锁拒绝] 电机没有使能。", file=sys.stderr)
             print(str(exc), file=sys.stderr)

@@ -5,10 +5,19 @@ import pytest
 
 from arm_control.rebot_b601 import StartupGuardError
 from scripts.b601_desktop_app import (
+    parse_scan_worker_output,
     required_engines,
     validate_engine_files,
     validate_table_flat_geometry,
 )
+
+
+def test_scan_worker_result_survives_noisy_sdk_output():
+    payload = parse_scan_worker_output(
+        "motorbridge diagnostic\n"
+        'B601_SCAN_RESULT_JSON={"ok":true,"q_table":[1,2,3,4,5,6]}\n'
+    )
+    assert payload == {"ok": True, "q_table": [1, 2, 3, 4, 5, 6]}
 
 
 def test_table_flat_geometry_accepts_validated_startup_shape():
