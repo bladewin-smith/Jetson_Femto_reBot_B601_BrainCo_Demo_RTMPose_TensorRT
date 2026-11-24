@@ -768,6 +768,68 @@ def independent_planar_task_backpressure(
     return np.asarray([forward_factor, vertical_factor], dtype=np.float64)
 
 
+def rate_limited_planar_task_backpressure(
+    requested: Sequence[float],
+    previous: Sequence[float],
+    requested_planar_increment: Sequence[float],
+    rise_rate_s: float,
+    fall_rate_s: float,
+    descent_intent_deadband_m_s: float,
+    dt_s: float,
+) -> np.ndarray:
+    """Smooth anti-windup factors without delaying an explicit descent.
+
+    Normal backpressure recovery remains rate limited to avoid task-command
+    chatter.  An accepted negative lift increment, however, supersedes the
+    stale vertical factor immediately.  This prevents the rate limiter itself
+    from reintroducing a delayed-descent queue after the raw backpressure has
+    granted the safety-priority return.
+    """
+
+    target = np.asarray(requested, dtype=np.float64).reshape(-1)
+    prior = np.asarray(previous, dtype=np.float64).reshape(-1)
+    increment = np.asarray(
+        requested_planar_increment, dtype=np.float64
+    ).reshape(-1)
+    if (
+        target.size != 2
+        or prior.shape != target.shape
+        or increment.shape != target.shape
+    ):
+        raise ValueError("planar backpressure vectors must contain forward and lift")
+    if not all(
+        np.all(np.isfinite(value)) for value in (target, prior, increment)
+    ):
+        raise ValueError("planar backpressure vectors must be finite")
+
+    limited = np.asarray(
+        [
+            rate_limited_unit_interval(
+                target[index],
+                prior[index],
+                rise_rate_s,
+                fall_rate_s,
+                dt_s,
+            )
+            for index in range(2)
+        ],
+        dtype=np.float64,
+    )
+    descent_deadband = float(descent_intent_deadband_m_s)
+    dt = float(dt_s)
+    if (
+        not np.isfinite(descent_deadband)
+        or descent_deadband < 0.0
+        or not np.isfinite(dt)
+        or dt <= 0.0
+    ):
+        raise ValueError("descent intent deadband and dt are invalid")
+    clear_descent = increment[1] < -(descent_deadband * dt)
+    if clear_descent:
+        limited[1] = 1.0
+    return limited
+
+
 def wrapped_rate_motion_hold(
     current_delta_rad: float,
     previous_delta_rad: float | None,
@@ -4542,18 +4604,21 @@ class B601PalmFollower:
             task_tracking_limit,
             self.semantic_planar_backpressure_start_fraction,
         )
-        planar_backpressure = np.asarray(
-            [
-                rate_limited_unit_interval(
-                    raw_backpressure[index],
-                    self.semantic_planar_backpressure[index],
-                    self.semantic_planar_backpressure_rates[0],
-                    self.semantic_planar_backpressure_rates[1],
-                    planar_dt,
-                )
-                for index in range(2)
-            ],
-            dtype=np.float64,
+        planar_backpressure = rate_limited_planar_task_backpressure(
+            raw_backpressure,
+            self.semantic_planar_backpressure,
+            planar_increment,
+            self.semantic_planar_backpressure_rates[0],
+            self.semantic_planar_backpressure_rates[1],
+            self.semantic_vertical_descent_intent_deadband_m_s,
+            planar_dt,
+        )
+        descent_backpressure_bypass = bool(
+            planar_increment[1]
+            < -(
+                self.semantic_vertical_descent_intent_deadband_m_s
+                * planar_dt
+            )
         )
         planar_command = (
             self.semantic_planar_command_m
@@ -4796,6 +4861,7 @@ class B601PalmFollower:
                 f"forward_gate={forward_gate:.2f}/{raw_forward_gate:.2f}, "
                 f"backpressure={planar_backpressure.round(2).tolist()}/"
                 f"{raw_backpressure.round(2).tolist()}, "
+                f"descent_backpressure_bypass={descent_backpressure_bypass}, "
                 f"planar_idle={self.semantic_planar_idle_active}:"
                 f"{self.semantic_planar_idle_count}/"
                 f"{self.semantic_planar_idle_confirm_samples}, "

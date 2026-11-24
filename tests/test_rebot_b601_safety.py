@@ -29,6 +29,7 @@ from arm_control.rebot_b601 import (
     limit_mit_target_by_effort,
     minimum_jerk_blend,
     ramp_joint_target_with_tracking_window,
+    rate_limited_planar_task_backpressure,
     rate_limited_unit_interval,
     resolve_native_frame_ids,
     rotation_compensated_scalar_observation,
@@ -817,6 +818,64 @@ def test_planar_backpressure_does_not_cross_couple_forward_and_lift():
 
     np.testing.assert_allclose(forward_blocked, [0.0, 1.0])
     np.testing.assert_allclose(vertical_blocked, [1.0, 0.0])
+
+
+def test_planar_backpressure_never_queues_an_explicit_descent():
+    raw_backpressure = independent_planar_task_backpressure(
+        # Mixed link errors used to let one lagging row freeze all vertical
+        # descent until the arm caught up several seconds later.
+        signed_task_error=[0.0, -0.030, 0.025, 0.040],
+        requested_planar_increment=[0.0, -0.004],
+        vertical_height_profile=[0.5, 0.8, 1.0],
+        max_tracking_error=[0.020, 0.020, 0.020, 0.020],
+        start_fraction=0.50,
+    )
+    descent = rate_limited_planar_task_backpressure(
+        requested=raw_backpressure,
+        previous=[1.0, 0.0],
+        requested_planar_increment=[0.0, -0.004],
+        rise_rate_s=1.0,
+        fall_rate_s=1.5,
+        descent_intent_deadband_m_s=0.0015,
+        dt_s=0.20,
+    )
+
+    np.testing.assert_allclose(raw_backpressure, [1.0, 0.0])
+    np.testing.assert_allclose(descent, [1.0, 1.0])
+
+
+def test_descent_bypasses_stale_backpressure_rate_state_immediately():
+    descent = rate_limited_planar_task_backpressure(
+        requested=[1.0, 1.0],
+        previous=[0.0, 0.0],
+        requested_planar_increment=[0.002, -0.004],
+        rise_rate_s=1.0,
+        fall_rate_s=1.5,
+        descent_intent_deadband_m_s=0.0015,
+        dt_s=0.20,
+    )
+    ascent = rate_limited_planar_task_backpressure(
+        requested=[1.0, 1.0],
+        previous=[0.0, 0.0],
+        requested_planar_increment=[0.002, 0.004],
+        rise_rate_s=1.0,
+        fall_rate_s=1.5,
+        descent_intent_deadband_m_s=0.0015,
+        dt_s=0.20,
+    )
+    subthreshold_noise = rate_limited_planar_task_backpressure(
+        requested=[1.0, 1.0],
+        previous=[0.0, 0.0],
+        requested_planar_increment=[0.0, -0.0002],
+        rise_rate_s=1.0,
+        fall_rate_s=1.5,
+        descent_intent_deadband_m_s=0.0015,
+        dt_s=0.20,
+    )
+
+    np.testing.assert_allclose(descent, [0.2, 1.0])
+    np.testing.assert_allclose(ascent, [0.2, 0.2])
+    np.testing.assert_allclose(subthreshold_noise, [0.2, 0.2])
 
 
 def test_coordinated_velocity_limiter_preserves_joint_ratio():

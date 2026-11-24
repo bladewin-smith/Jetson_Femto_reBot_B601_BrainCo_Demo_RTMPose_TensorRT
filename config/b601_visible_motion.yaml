@@ -117,8 +117,10 @@ hand_palm_b601_control_node:
     b601_semantic_motion_reverse_confirm_samples: 2
     b601_semantic_planar_command_max_acceleration_m_s2: [0.32, 0.16]
     b601_semantic_planar_command_deadband_m: [0.0015, 0.0015]
-    # Stop accumulating operator displacement when the physical arm has not
-    # yet caught up, while always permitting a command back toward feedback.
+    # Stop accumulating outward operator displacement when the physical arm
+    # has not caught up. Explicit descent bypasses vertical backpressure and
+    # its recovery ramp so a stale high target can never be released seconds
+    # later; velocity/acceleration and table-clearance limits remain active.
     b601_semantic_planar_tracking_error_m: [0.030, 0.050]
     b601_semantic_planar_backpressure_start_fraction: 0.65
     b601_semantic_planar_backpressure_rates_s: [1.0, 1.5]
