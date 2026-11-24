@@ -1,0 +1,5 @@
+# Verified TensorRT deployment plans are versioned with Git LFS. Keep the
+# allow-list explicit so experimental builds are not uploaded accidentally.
+models/tensorrt/rtmdet_nano.engine filter=lfs diff=lfs merge=lfs -text
+models/tensorrt/rtmpose_body.engine filter=lfs diff=lfs merge=lfs -text
+models/tensorrt/rtmpose_hand.engine filter=lfs diff=lfs merge=lfs -text

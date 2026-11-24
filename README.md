@@ -51,57 +51,154 @@ Orbbec RGB-D
 | `scripts/read_b601_table_pose.py` | 不使能电机，只读取并输出桌面姿态参数 |
 | `scripts/install_b601_desktop_app.sh` | 复制已验证模型并安装桌面一键启动图标 |
 | `scripts/b601_desktop_app.py` | 失能力矩状态下扫描姿态，失败时按 `r` 重试 |
+| `scripts/prepare_b601_models_lfs.sh` | 校验并暂存三份Git LFS模型供维护者上传 |
 | `vision_backends/` | TensorRT 10、RTMDet/RTMPose、深度选人和手部分割 |
 | `hand_control/` | BrainCo 手指标定、迟滞、防抖与拇指对掌 |
 | `third_party/reBotArm_control_py` | Seeed 官方 SDK Git submodule |
 | `jetson_autostart/` | 带双重真机确认的 Jetson 启动脚本和环境模板 |
 
-## 安装
+## Jetson 快速使用
 
-Seeed SDK 当前声明 Python `>=3.10,<3.12`，Jetson 侧建议 Python 3.10：
+### 1. 系统与硬件前提
+
+- Ubuntu 22.04 / JetPack、CUDA、TensorRT，以及 ROS 2 Humble；不要用 pip
+  覆盖 JetPack 自带的 TensorRT。
+- Python 3.10；Seeed SDK 当前要求 Python `>=3.10,<3.12`。
+- Orbbec相机及`pyorbbecsdk`，默认路径为`$HOME/ws/pyorbbecsdk-2-main`。
+- BrainCo官方Python SDK，默认路径为`$HOME/ws/brainco-hand-sdk-main/python`。
+- B601 MotorBridge默认为`/dev/ttyACM0`；BrainCo灵巧手使用独立RS485链路。
+- 启动前机械臂必须断电摆平并完整支撑在桌面上，工作区清空，急停在手边。
+
+仓库中的TensorRT engine是平台相关二进制，只保证在生成它们的Jetson、JetPack、
+TensorRT和GPU组合上可用。其他设备若出现跨设备plan警告，应按
+[`deploy/README.md`](deploy/README.md)重新构建，而不是继续强行使用。
+
+### 2. 克隆代码、子模块和Git LFS模型
+
+三份已验证engine使用Git LFS保存。未安装Git LFS时，克隆到的只是约百字节的
+指针文件，程序无法加载模型。
 
 ```bash
-git clone --recurse-submodules <this-repository-url>
-cd Jetson_Femto_reBot_B601_BrainCo_Demo_RTMPose_TensorRT
-git submodule update --init --recursive
+sudo apt update
+sudo apt install -y git git-lfs python3-venv
+git lfs install
 
+mkdir -p "$HOME/ws"
+cd "$HOME/ws"
+git clone --recurse-submodules \
+  https://github.com/bladewin-smith/Jetson_Femto_reBot_B601_BrainCo_Demo_RTMPose_TensorRT.git
+cd Jetson_Femto_reBot_B601_BrainCo_Demo_RTMPose_TensorRT
+git submodule update --init --recursive --depth 1
+git lfs pull
+```
+
+确认三份LFS模型和校验清单已经完整下载：
+
+```bash
+git lfs ls-files
+ls -lh models/tensorrt/*.engine
+(cd models/tensorrt && sha256sum -c verified_engines.sha256)
+```
+
+预期文件为：
+
+```text
+models/tensorrt/rtmdet_nano.engine
+models/tensorrt/rtmpose_body.engine
+models/tensorrt/rtmpose_hand.engine
+models/tensorrt/verified_engines.sha256
+```
+
+已有仓库只需执行：
+
+```bash
+cd "$HOME/ws/Jetson_Femto_reBot_B601_BrainCo_Demo_RTMPose_TensorRT"
+git pull --rebase
+git submodule update --init --recursive --depth 1
+git lfs install
+git lfs pull
+```
+
+### 3. 创建Python环境
+
+```bash
+cd "$HOME/ws/Jetson_Femto_reBot_B601_BrainCo_Demo_RTMPose_TensorRT"
 python3 -m venv --system-site-packages .venv
 source .venv/bin/activate
 python -m pip install -e third_party/reBotArm_control_py
 python -m pip install -r deploy/requirements-jetson-runtime.txt
 ```
 
-另外需要：ROS 2 Humble、`pyorbbecsdk`、目标 JetPack 自带 TensorRT/CUDA，及
-BrainCo 官方手部 SDK（启用灵巧手时）。不要用 pip 覆盖 JetPack 的 TensorRT。
-
-### 一键桌面程序
-
-在目标 Jetson 上执行一次安装器：
+如果Orbbec或BrainCo SDK不在默认路径，创建本机专用配置（该文件不提交）：
 
 ```bash
-cd "$HOME/ws/Jetson_Femto_reBot_B601_BrainCo_Demo_RTMPose_TensorRT"
+mkdir -p "$HOME/.config"
+cat > "$HOME/.config/rebot_b601_demo.env" <<'EOF'
+PYORBBEC_ROOT=/absolute/path/to/pyorbbecsdk
+BRAINCO_HAND_SDK_PATH=/absolute/path/to/brainco-hand-sdk/python
+# B601_VENV_DIR=/absolute/path/to/.venv
+EOF
+```
+
+### 4. 安装桌面启动程序
+
+```bash
 bash scripts/install_b601_desktop_app.sh
 ```
 
-安装器会从相邻的
-`$HOME/ws/Jetson_Femto_Realman_Brainco_Demo_RTMPose_TensorRT` 复制并覆盖以下
-三份已验证模型到本仓库的 `models/tensorrt/`：
+如果当前仓库已经通过Git LFS取得模型，安装器会直接验证并使用它们；如果本机仍有
+旧Realman仓库，则也兼容从该仓库复制、校验并覆盖模型。完成后桌面和应用菜单中会
+出现`reBot B601 Vision Control`。
 
-- `tensorrt_orin_nano_20261102_170600/rtmdet_nano.engine`
-- `tensorrt_pose_fp32/rtmpose_body.engine`
-- `tensorrt/rtmpose_hand.engine`
+### 5. 每次运行
 
-复制过程会比较 SHA-256，之后在桌面和应用菜单生成
-`reBot B601 Vision Control`。双击图标后，程序会在不使能电机的状态下自动读取
-六轴反馈，并验证静止状态、官方/URDF关节交集以及J2/J3/J4桌面平放包络。失败时
-电机保持失能；重新摆好并完整支撑机械臂后按 `r` 再次扫描，按 `q` 退出。扫描
-通过后才启动整臂和灵巧手程序，人员识别稳定后仍需按 `S` 开始跟随。
+1. 机械臂断电、平行且完整支撑在桌面上，清空工作区。
+2. 接通24 V、MotorBridge、Orbbec和BrainCo灵巧手，再双击桌面图标。
+3. 启动器在独立进程中只读25组关节反馈；此阶段绝不使能电机。
+4. 若姿态或反馈不安全，重新摆好后按`r`扫描，或按`q`退出。
+5. 扫描通过后程序自动写入本次`TABLE_Q`并启动相机和控制器。
+6. 人体识别稳定后，在OpenCV画面按`S`开始机械臂和灵巧手跟随。
+7. 按`H`以低速轨迹回到本次桌面姿态并暂停；再次按`S`恢复。
+8. 按`Q`或`Esc`正常退出。紧急情况直接急停，不要依赖软件回桌。
 
-扫描只能根据关节反馈拒绝明显不安全的姿态，不能感知桌面对机械臂的真实支撑力；
-每次双击前仍必须由操作者确认机械臂平行且完整支撑在桌面上。
+扫描只能根据关节反馈拒绝明显不安全的姿态，无法感知桌面对机械臂的真实支撑力；
+每次双击前仍必须由操作者确认机械臂已经获得完整物理支撑。
 
-TensorRT engine 必须在目标 Jetson/JetPack/TensorRT 组合上构建；流程见
-[`deploy/README.md`](deploy/README.md)。
+命令行启动与桌面图标等价：
+
+```bash
+bash scripts/launch_b601_desktop.sh
+```
+
+### 6. 常见问题
+
+- 模型只有一百多字节或报反序列化错误：运行`git lfs pull`，再执行SHA-256检查。
+- `Device or resource busy`：关闭其他占用`/dev/ttyACM0`的进程；新版桌面启动器已把
+  姿态扫描放入一次性子进程，避免自身遗留串口句柄。
+- `StartupGuardError`：不要绕过安全门；断电后重新平放并支撑机械臂，再按`r`。
+- GitHub下载模型失败：检查`git lfs env`、远程仓库LFS配额和网络代理。
+- TensorRT提示跨设备engine：在目标Jetson重新构建engine；TensorRT plan不是通用模型。
+
+## 维护者：从Jetson上传或更新模型
+
+模型只能从已经真机验证通过的Jetson上传。先安装Git LFS并确认模型校验通过：
+
+```bash
+cd "$HOME/ws/Jetson_Femto_reBot_B601_BrainCo_Demo_RTMPose_TensorRT"
+sudo apt install -y git-lfs
+git lfs install
+
+bash scripts/prepare_b601_models_lfs.sh
+git status --short
+git lfs ls-files
+git commit -m "add verified B601 TensorRT engines"
+git push origin HEAD
+```
+
+`prepare_b601_models_lfs.sh`只会暂存三份白名单engine和SHA-256清单，不会上传其他
+实验模型。更新engine后必须同时更新`verified_engines.sha256`。协作者克隆仓库前也
+必须安装Git LFS，否则只会得到LFS指针文件。GitHub LFS说明见
+[About Git Large File Storage](https://docs.github.com/en/repositories/working-with-files/managing-large-files/about-git-large-file-storage)。
 
 ## 分阶段验收
 

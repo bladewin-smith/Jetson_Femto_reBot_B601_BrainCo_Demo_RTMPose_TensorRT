@@ -11,40 +11,74 @@ declare -A SOURCES=(
   [rtmpose_body.engine]="$SOURCE_REPO/models/tensorrt_pose_fp32/rtmpose_body.engine"
   [rtmpose_hand.engine]="$SOURCE_REPO/models/tensorrt/rtmpose_hand.engine"
 )
+MODEL_NAMES=(rtmdet_nano.engine rtmpose_body.engine rtmpose_hand.engine)
 
-for name in rtmdet_nano.engine rtmpose_body.engine rtmpose_hand.engine; do
+source_bundle_available=true
+for name in "${MODEL_NAMES[@]}"; do
   source_file="${SOURCES[$name]}"
   if [[ ! -s "$source_file" ]]; then
-    echo "Missing or empty verified model: $source_file" >&2
-    exit 2
+    source_bundle_available=false
   fi
 done
 
 mkdir -p "$TARGET_DIR"
-STAGE_DIR="$(mktemp -d "$TARGET_DIR/.verified-install.XXXXXX")"
-cleanup() { rm -rf -- "$STAGE_DIR"; }
-trap cleanup EXIT
+target_bundle_valid=true
+for name in "${MODEL_NAMES[@]}"; do
+  [[ -s "$TARGET_DIR/$name" ]] || target_bundle_valid=false
+done
+[[ -s "$TARGET_DIR/verified_engines.sha256" ]] || target_bundle_valid=false
+if [[ "$target_bundle_valid" == "true" ]] \
+   && ! (cd "$TARGET_DIR" && sha256sum -c verified_engines.sha256 >/dev/null 2>&1); then
+  target_bundle_valid=false
+fi
 
-echo "Copying verified TensorRT engines into: $TARGET_DIR"
-for name in rtmdet_nano.engine rtmpose_body.engine rtmpose_hand.engine; do
-  source_file="${SOURCES[$name]}"
-  echo "  - $name <- $source_file" >&2
-  cp -- "$source_file" "$STAGE_DIR/$name"
-  chmod 0644 "$STAGE_DIR/$name"
-  source_hash="$(sha256sum "$source_file" | awk '{print $1}')"
-  copied_hash="$(sha256sum "$STAGE_DIR/$name" | awk '{print $1}')"
-  if [[ "$source_hash" != "$copied_hash" ]]; then
-    echo "Checksum mismatch while copying $name" >&2
+if [[ "$target_bundle_valid" == "true" ]]; then
+  echo "Using verified Git LFS model bundle in: $TARGET_DIR"
+elif [[ "$source_bundle_available" == "true" ]]; then
+  STAGE_DIR="$(mktemp -d "$TARGET_DIR/.verified-install.XXXXXX")"
+  cleanup() { rm -rf -- "$STAGE_DIR"; }
+  trap cleanup EXIT
+
+  echo "Copying verified TensorRT engines into: $TARGET_DIR"
+  for name in "${MODEL_NAMES[@]}"; do
+    source_file="${SOURCES[$name]}"
+    echo "  - $name <- $source_file" >&2
+    cp -- "$source_file" "$STAGE_DIR/$name"
+    chmod 0644 "$STAGE_DIR/$name"
+    source_hash="$(sha256sum "$source_file" | awk '{print $1}')"
+    copied_hash="$(sha256sum "$STAGE_DIR/$name" | awk '{print $1}')"
+    if [[ "$source_hash" != "$copied_hash" ]]; then
+      echo "Checksum mismatch while copying $name" >&2
+      exit 2
+    fi
+    printf '%s  %s\n' "$copied_hash" "$name"
+  done > "$STAGE_DIR/verified_engines.sha256"
+
+  # Each replacement is an atomic rename inside the destination filesystem.
+  for name in "${MODEL_NAMES[@]}"; do
+    mv -f -- "$STAGE_DIR/$name" "$TARGET_DIR/$name"
+  done
+  mv -f -- "$STAGE_DIR/verified_engines.sha256" "$TARGET_DIR/verified_engines.sha256"
+else
+  echo "Neither a valid Git LFS bundle nor a complete source bundle is available." >&2
+fi
+
+for name in "${MODEL_NAMES[@]}"; do
+  if [[ ! -s "$TARGET_DIR/$name" ]]; then
+    echo "Missing model: $TARGET_DIR/$name" >&2
+    echo "Run 'git lfs pull' in the repository, then retry." >&2
     exit 2
   fi
-  printf '%s  %s\n' "$copied_hash" "$name"
-done > "$STAGE_DIR/verified_engines.sha256"
-
-# Each replacement is an atomic rename inside the destination filesystem.
-for name in rtmdet_nano.engine rtmpose_body.engine rtmpose_hand.engine; do
-  mv -f -- "$STAGE_DIR/$name" "$TARGET_DIR/$name"
 done
-mv -f -- "$STAGE_DIR/verified_engines.sha256" "$TARGET_DIR/verified_engines.sha256"
+if [[ ! -s "$TARGET_DIR/verified_engines.sha256" ]]; then
+  echo "Missing checksum manifest: $TARGET_DIR/verified_engines.sha256" >&2
+  echo "Run 'git lfs pull' or regenerate the verified model bundle." >&2
+  exit 2
+fi
+if ! (cd "$TARGET_DIR" && sha256sum -c verified_engines.sha256); then
+  echo "Verified model checksum failed. Run 'git lfs pull' and retry." >&2
+  exit 2
+fi
 
 chmod +x "$REPO/scripts/launch_b601_desktop.sh"
 desktop_dir="$(xdg-user-dir DESKTOP 2>/dev/null || true)"

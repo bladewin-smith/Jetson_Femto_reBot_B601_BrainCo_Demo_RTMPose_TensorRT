@@ -9,11 +9,18 @@ dist/
 # Generated/downloaded deployment artifacts are platform-specific and large.
 models/mmdeploy/*/
 models/tensorrt_local/
-models/tensorrt/
 *.engine
 *.onnx
 *.pth
 *.pt
+
+# Only the three validated runtime plans and their checksum manifest are
+# intentionally versioned. .gitattributes routes the engine payloads to LFS.
+models/tensorrt/*
+!models/tensorrt/rtmdet_nano.engine
+!models/tensorrt/rtmpose_body.engine
+!models/tensorrt/rtmpose_hand.engine
+!models/tensorrt/verified_engines.sha256
 
 # Site-specific hardware confirmation and calibration values.
 jetson_autostart/b601_brainco_orbbec_demo.env
